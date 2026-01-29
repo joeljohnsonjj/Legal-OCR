@@ -776,9 +776,7 @@ class QueryRequest(BaseModel):
         json_schema_extra = {
             "example": {
                 "query": "Landlord HVAC Hazardous Materials",
-                "document_ids": ["url1", "url2", "url3"],
-                "save_output": False,
-                "output_folder": "Output"
+                "document_ids": ["url1", "url2", "url3"]
             }
         }
 
@@ -910,7 +908,6 @@ async def root():
         "version": "1.0.0",
         "endpoints": {
             "query_post": "/query (POST)",
-            "query_get": "/query (GET)",
             "process": "/process (POST)",
             "documents": "/documents (GET)",
             "health": "/health",
@@ -971,64 +968,6 @@ async def query_obligations_post(request: QueryRequest):
                 save_output=request.save_output,
                 document_ids=request.document_ids
             )
-        
-        # Check for errors in result
-        if "error" in result and result.get("total_obligations_found", 0) == 0:
-            raise HTTPException(status_code=500, detail=result["error"])
-        
-        return JSONResponse(content=result)
-        
-    except Exception as e:
-        logging.error(f"Error processing query: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Error processing query: {str(e)}")
-
-
-@app.get("/query", response_model=QueryResponse, tags=["Query"])
-async def query_obligations_get(
-    q: str = Query(default="", description="Search query for legal obligations (if empty, returns utility-related obligations)"),
-    document_ids: Optional[str] = Query(
-        default=None, 
-        description="Comma-separated list of document identifiers (URLs or filenames matching consolidated docs). If omitted, all documents are searched."
-    ),
-    save_output: bool = Query(default=False, description="Whether to save results to file"),
-    output_folder: Optional[str] = Query(default=None, description="Local output folder to search (if not provided, uses OUTPUT_FOLDER from environment)")
-):
-    """
-    Query legal obligations using GET method
-    
-    Searches through all consolidated JSON files and returns relevant obligations
-    ranked by relevance and monetary value.
-    
-    If no query is provided (empty string), returns all utility-related obligations including:
-    water, gas, heat, light, electricity, telephone service, HVAC, sprinkler system, 
-    electrical and plumbing systems.
-    
-    If document_ids are provided (comma-separated), only searches those specific documents.
-    document_ids can be URLs or filenames matching consolidated document names.
-    
-    Args:
-        q: Search query string (optional - defaults to utilities if empty)
-        document_ids: Comma-separated list of document identifiers (optional - searches all if not provided)
-        save_output: Whether to save results to file
-        output_folder: Local output folder to search (optional - uses OUTPUT_FOLDER if not provided)
-        
-    Returns:
-        QueryResponse with matched obligations
-    """
-    if query_system_instance is None:
-        raise HTTPException(status_code=503, detail="Query system not initialized")
-    
-    try:
-        # Parse document_ids from comma-separated string
-        parsed_document_ids = None
-        if document_ids:
-            parsed_document_ids = [doc_id.strip() for doc_id in document_ids.split(",") if doc_id.strip()]
-        
-        if output_folder:
-            qs = ObligationQuerySystem(local_output_folder=output_folder, model=os.getenv('GEMINI_MODEL', 'gemini-2.5-flash'))
-            result = qs.query(user_query=q, save_output=save_output, document_ids=parsed_document_ids)
-        else:
-            result = query_system_instance.query(user_query=q, save_output=save_output, document_ids=parsed_document_ids)
         
         # Check for errors in result
         if "error" in result and result.get("total_obligations_found", 0) == 0:
