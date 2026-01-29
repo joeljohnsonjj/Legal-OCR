@@ -1,0 +1,11 @@
+[build-system]
+requires = [
+    "setuptools",
+    "wheel"
+]
+
+[tool.pytest.ini_options]
+addopts = "--cov=src --cov-report=xml --cov-branch"
+testpaths = [
+    "tests"
+]

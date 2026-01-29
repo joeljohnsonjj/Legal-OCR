@@ -1,0 +1,28 @@
+{
+  "buckets": {
+    "heb-legal": {
+      "kind": "storage#bucket",
+      "id": "heb-legal",
+      "selfLink": "/storage/v1/b/heb-legal",
+      "projectNumber": "1234",
+      "name": "heb-legal",
+      "timeCreated": "2026-01-28T10:51:55.742025Z",
+      "updated": "2026-01-28T10:51:55.742025Z",
+      "metageneration": "1",
+      "iamConfiguration": {
+        "bucketPolicyOnly": {
+          "enabled": false
+        },
+        "uniformBucketLevelAccess": {
+          "enabled": false
+        }
+      },
+      "location": "US",
+      "locationType": "multi-region",
+      "storageClass": "STANDARD",
+      "etag": "CAE="
+    }
+  },
+  "objects": {},
+  "resumable": {}
+}

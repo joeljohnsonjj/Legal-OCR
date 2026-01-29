@@ -1,0 +1,6 @@
+flake8
+google-cloud-storage
+google-crc32c
+pytest
+pytest-cov
+requests

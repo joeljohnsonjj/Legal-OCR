@@ -1,0 +1,57 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Environment files (IMPORTANT: Never commit credentials!)
+.env
+.env.local
+.env.*.local
+
+# GCP Credentials (CRITICAL: Never commit these!)
+*-key.json
+*-credentials.json
+gcp-*.json
+service-account*.json
+
+# Logs
+logs/
+*.log
+
+# Cache
+ocr_cache/
+__pycache__/
+
+# Output files
+output/
+query_results/
+
+# Backup files
+bkup/
+backup/
+*.bak
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Docker volumes (if using named volumes)
+docker-volumes/
+

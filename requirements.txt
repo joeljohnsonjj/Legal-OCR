@@ -1,0 +1,36 @@
+# Google Generative AI SDK
+google-genai>=0.2.0
+google-generativeai>=0.3.0
+
+# Google Cloud Storage
+google-cloud-storage>=2.10.0
+
+# PDF Processing
+PyPDF2>=3.0.0
+pdf2image>=1.16.3
+Pillow>=10.0.0
+
+# OCR
+pytesseract>=0.3.10
+
+# Environment Variables
+python-dotenv>=1.0.0
+
+# JSON Processing (built-in)
+# json
+
+# Logging (built-in)
+# logging
+
+# FastAPI dependencies (new)
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+pydantic>=2.0.0
+
+# HTTP requests (for health checks)
+requests>=2.31.0
+
+# GCS Emulator (optional, for local development)
+# Install from local directory: pip install -e ./gcp-storage-emulator-main
+# Or install from PyPI: pip install gcp-storage-emulator
+# gcp-storage-emulator>=0.0.0
