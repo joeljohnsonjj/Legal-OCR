@@ -3,6 +3,7 @@ Interactive Query System for Legal Document Obligations
 Searches through consolidated JSON files and returns relevant obligations based on user queries
 """
 
+import asyncio
 import os
 import json
 import logging
@@ -96,6 +97,11 @@ class ObligationQuerySystem:
         """Call Gemini via REST using GEMINI_API_KEY only."""
         return gemini_generate_content(prompt, model=self.model, temperature=temperature, response_mime_type=response_mime_type)
     
+    async def _generate_content_async(self, prompt: str, temperature: float = 0.1, response_mime_type: str = "application/json"):
+        """Async wrapper for Gemini API calls using asyncio.to_thread."""
+        from gemini_client import generate_content_async
+        return await generate_content_async(prompt, model=self.model, temperature=temperature, response_mime_type=response_mime_type)
+    
     def load_consolidated_jsons(self) -> List[Dict[str, Any]]:
         """Load all *_consolidated.json files from output folder."""
         root = Path(self.local_output_folder)
@@ -119,10 +125,10 @@ class ObligationQuerySystem:
                 self.logger.error(f"Error loading {p}: {e}")
         return loaded_data
     
-    def filter_obligations_by_query(self, user_query: str, consolidated_data: Dict[str, Any], 
+    async def filter_obligations_by_query(self, user_query: str, consolidated_data: Dict[str, Any], 
                                    document_name: str) -> Dict[str, Any]:
         """
-        Step 1: Filter obligations from a single consolidated JSON based on user query
+        Step 1: Filter obligations from a single consolidated JSON based on user query (ASYNC)
         
         Args:
             user_query: User's search query
@@ -235,8 +241,8 @@ Output the filtered JSON:"""
 
             self.logger.info(f"Filtering obligations from {document_name} for query: '{user_query}'")
             
-            # Call Gemini API
-            response = self._generate_content(
+            # Call Gemini API asynchronously
+            response = await self._generate_content_async(
                 prompt=filter_prompt,
                 temperature=0.1,
                 response_mime_type="application/json"
@@ -361,10 +367,10 @@ Output the filtered JSON:"""
         
         return citations
     
-    def merge_and_rank_results(self, user_query: str, filtered_results: List[Dict[str, Any]], 
+    async def merge_and_rank_results(self, user_query: str, filtered_results: List[Dict[str, Any]], 
                               document_name_to_id: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
         """
-        Step 3: Merge all filtered results and rank by relevance and monetary value
+        Step 3: Merge all filtered results and rank by relevance and monetary value (ASYNC)
         
         Args:
             user_query: User's search query
@@ -467,8 +473,8 @@ Output the merged and ranked JSON:"""
 
             self.logger.info(f"Merging and ranking results for query: '{user_query}'")
             
-            # Call Gemini API
-            response = self._generate_content(
+            # Call Gemini API asynchronously
+            response = await self._generate_content_async(
                 prompt=merge_prompt,
                 temperature=0.1,
                 response_mime_type="application/json"
@@ -547,9 +553,9 @@ Output the merged and ranked JSON:"""
                 "error": str(e)
             }
     
-    def query(self, user_query: str, save_output: bool = True, document_ids: Optional[List[str]] = None) -> Dict[str, Any]:
+    async def query(self, user_query: str, save_output: bool = True, document_ids: Optional[List[str]] = None) -> Dict[str, Any]:
         """
-        Main query function - orchestrates the entire search process
+        Main query function - orchestrates the entire search process (ASYNC with parallel document filtering)
         
         Args:
             user_query: User's search query (if empty, returns utility-related obligations)
@@ -698,18 +704,24 @@ Output the merged and ranked JSON:"""
                         document_name_to_id[doc_name] = matched_doc_id
                         self.logger.info(f"Mapped document name '{doc_name}' to doc_id '{matched_doc_id}'")
             
-            # Step 2: Process each consolidated JSON (Step 1 is called for each)
-            filtered_results = []
-            for file_info in consolidated_files:
-                filtered = self.filter_obligations_by_query(
+            # Step 2: Process each consolidated JSON in PARALLEL
+            # OPTIMIZATION: Use asyncio.gather to filter all documents concurrently
+            self.logger.info(f"Filtering {len(consolidated_files)} documents in parallel...")
+            
+            filter_tasks = [
+                self.filter_obligations_by_query(
                     user_query,
                     file_info["data"],
                     file_info["document_name"]
                 )
-                filtered_results.append(filtered)
+                for file_info in consolidated_files
+            ]
+            
+            # Wait for all filtering to complete in parallel
+            filtered_results = await asyncio.gather(*filter_tasks)
             
             # Step 3: Merge and rank all results with document_id mapping
-            final_result = self.merge_and_rank_results(user_query, filtered_results, document_name_to_id)
+            final_result = await self.merge_and_rank_results(user_query, filtered_results, document_name_to_id)
             
             # Add timestamp
             final_result["processed_at"] = datetime.now().isoformat()
@@ -956,14 +968,14 @@ async def query_obligations_post(request: QueryRequest):
     try:
         if request.output_folder:
             qs = ObligationQuerySystem(local_output_folder=request.output_folder, model=os.getenv('GEMINI_MODEL', 'gemini-2.5-flash'))
-            result = qs.query(
+            result = await qs.query(
                 user_query=request.query,
                 save_output=request.save_output,
                 document_ids=request.document_ids
             )
         else:
             # Use default query system instance
-            result = query_system_instance.query(
+            result = await query_system_instance.query(
                 user_query=request.query,
                 save_output=request.save_output,
                 document_ids=request.document_ids
@@ -1079,8 +1091,8 @@ async def list_documents():
 # Command Line Interface
 # ============================================================================
 
-def main():
-    """Main entry point for command-line usage"""
+async def main():
+    """Main entry point for command-line usage (async)"""
     import sys
     
     # Get query from command line or prompt user
@@ -1096,8 +1108,8 @@ def main():
     query_system = ObligationQuerySystem(local_output_folder=os.getenv('OUTPUT_FOLDER', 'output'), model=os.getenv('GEMINI_MODEL', 'gemini-2.5-flash'))
     print(f"Output folder: {query_system.local_output_folder}")
     
-    # Execute query
-    result = query_system.query(user_query)
+    # Execute query (now async)
+    result = await query_system.query(user_query)
     
     # Print results
     print("\n" + "=" * 80)
@@ -1110,5 +1122,5 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
 

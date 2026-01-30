@@ -6,6 +6,7 @@ Supports:
      - With GOOGLE_CLOUD_PROJECT set: standard Vertex path (project/location in URL).
      - Without project: Vertex express mode — no project ID needed; key is tied to project at creation.
 """
+import asyncio
 import os
 from typing import Optional
 
@@ -141,3 +142,38 @@ def generate_content(
     )[0].get("content", {}).get("parts") or []
     text = (parts[0].get("text") or "").strip()
     return GeminiResponse(text)
+
+
+async def generate_content_async(
+    prompt: str,
+    *,
+    model: Optional[str] = None,
+    api_key: Optional[str] = None,
+    temperature: float = 0.1,
+    response_mime_type: str = "application/json",
+) -> GeminiResponse:
+    """
+    Async version of generate_content using asyncio.to_thread.
+    
+    This wraps the synchronous generate_content function to allow it to be used
+    in async contexts without blocking the event loop. The actual HTTP request
+    is executed in a thread pool.
+    
+    Args:
+        prompt: The text prompt to send to Gemini
+        model: Model name (optional, defaults to GEMINI_MODEL env var)
+        api_key: API key (optional, defaults to GEMINI_API_KEY env var)
+        temperature: Generation temperature (default: 0.1)
+        response_mime_type: Expected response MIME type (default: "application/json")
+    
+    Returns:
+        GeminiResponse object with .text attribute
+    """
+    return await asyncio.to_thread(
+        generate_content,
+        prompt,
+        model=model,
+        api_key=api_key,
+        temperature=temperature,
+        response_mime_type=response_mime_type
+    )
