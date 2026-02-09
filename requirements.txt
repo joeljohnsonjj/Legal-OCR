@@ -30,6 +30,11 @@ pydantic>=2.0.0
 # HTTP requests (for health checks)
 requests>=2.31.0
 
+# Vector store for obligation chunks (ChromaDB + optional OpenAI embeddings)
+chromadb>=0.4.0
+sentence-transformers>=2.2.0
+openai>=1.0.0
+
 # GCS Emulator (optional, for local development)
 # Install from local directory: pip install -e ./gcp-storage-emulator-main
 # Or install from PyPI: pip install gcp-storage-emulator

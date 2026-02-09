@@ -20,50 +20,49 @@ from pdf2image import convert_from_path
 from PIL import Image
 import pytesseract
 
-# Gemini API (REST + API key only, no GCP)
-from gemini_client import generate_content as gemini_generate_content
+# LLM API (Azure OpenAI or Gemini via llm_client)
+from llm_client import generate_content as llm_generate_content, get_default_model
 
 # Environment Variables
 from dotenv import load_dotenv
 load_dotenv()
 
 
-# GCS Client Helper (for future GCS integration)
-def get_storage_client():
-    """
-    Get a Google Cloud Storage client, configured for fake GCS if STORAGE_EMULATOR_HOST is set.
-    
-    Returns:
-        storage.Client: Configured GCS client (connects to fake GCS if STORAGE_EMULATOR_HOST is set)
-    
-    Note:
-        This function is provided for future GCS integration. The current code uses local file system.
-        When STORAGE_EMULATOR_HOST is set, the client automatically connects to fake GCS server.
-    """
-    try:
-        from google.cloud import storage
-        # The storage client automatically uses STORAGE_EMULATOR_HOST if set
-        # No special configuration needed - just create the client normally
-        client = storage.Client()
-        return client
-    except ImportError:
-        logging.getLogger(__name__).warning(
-            "google-cloud-storage not available. GCS functionality will not work."
+def _extract_obligations_list(parsed: Any) -> List[Dict[str, Any]]:
+    """Extract list of obligation dicts from LLM response (array or object with array in known keys or single obligation dict)."""
+    def is_obligation_list(lst: Any) -> bool:
+        return (
+            isinstance(lst, list)
+            and len(lst) > 0
+            and isinstance(lst[0], dict)
+            and ("DutyType" in lst[0] or "Responsible Party" in lst[0])
         )
-        return None
-    except Exception as e:
-        logging.getLogger(__name__).error(f"Error creating storage client: {e}")
-        return None
 
+    def is_single_obligation(d: Any) -> bool:
+        return (
+            isinstance(d, dict)
+            and ("DutyType" in d or "Responsible Party" in d)
+        )
 
-def is_fake_gcs_mode():
-    """
-    Check if fake GCS mode is enabled (STORAGE_EMULATOR_HOST is set).
-    
-    Returns:
-        bool: True if fake GCS mode is enabled, False otherwise
-    """
-    return bool(os.getenv("STORAGE_EMULATOR_HOST"))
+    if isinstance(parsed, list):
+        if is_obligation_list(parsed):
+            return parsed
+        return parsed if parsed else []
+    if isinstance(parsed, dict):
+        # LLM sometimes returns a single obligation object at root instead of an array
+        if is_single_obligation(parsed):
+            return [parsed]
+        for key in (
+            "consolidated_results", "results", "obligations", "data", "items",
+            "obligations_list", "consolidated", "output", "obligations_array",
+        ):
+            val = parsed.get(key)
+            if is_obligation_list(val):
+                return val
+        for val in parsed.values():
+            if is_obligation_list(val):
+                return val
+    return []
 
 
 # Exponential backoff retry decorator
@@ -339,9 +338,16 @@ class GeminiAnalyzer:
         
         # Initialize party metadata tracking
         self.party_metadata = {}
-        if not os.getenv('GEMINI_API_KEY') and not os.getenv('GOOGLE_API_KEY'):
-            raise ValueError("GEMINI_API_KEY must be set in .env (Gemini API key from https://aistudio.google.com/app/apikey)")
-        self.logger.info("Gemini client (REST + API key) ready")
+        _use_azure = os.getenv("USE_AZURE_OPENAI", "").lower() in ("true", "1", "yes")
+        if _use_azure:
+            if not os.getenv("AZURE_OPENAI_ENDPOINT") or not (os.getenv("AZURE_OPENAI_API_KEY") or os.getenv("AZURE_OPENAI_KEY") or os.getenv("OPENAI_API_KEY")):
+                raise ValueError("USE_AZURE_OPENAI is set; AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_API_KEY (or AZURE_OPENAI_KEY) must be set in .env")
+            if not os.getenv("AZURE_OPENAI_DEPLOYMENT") and not os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME") and not os.getenv("OPENAI_DEPLOYMENT_NAME"):
+                raise ValueError("USE_AZURE_OPENAI is set; AZURE_OPENAI_DEPLOYMENT or AZURE_OPENAI_DEPLOYMENT_NAME must be set in .env")
+        else:
+            if not os.getenv('GEMINI_API_KEY') and not os.getenv('GOOGLE_API_KEY'):
+                raise ValueError("GEMINI_API_KEY must be set in .env (Gemini API key from https://aistudio.google.com/app/apikey)")
+        self.logger.info("LLM client (Azure OpenAI or Gemini) ready")
     
     def reset_party_metadata(self):
         """
@@ -353,13 +359,14 @@ class GeminiAnalyzer:
         self.party_metadata = {}
         self.logger.info("Party metadata reset for new document")
     
-    def _generate_content(self, prompt: str, temperature: float = 0.1, response_mime_type: str = "application/json"):
-        """Call Gemini via REST using GEMINI_API_KEY only."""
-        return gemini_generate_content(
+    def _generate_content(self, prompt: str, temperature: float = 0.1, response_mime_type: str = "application/json", max_output_tokens: Optional[int] = None):
+        """Call configured LLM (Azure OpenAI or Gemini) via llm_client."""
+        return llm_generate_content(
             prompt,
             model=self.model,
             temperature=temperature,
             response_mime_type=response_mime_type,
+            max_output_tokens=max_output_tokens,
         )
     
     @retry_with_exponential_backoff(max_retries=5, initial_delay=5.0, exponential_base=2.0)
@@ -497,8 +504,15 @@ Extract party metadata as JSON:"""
                 
                 metadata_context += "\nIMPORTANT: When extracting obligations, use the actual party names (e.g., 'ABC Company') in the 'Responsible Party' field, NOT the reference labels (e.g., 'Tenant'). If the actual name is not yet known, use the reference label.\n"
             
-            # Construct the full prompt with metadata
-            full_prompt = f"{self.prompt_template}{metadata_context}\n\n--- PAGE {page_num} TEXT ---\n\n{page_text}"
+            # Construct the full prompt with metadata (explicit: extract ALL obligations, multiple per page)
+            # Ask for object with "obligations" key so Azure response_format json_object is satisfied (root must be object, not array)
+            full_prompt = f"""{self.prompt_template}{metadata_context}
+
+CRITICAL — OUTPUT FORMAT: Respond with a single JSON object that has exactly one key: "obligations". The value of "obligations" must be a JSON array listing EVERY financial obligation on this page. One obligation = one object in that array. If the page mentions rent, deposit, taxes, insurance, utilities, maintenance, fees, etc., each must be a separate object in the array. Do NOT combine them into one. Example: {{ "obligations": [ {{ "DutyType": "...", "Responsible Party": "...", ... }}, {{ "DutyType": "...", ... }} ] }}
+
+--- PAGE {page_num} TEXT (extract every financial obligation below; put each as an object in the "obligations" array) ---
+
+{page_text}"""
             
             self.logger.info(f"Analyzing page {page_num} with Gemini API...")
             
@@ -522,13 +536,33 @@ Extract party metadata as JSON:"""
             
             result_text = result_text.strip()
             
-            # Parse JSON
-            obligations = json.loads(result_text)
+            # Parse JSON (handle array, or object with obligations/results/items/etc., or single obligation object)
+            parsed = json.loads(result_text)
+            if isinstance(parsed, list):
+                obligations = parsed
+            elif isinstance(parsed, dict):
+                # Unwrap: prefer "obligations" (asked in prompt), then other common keys
+                for key in ("obligations", "results", "items", "data", "consolidated_results", "records"):
+                    if isinstance(parsed.get(key), list):
+                        obligations = parsed[key]
+                        break
+                else:
+                    # Single obligation object (DutyType etc.) — treat as one
+                    if any(k in parsed for k in ("DutyType", "Responsible Party", "Owner Responsibility")):
+                        obligations = [parsed]
+                    else:
+                        # Any dict value that is a list of objects with DutyType?
+                        for v in parsed.values():
+                            if isinstance(v, list) and v and isinstance(v[0], dict) and "DutyType" in v[0]:
+                                obligations = v
+                                break
+                        else:
+                            obligations = []
+            else:
+                obligations = []
             
-            # Ensure it's a list
-            if not isinstance(obligations, list):
-                obligations = [obligations]
-            
+            if len(obligations) == 0:
+                self.logger.warning(f"Page {page_num}: 0 obligations — API response (first 600 chars): {result_text[:600]!r}")
             self.logger.info(f"Page {page_num}: Found {len(obligations)} financial obligations")
             return obligations
             
@@ -554,102 +588,102 @@ Extract party metadata as JSON:"""
                 return []
     
     @retry_with_exponential_backoff(max_retries=5, initial_delay=5.0, exponential_base=2.0)
-    def consolidate_results(self, all_page_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def consolidate_results_to_json(self, all_page_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
-        Consolidate results from all pages using Gemini API
-        
-        Args:
-            all_page_results: List of all obligations from all pages
-            
-        Returns:
-            Consolidated list of financial obligations
+        Consolidate obligations from all pages into a single, deduplicated JSON array using the LLM.
+        Returns the list of consolidated obligation dicts (same structure: DutyType, Responsible Party, Owner Responsibility, Reasoning, Citation).
         """
         try:
-            self.logger.info("Consolidating results from all pages...")
-            
-            # Build metadata context for consolidation
+            self.logger.info("Consolidating results into JSON...")
             metadata_context = ""
             if self.party_metadata:
-                metadata_context = "\n\nParty Metadata:\n"
+                metadata_context = "\n\nParty metadata (use Responsible Party as given or from metadata):\n"
                 for ref_label, info in self.party_metadata.items():
-                    actual_name = info.get("actual_name", "")
-                    if actual_name:
-                        metadata_context += f"- '{ref_label}' = {actual_name}\n"
-                metadata_context += "\nEnsure 'Responsible Party' uses actual party names, not reference labels.\n"
-            
-            # Prepare consolidated prompt
-            consolidation_prompt = f"""You are a legal analyst. You have been provided with financial obligations extracted from multiple pages of a legal document.
+                    actual_name = info.get("actual_name", "") or ref_label
+                    metadata_context += f"- {ref_label}: {actual_name}\n"
+            num_input = len(all_page_results)
+            consolidation_prompt = f"""You are a legal analyst. You have been provided with {num_input} financial obligations extracted from multiple pages of a legal document.
 
-Your task is to consolidate these obligations into a single, deduplicated JSON array. Follow these rules:
+Your task is to consolidate these into a single, deduplicated JSON array. The consolidated JSON must be produced directly from this input.
 
-1. Merge duplicate or highly similar obligations
-2. Preserve all unique obligations
-3. Keep the same JSON structure with fields: "DutyType", "Responsible Party", "Owner Responsibility", "Reasoning", "Citation"
-4. The "DutyType" field must be a short, precise label describing the specific monetary obligation (e.g., "Rent Payment", "Security Deposit", "Property Tax Payment", etc.)
-5. The "Responsible Party" field must be used as is.
-6. When merging, combine citations (e.g., "Page 3, Section A; Page 7, Section B")
-7. Maintain legal accuracy and precision
-8. Output ONLY a JSON array, no other text
+CRITICAL: You MUST output a non-empty JSON array. The input contains {num_input} obligations; your output must be a deduplicated/merged array of those obligations (fewer items after merging duplicates). Never return an empty array [].
+
+Rules:
+1. Merge duplicate or highly similar obligations (same Duty Type, same Party, same or similar obligation text).
+2. Preserve all unique obligations.
+3. Each element must have: "DutyType", "Responsible Party", "Owner Responsibility" (array of strings), "Reasoning" (array of strings), "Citation" (string), and "related_keywords" (array of strings).
+4. DutyType: short, precise label (e.g. Rent Payment, Security Deposit, Property Tax Payment).
+5. Responsible Party: use as given or from metadata below.
+6. When merging, combine citations (e.g., "Page 3, Section A; Page 7, Section B").
+7. related_keywords: for each obligation, add an array of 8–20 search keywords/phrases. You MUST include the DutyType itself (and normalised variations, e.g. "Rent Payment" → "rent payment", "rent") in this array. Add synonyms and related concepts so semantic search can find this obligation. Example: for DutyType "Property Insurance", related_keywords must include "Property Insurance" or "property insurance", plus e.g. ["insurance", "property insurance", "liability", "coverage", "premium", "tenant insurance"].
+8. Maintain legal accuracy. Output ONLY a valid JSON array, no other text.
 {metadata_context}
-Here are the extracted obligations:
+Extracted obligations from the document:
 
 {json.dumps(all_page_results, indent=2)}
 
-Provide the consolidated JSON array:"""
-
-            # Call Gemini API
+Output ONLY the consolidated JSON array (non-empty, deduplicated), starting with [ and ending with ]:"""
             response = self._generate_content(
                 prompt=consolidation_prompt,
                 temperature=0.1,
-                response_mime_type="application/json"
+                response_mime_type="application/json",
+                max_output_tokens=16384,
             )
-            
-            # Parse JSON response
-            result_text = response.text.strip()
-            
-            # Handle markdown code blocks if present
-            if result_text.startswith("```json"):
-                result_text = result_text[7:]
-            if result_text.startswith("```"):
-                result_text = result_text[3:]
+            result_text = (response.text or "").strip()
+            for prefix in ("```json", "```"):
+                if result_text.startswith(prefix):
+                    result_text = result_text[len(prefix):]
+                    break
             if result_text.endswith("```"):
                 result_text = result_text[:-3]
-            
             result_text = result_text.strip()
-            
-            # Parse JSON
-            consolidated = json.loads(result_text)
-            
-            # Ensure it's a list
-            if not isinstance(consolidated, list):
-                consolidated = [consolidated]
-            
-            self.logger.info(f"Consolidated into {len(consolidated)} unique obligations")
+            try:
+                parsed = json.loads(result_text)
+            except json.JSONDecodeError as e:
+                self.logger.error(
+                    "Consolidation JSON parse failed (possible truncation or invalid format). Error: %s. Response length: %d. First 500 chars: %s",
+                    e, len(result_text), result_text[:500],
+                )
+                raise
+            consolidated = _extract_obligations_list(parsed)
+            if not consolidated and all_page_results:
+                self.logger.error(
+                    "LLM consolidation returned 0 obligations although %d were extracted from the PDF. Parsed type: %s, keys: %s. Raw response (first 800 chars): %s",
+                    num_input,
+                    type(parsed).__name__,
+                    list(parsed.keys()) if isinstance(parsed, dict) else "n/a",
+                    result_text[:800],
+                )
+            # Ensure DutyType is always in related_keywords for semantic search
+            for ob in consolidated:
+                ob.pop("_source_page", None)
+                duty = ob.get("DutyType")
+                if duty is not None:
+                    duty_str = " ".join(duty).strip() if isinstance(duty, list) else str(duty).strip()
+                    if duty_str:
+                        kw = ob.get("related_keywords")
+                        if not isinstance(kw, list):
+                            ob["related_keywords"] = [duty_str]
+                        else:
+                            seen = {str(x).strip().lower() for x in kw if x}
+                            if duty_str.lower() not in seen:
+                                ob["related_keywords"] = [duty_str] + [x for x in kw if x]
+            self.logger.info(f"Consolidated into JSON ({len(consolidated)} obligations)")
             return consolidated
-            
-        except json.JSONDecodeError as e:
-            # JSON parsing errors should not trigger retry
-            self.logger.error(f"Error parsing consolidated results JSON: {e}")
-            return all_page_results
         except Exception as e:
-            # Check if it's a rate limiting error - if so, re-raise to trigger retry
             error_str = str(e).lower()
-            is_rate_limit = any(keyword in error_str for keyword in [
+            is_rate_limit = any(k in error_str for k in [
                 'rate limit', 'quota', 'resource exhausted', 'resource_exhausted',
                 'too many requests', '429', 'throttl'
             ])
-            
             if is_rate_limit:
-                # Re-raise to trigger retry decorator
                 raise
-            else:
-                # Non-rate-limit errors should not trigger retry
-                self.logger.error(f"Error consolidating results: {e}")
-                return all_page_results
+            self.logger.error(f"Error consolidating to JSON (consolidated output will be empty): {e}", exc_info=True)
+            return []
 
 
 class LegalDocumentProcessor:
-    """Legal document processing: local docs folder -> output folder. Uses Gemini API key only."""
+    """Legal document processing: local docs folder -> output folder. Uses Azure OpenAI or Gemini via llm_client."""
 
     def __init__(self,
                  local_docs_folder: Optional[str] = None,
@@ -657,9 +691,9 @@ class LegalDocumentProcessor:
                  logs_folder: str = "logs",
                  cache_folder: str = "ocr_cache",
                  prompt_file: str = "prompt.txt",
-                 model: str = "gemini-2.5-flash",
+                 model: str = "gemini-2.5-flash-lite",
                  tesseract_cmd: Optional[str] = None):
-        """Initialize with local docs and output folders. Requires GEMINI_API_KEY in .env."""
+        """Initialize with local docs and output folders. Requires GEMINI_API_KEY or (when USE_AZURE_OPENAI) Azure env vars in .env."""
         self.logs_folder = Path(logs_folder)
         self.cache_folder = Path(cache_folder)
         self.logs_folder.mkdir(exist_ok=True)
@@ -738,10 +772,10 @@ class LegalDocumentProcessor:
                 # Add delay between pages to stay under quota
                 if page_num < len(page_texts):  # Don't delay after last page
                     time.sleep(page_delay)
-            consolidated_results = self.gemini_analyzer.consolidate_results(all_page_results)
+            # In-memory consolidated, deduplicated obligations (one entry per unique obligation)
+            consolidated_results = self.gemini_analyzer.consolidate_results_to_json(all_page_results)
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             pagewise_filename = f"{doc_stem}_{timestamp}_pagewise.json"
-            consolidated_filename = f"{doc_stem}_{timestamp}_consolidated.json"
             pagewise_data = {
                 "document_name": doc_name,
                 "processed_at": datetime.now().isoformat(),
@@ -757,20 +791,44 @@ class LegalDocumentProcessor:
                 "total_obligations_found": len(all_page_results),
                 "consolidated_obligations_count": len(consolidated_results),
                 "party_metadata": self.gemini_analyzer.party_metadata,
-                "consolidated_results": consolidated_results
+                "consolidated_results": consolidated_results,
             }
             out_dir = Path(self.local_output_folder)
             out_dir.mkdir(parents=True, exist_ok=True)
             pagewise_path = out_dir / pagewise_filename
-            consolidated_path = out_dir / consolidated_filename
+            consolidated_json_path = out_dir / f"{doc_stem}_{timestamp}_consolidated.json"
             with open(pagewise_path, "w", encoding="utf-8") as f:
                 json.dump(pagewise_data, f, indent=2, ensure_ascii=False)
-            with open(consolidated_path, "w", encoding="utf-8") as f:
+            with open(consolidated_json_path, "w", encoding="utf-8") as f:
                 json.dump(consolidated_data, f, indent=2, ensure_ascii=False)
             self.logger.info(f"Page-wise results saved to: {pagewise_path}")
-            self.logger.info(f"Consolidated results saved to: {consolidated_path}")
-            result_path = str(consolidated_path.resolve())
-            self.logger.info(f"Processing complete! Pages: {len(page_texts)}, obligations: {len(all_page_results)}, consolidated: {len(consolidated_results)}")
+            self.logger.info(f"Consolidated JSON saved to: {consolidated_json_path}")
+            # Vector store: one chunk per consolidated (deduplicated) obligation in ChromaDB
+            # index_obligations deletes this document's old chunks first, then re-indexes (no orphans)
+            try:
+                from vector_store import index_obligations
+                chroma_path = str(out_dir / "chroma_db")
+                num_indexed = index_obligations(
+                    document_name=doc_name,
+                    consolidated_results=consolidated_results,
+                    chroma_path=chroma_path,
+                )
+                self.logger.info(f"Vector index: {num_indexed} obligation chunks (from consolidated deduplicated list) indexed in ChromaDB at {chroma_path}")
+            except ImportError:
+                self.logger.warning("ChromaDB/sentence-transformers not installed; skipping vector indexing. pip install chromadb sentence-transformers")
+            except Exception as e:
+                err_msg = str(e).lower()
+                if "deploymentnotfound" in err_msg or "404" in err_msg or "does not exist" in err_msg:
+                    self.logger.warning(
+                        "Vector indexing failed: Azure embedding deployment not found. "
+                        "In Azure Portal (portal.azure.com or ai.azure.com) create a deployment for model 'text-embedding-3-small' "
+                        "and set AZURE_OPENAI_EMBEDDING_DEPLOYMENT to that deployment name. "
+                        "Or leave AZURE_OPENAI_EMBEDDING_DEPLOYMENT unset to use local embeddings (no Azure deployment needed)."
+                    )
+                else:
+                    self.logger.warning(f"Vector indexing failed (processing succeeded): {e}")
+            result_path = str(consolidated_json_path.resolve())
+            self.logger.info(f"Processing complete! Pages: {len(page_texts)}, obligations: {len(all_page_results)}")
             return result_path
         except Exception as e:
             self.logger.error(f"Error processing document: {e}", exc_info=True)
@@ -879,7 +937,7 @@ def main():
         logs_folder=os.getenv('LOGS_FOLDER', 'logs'),
         cache_folder=os.getenv('CACHE_FOLDER', 'ocr_cache'),
         prompt_file=os.getenv('PROMPT_FILE', 'prompt.txt'),
-        model=os.getenv('GEMINI_MODEL', 'gemini-2.5-flash'),
+        model=get_default_model(),
         tesseract_cmd=os.getenv('TESSERACT_CMD')
     )
     processor.run()

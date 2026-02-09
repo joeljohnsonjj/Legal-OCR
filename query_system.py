@@ -8,16 +8,17 @@ import os
 import json
 import logging
 import re
+import time
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 from urllib.parse import unquote, urlparse
 
-# Gemini API (REST + API key only)
-from gemini_client import generate_content as gemini_generate_content
+# LLM API (Azure OpenAI or Gemini via llm_client)
+from llm_client import generate_content as llm_generate_content, get_default_model
 
 # FastAPI
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Body, FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -27,59 +28,212 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
-# GCS Client Helper (for future GCS integration)
-def get_storage_client():
-    """
-    Get a Google Cloud Storage client, configured for fake GCS if STORAGE_EMULATOR_HOST is set.
-    
-    Returns:
-        storage.Client: Configured GCS client (connects to fake GCS if STORAGE_EMULATOR_HOST is set)
-    
-    Note:
-        This function is provided for future GCS integration. The current code uses local file system.
-        When STORAGE_EMULATOR_HOST is set, the client automatically connects to fake GCS server.
-    """
-    try:
-        from google.cloud import storage
-        # The storage client automatically uses STORAGE_EMULATOR_HOST if set
-        # No special configuration needed - just create the client normally
-        client = storage.Client()
-        return client
-    except ImportError:
-        logging.getLogger(__name__).warning(
-            "google-cloud-storage not available. GCS functionality will not work."
-        )
-        return None
-    except Exception as e:
-        logging.getLogger(__name__).error(f"Error creating storage client: {e}")
-        return None
+def _normalize_ob_key(ob: Dict[str, Any]) -> tuple:
+    """Build a key for deduplication: (duty, party, first 80 chars of key obligation)."""
+    duty = (ob.get("DutyType") or "")
+    duty = " ".join(str(duty).split()).lower() if duty else ""
+    party = (ob.get("Responsible Party") or "")
+    party = " ".join(str(party).split()).lower() if party else ""
+    key_ob = ob.get("Owner Responsibility")
+    if isinstance(key_ob, list):
+        key_ob = " ".join(str(x) for x in key_ob if x)[:80]
+    else:
+        key_ob = (str(key_ob or ""))[:80]
+    key_ob = " ".join(key_ob.split()).lower()
+    return (duty, party, key_ob)
 
 
-def is_fake_gcs_mode():
+def _citation_parts_from_ob(ob: Dict[str, Any]) -> List[str]:
+    """Extract all citation parts (page/section strings) from one obligation, including _source_page."""
+    parts = []
+    src_page = ob.get("_source_page")
+    if src_page is not None:
+        parts.append(f"Page {src_page}")
+    citation = ob.get("Citation")
+    if citation is None:
+        pass
+    elif isinstance(citation, str) and citation.strip():
+        parts.append(citation.strip())
+    elif isinstance(citation, list):
+        for c in citation:
+            if isinstance(c, dict):
+                pages = c.get("pageNumbers") or []
+                sections = c.get("section") or []
+                if pages or sections:
+                    page_part = f"Page {', '.join(map(str, pages))}" if pages else ""
+                    section_part = "; ".join(sections) if sections else ""
+                    parts.append(", ".join(filter(None, [page_part, section_part])))
+            else:
+                parts.append(str(c))
+    return parts
+
+
+def deduplicate_and_merge_citations(obligations: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
-    Check if fake GCS mode is enabled (STORAGE_EMULATOR_HOST is set).
-    
-    Returns:
-        bool: True if fake GCS mode is enabled, False otherwise
+    Deduplicate obligations that represent the same duty (same DutyType, Party, and similar obligation text).
+    For each merged group, combine Owner Responsibility, Reasoning, and Citation so that Citation lists
+    ALL page numbers and sections where that obligation is mentioned.
     """
-    return bool(os.getenv("STORAGE_EMULATOR_HOST"))
+    if not obligations:
+        return []
+    groups: Dict[tuple, List[Dict[str, Any]]] = {}
+    for ob in obligations:
+        key = _normalize_ob_key(ob)
+        groups.setdefault(key, []).append(ob)
+    merged = []
+    for key, group in groups.items():
+        first = group[0].copy()
+        # Collect all citation parts from the group (all pages and sections)
+        all_citation_parts = []
+        seen_citation = set()
+        for o in group:
+            for p in _citation_parts_from_ob(o):
+                if p and p not in seen_citation:
+                    seen_citation.add(p)
+                    all_citation_parts.append(p)
+        first["Citation"] = "; ".join(all_citation_parts) if all_citation_parts else ""
+        # Merge Owner Responsibility and Reasoning (unique items)
+        owner_set = []
+        seen_owner = set()
+        for o in group:
+            val = o.get("Owner Responsibility")
+            for item in (val if isinstance(val, list) else [val] if val is not None else []):
+                s = str(item).strip()
+                if s and s not in seen_owner:
+                    seen_owner.add(s)
+                    owner_set.append(s)
+        first["Owner Responsibility"] = owner_set
+        reason_set = []
+        seen_reason = set()
+        for o in group:
+            val = o.get("Reasoning")
+            for item in (val if isinstance(val, list) else [val] if val is not None else []):
+                s = str(item).strip()
+                if s and s not in seen_reason:
+                    seen_reason.add(s)
+                    reason_set.append(s)
+        first["Reasoning"] = reason_set
+        first.pop("_source_page", None)
+        merged.append(first)
+    return merged
+
+
+def consolidated_results_to_markdown_table(obligations: List[Dict[str, Any]]) -> str:
+    """
+    Transform consolidated_results (or results) into a single Markdown table string.
+    Deduplicates obligations and merges citations so each row lists all page numbers and sections.
+    Flattens Owner Responsibility and Reasoning to semicolon-separated strings;
+    escapes pipe characters so they don't break table syntax.
+    """
+    obligations = deduplicate_and_merge_citations(obligations or [])
+    HEADERS = "| Duty Type | Party | Key Obligations | Reasoning | Citation |"
+    SEP = "| :--- | :--- | :--- | :--- | :--- |"
+
+    def _cell(s: str) -> str:
+        """Replace pipe with slash so Markdown table doesn't break."""
+        return (s or "").replace("|", "/").strip()
+
+    def _flatten(val: Any) -> str:
+        if val is None:
+            return ""
+        if isinstance(val, list):
+            parts = [str(x).strip() for x in val if x is not None]
+            return "; ".join(parts)
+        return str(val).strip()
+
+    def _citation_str(citation: Any) -> str:
+        if citation is None:
+            return ""
+        if isinstance(citation, str):
+            return citation
+        if isinstance(citation, list):
+            out = []
+            for c in citation:
+                if isinstance(c, dict):
+                    pages = c.get("pageNumbers") or []
+                    sections = c.get("section") or []
+                    if pages or sections:
+                        page_part = f"Page {', '.join(map(str, pages))}" if pages else ""
+                        section_part = "; ".join(sections) if sections else ""
+                        out.append(", ".join(filter(None, [page_part, section_part])))
+                else:
+                    out.append(str(c))
+            return "; ".join(out)
+        return str(citation)
+
+    rows = [HEADERS, SEP]
+    for ob in obligations:
+        duty = _cell(_flatten(ob.get("DutyType")))
+        party = _cell(_flatten(ob.get("Responsible Party")))
+        key_ob = _cell(_flatten(ob.get("Owner Responsibility")))
+        reasoning = _cell(_flatten(ob.get("Reasoning")))
+        citation = _cell(_citation_str(ob.get("Citation")))
+        rows.append(f"| {duty} | {party} | {key_ob} | {reasoning} | {citation} |")
+    return "\n".join(rows)
+
+
+def parse_markdown_table_to_obligations(md_text: str) -> List[Dict[str, Any]]:
+    """
+    Parse a consolidated Markdown table (Duty Type | Party | Key Obligations | Reasoning | Citation)
+    into a list of obligation dicts in the same JSON shape as before:
+    DutyType, Responsible Party, Owner Responsibility (list), Reasoning (list), Citation (string).
+    """
+    obligations = []
+    lines = [ln.strip() for ln in md_text.strip().splitlines() if ln.strip()]
+    if len(lines) < 3:
+        return obligations
+    # Skip header (line 0) and separator (line 1); data rows start at line 2
+    for line in lines[2:]:
+        if not line.startswith("|"):
+            continue
+        parts = [p.strip() for p in line.split("|")]
+        # Table format: | cell | cell | cell | cell | cell |  -> parts = ['', c1, c2, c3, c4, c5, '']
+        if len(parts) < 6:
+            continue
+        duty_type = (parts[1] or "").replace("/", "|").strip()
+        party = (parts[2] or "").replace("/", "|").strip()
+        key_ob = (parts[3] or "").replace("/", "|").strip()
+        reasoning = (parts[4] or "").replace("/", "|").strip()
+        citation = (parts[5] or "").replace("/", "|").strip()
+        # Split Key Obligations and Reasoning by semicolon into lists (original format)
+        owner_resp = [x.strip() for x in key_ob.split(";") if x.strip()] if key_ob else []
+        reasoning_list = [x.strip() for x in reasoning.split(";") if x.strip()] if reasoning else []
+        if not owner_resp and key_ob:
+            owner_resp = [key_ob]
+        if not reasoning_list and reasoning:
+            reasoning_list = [reasoning]
+        obligations.append({
+            "DutyType": duty_type,
+            "Responsible Party": party,
+            "Owner Responsibility": owner_resp,
+            "Reasoning": reasoning_list,
+            "Citation": citation,
+        })
+    return obligations
 
 
 class ObligationQuerySystem:
-    """Query legal obligations from consolidated JSON in output folder. Uses Gemini API key only."""
+    """Query legal obligations from consolidated JSON in output folder. Uses Azure OpenAI or Gemini via llm_client."""
 
     def __init__(
         self,
         local_output_folder: Optional[str] = None,
         model: Optional[str] = None,
     ):
-        """Initialize with local output folder. Requires GEMINI_API_KEY in .env."""
+        """Initialize with local output folder. Requires GEMINI_API_KEY or (when USE_AZURE_OPENAI) Azure env vars in .env."""
         self.local_output_folder = str(Path(local_output_folder or os.getenv("OUTPUT_FOLDER", "output")).resolve())
-        self.model = model or os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+        _use_azure = os.getenv("USE_AZURE_OPENAI", "").lower() in ("true", "1", "yes")
+        self.model = model or (os.getenv("AZURE_OPENAI_DEPLOYMENT") or os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME") or os.getenv("OPENAI_DEPLOYMENT_NAME") if _use_azure else os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite"))
         self.logger = logging.getLogger(__name__)
         self._setup_logging()
-        if not os.getenv("GEMINI_API_KEY") and not os.getenv("GOOGLE_API_KEY"):
-            raise ValueError("GEMINI_API_KEY must be set in .env (https://aistudio.google.com/app/apikey)")
+        if _use_azure:
+            if not os.getenv("AZURE_OPENAI_ENDPOINT") or not (os.getenv("AZURE_OPENAI_API_KEY") or os.getenv("AZURE_OPENAI_KEY") or os.getenv("OPENAI_API_KEY")):
+                raise ValueError("USE_AZURE_OPENAI is set; AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_API_KEY (or AZURE_OPENAI_KEY) must be set in .env")
+            if not os.getenv("AZURE_OPENAI_DEPLOYMENT") and not os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME") and not os.getenv("OPENAI_DEPLOYMENT_NAME"):
+                raise ValueError("USE_AZURE_OPENAI is set; AZURE_OPENAI_DEPLOYMENT or AZURE_OPENAI_DEPLOYMENT_NAME must be set in .env")
+        else:
+            if not os.getenv("GEMINI_API_KEY") and not os.getenv("GOOGLE_API_KEY"):
+                raise ValueError("GEMINI_API_KEY must be set in .env (https://aistudio.google.com/app/apikey)")
         self.logger.info(f"ObligationQuerySystem: output={self.local_output_folder}, model={self.model}")
     
     def _setup_logging(self):
@@ -94,23 +248,25 @@ class ObligationQuerySystem:
         self.logger = logging.getLogger(__name__)
     
     def _generate_content(self, prompt: str, temperature: float = 0.1, response_mime_type: str = "application/json"):
-        """Call Gemini via REST using GEMINI_API_KEY only."""
-        return gemini_generate_content(prompt, model=self.model, temperature=temperature, response_mime_type=response_mime_type)
+        """Call configured LLM (Azure OpenAI or Gemini) via llm_client."""
+        return llm_generate_content(prompt, model=self.model, temperature=temperature, response_mime_type=response_mime_type)
     
     async def _generate_content_async(self, prompt: str, temperature: float = 0.1, response_mime_type: str = "application/json"):
-        """Async wrapper for Gemini API calls using asyncio.to_thread."""
-        from gemini_client import generate_content_async
+        """Async wrapper for LLM API calls (Azure OpenAI or Gemini)."""
+        from llm_client import generate_content_async
         return await generate_content_async(prompt, model=self.model, temperature=temperature, response_mime_type=response_mime_type)
     
     def load_consolidated_jsons(self) -> List[Dict[str, Any]]:
-        """Load all *_consolidated.json files from output folder."""
+        """Load *_consolidated.json first, then *_consolidated.md, then *_pagewise.json. Prefers JSON."""
+        t0 = time.perf_counter()
+        self.logger.info("[TIMING] Step: load_consolidated_jsons - start")
         root = Path(self.local_output_folder)
         if not root.exists():
             self.logger.warning(f"Output folder does not exist: {root}")
             return []
-        patterns = list(root.rglob("*_consolidated.json"))
         loaded_data = []
-        for p in sorted(patterns):
+        # 1. Prefer consolidated JSON
+        for p in sorted(root.rglob("*_consolidated.json")):
             try:
                 with open(p, "r", encoding="utf-8") as f:
                     data = json.load(f)
@@ -118,14 +274,203 @@ class ObligationQuerySystem:
                     "file_path": str(p.resolve()),
                     "file_name": p.name,
                     "document_name": data.get("document_name", "Unknown"),
-                    "data": data
+                    "data": data,
                 })
                 self.logger.info(f"Loaded: {p.name}")
             except Exception as e:
                 self.logger.error(f"Error loading {p}: {e}")
+        # 2. Else load consolidated Markdown (parse to same shape)
+        if not loaded_data:
+            md_files = list(sorted(root.rglob("*_consolidated.md")))
+            for p in md_files:
+                try:
+                    with open(p, "r", encoding="utf-8") as f:
+                        md_text = f.read()
+                    obligations = parse_markdown_table_to_obligations(md_text)
+                    stem = p.stem
+                    document_name = re.sub(r"_\d{8}_\d{6}_consolidated$", "", stem)
+                    if not document_name:
+                        document_name = stem
+                    document_name = f"{document_name}.pdf"
+                    data = {
+                        "document_name": document_name,
+                        "consolidated_results": obligations,
+                        "total_obligations_found": len(obligations),
+                        "party_metadata": {},
+                    }
+                    loaded_data.append({
+                        "file_path": str(p.resolve()),
+                        "file_name": p.name,
+                        "document_name": document_name,
+                        "data": data,
+                    })
+                    self.logger.info(f"Loaded (markdown): {p.name} -> {len(obligations)} obligations")
+                except Exception as e:
+                    self.logger.error(f"Error loading {p}: {e}")
+        # 3. Else load pagewise and flatten to consolidated_results
+        if not loaded_data:
+            for p in sorted(root.rglob("*_pagewise.json")):
+                try:
+                    with open(p, "r", encoding="utf-8") as f:
+                        pw = json.load(f)
+                    page_results = pw.get("page_results") or {}
+                    keys_sorted = sorted(page_results.keys(), key=lambda x: int(x) if str(x).isdigit() else 0)
+                    flat = [ob for k in keys_sorted for ob in page_results[k]]
+                    data = {
+                        "document_name": pw.get("document_name", "Unknown"),
+                        "consolidated_results": flat,
+                        "total_obligations_found": len(flat),
+                        "party_metadata": pw.get("party_metadata") or {},
+                    }
+                    loaded_data.append({
+                        "file_path": str(p.resolve()),
+                        "file_name": p.name,
+                        "document_name": data["document_name"],
+                        "data": data,
+                    })
+                    self.logger.info(f"Loaded (pagewise): {p.name}")
+                except Exception as e:
+                    self.logger.error(f"Error loading {p}: {e}")
+        elapsed = time.perf_counter() - t0
+        self.logger.info(f"[TIMING] Step: load_consolidated_jsons - done in {elapsed:.3f}s ({len(loaded_data)} files)")
         return loaded_data
-    
-    async def filter_obligations_by_query(self, user_query: str, consolidated_data: Dict[str, Any], 
+
+    @staticmethod
+    def _parse_vector_chunk_text(chunk_text: str) -> Dict[str, Any]:
+        """
+        Parse chunk text produced by vector_store.obligation_to_chunk_text().
+        Format: "DutyType: ... Responsible Party: ... Key Obligations: ... Reasoning: ... Citation: ..."
+        Returns dict with 'Owner Responsibility' (list) and 'Reasoning' (list) only.
+        """
+        if not chunk_text or not isinstance(chunk_text, str):
+            return {"Owner Responsibility": [], "Reasoning": []}
+        text = chunk_text.strip()
+        owner_resp: List[str] = []
+        reasoning: List[str] = []
+        key_ob_prefix = "Key Obligations:"
+        reasoning_prefix = "Reasoning:"
+        citation_prefix = "Citation:"
+        if key_ob_prefix in text:
+            start = text.find(key_ob_prefix) + len(key_ob_prefix)
+            end = text.find(reasoning_prefix, start)
+            if end == -1:
+                end = len(text)
+            key_ob_str = text[start:end].strip().rstrip(".").strip()
+            if key_ob_str:
+                owner_resp = [key_ob_str]
+        if reasoning_prefix in text:
+            start = text.find(reasoning_prefix) + len(reasoning_prefix)
+            end = text.find(citation_prefix, start)
+            if end == -1:
+                end = len(text)
+            reasoning_str = text[start:end].strip().rstrip(".").strip()
+            if reasoning_str:
+                reasoning = [reasoning_str]
+        return {"Owner Responsibility": owner_resp, "Reasoning": reasoning}
+
+    def _query_vector_store(
+        self,
+        user_query: str,
+        n_results: int = 50,
+        document_ids: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Query ChromaDB by semantic similarity; only results with distance <= VECTOR_MAX_DISTANCE.
+        Returns the top n_results most similar obligation chunks; full obligations
+        are resolved from consolidated JSON (document_name + chunk_index).
+        Returns list of obligation dicts (DutyType, Responsible Party, Owner Responsibility, Reasoning, Citation)
+        with Citation prefixed by "Document: {document_name} | ".
+        """
+        try:
+            from vector_store import query_obligations
+            chroma_path = str(Path(self.local_output_folder) / "chroma_db")
+            if not Path(chroma_path).exists():
+                self.logger.info("Vector store path does not exist; skipping vector query")
+                return []
+            # Distance threshold: only results with distance <= VECTOR_MAX_DISTANCE (default 1.4)
+            max_dist_str = os.getenv("VECTOR_MAX_DISTANCE", "1.4").strip()
+            try:
+                max_distance = float(max_dist_str) if max_dist_str else 1.4
+            except ValueError:
+                max_distance = 1.4
+            self.logger.info(f"Vector query: max_distance={max_distance} (from VECTOR_MAX_DISTANCE)")
+            raw = query_obligations(
+                query_text=user_query,
+                n_results=500,
+                document_name=None,
+                chroma_path=chroma_path,
+                max_distance=max_distance,
+            )
+            if not raw:
+                return []
+            if document_ids:
+                normalized_allowed = set()
+                for doc_id in document_ids:
+                    d = (doc_id or "").strip()
+                    if not d:
+                        continue
+                    name = Path(d).name or d
+                    normalized_allowed.add(name.lower().strip())
+                    base = name.rsplit(".", 1)[0] if "." in name else name
+                    if base:
+                        normalized_allowed.add(base.lower())
+                filtered = []
+                for r in raw:
+                    doc_name = (r.get("document_name") or "").strip()
+                    doc_norm = doc_name.lower()
+                    doc_base = doc_norm.rsplit(".", 1)[0] if "." in doc_norm else doc_norm
+                    if doc_norm in normalized_allowed or doc_base in normalized_allowed:
+                        filtered.append(r)
+                raw = filtered
+            # Load consolidated JSONs to resolve full obligation by document_name + chunk_index
+            loaded = self.load_consolidated_jsons()
+            doc_to_results: Dict[str, List[Dict[str, Any]]] = {}
+            for entry in loaded:
+                data = entry.get("data") or {}
+                doc_name = (data.get("document_name") or "").strip()
+                results = data.get("consolidated_results") or []
+                if doc_name:
+                    doc_to_results[doc_name] = results
+            obligations = []
+            for r in raw:
+                doc_name = (r.get("document_name") or "").strip()
+                try:
+                    idx = int(r.get("chunk_index") or 0)
+                except (TypeError, ValueError):
+                    idx = 0
+                results = doc_to_results.get(doc_name)
+                if results and 0 <= idx < len(results):
+                    full_ob = results[idx]
+                    citation = full_ob.get("Citation") or ""
+                    if isinstance(citation, list):
+                        citation = "; ".join(str(c) for c in citation)
+                    if doc_name:
+                        citation = f"Document: {doc_name} | {citation}"
+                    obligations.append({
+                        "DutyType": full_ob.get("DutyType") or "",
+                        "Responsible Party": full_ob.get("Responsible Party") or "",
+                        "Owner Responsibility": full_ob.get("Owner Responsibility") if isinstance(full_ob.get("Owner Responsibility"), list) else [str(full_ob.get("Owner Responsibility") or "")],
+                        "Reasoning": full_ob.get("Reasoning") if isinstance(full_ob.get("Reasoning"), list) else [str(full_ob.get("Reasoning") or "")],
+                        "Citation": citation,
+                    })
+                else:
+                    # Fallback: build from metadata when consolidated lookup fails
+                    citation = r.get("Citation") or ""
+                    if doc_name:
+                        citation = f"Document: {doc_name} | {citation}"
+                    obligations.append({
+                        "DutyType": r.get("DutyType") or "",
+                        "Responsible Party": r.get("Responsible_Party") or "",
+                        "Owner Responsibility": [r.get("document") or ""] if r.get("document") else [],
+                        "Reasoning": [],
+                        "Citation": citation,
+                    })
+            return obligations
+        except Exception as e:
+            self.logger.warning(f"Vector store query failed, will use JSON path: {e}")
+            return []
+
+    async def filter_obligations_by_query(self, user_query: str, consolidated_data: Dict[str, Any],
                                    document_name: str) -> Dict[str, Any]:
         """
         Step 1: Filter obligations from a single consolidated JSON based on user query (ASYNC)
@@ -139,6 +484,8 @@ class ObligationQuerySystem:
             Filtered JSON with only relevant obligations
         """
         try:
+            t0 = time.perf_counter()
+            self.logger.info(f"[TIMING] Step: filter_obligations_by_query - start for doc '{document_name}'")
             # Extract obligations from consolidated data
             obligations = consolidated_data.get("consolidated_results", [])
             
@@ -241,12 +588,14 @@ Output the filtered JSON:"""
 
             self.logger.info(f"Filtering obligations from {document_name} for query: '{user_query}'")
             
-            # Call Gemini API asynchronously
+            # Call LLM API asynchronously (Azure OpenAI or Gemini)
+            t_gemini = time.perf_counter()
             response = await self._generate_content_async(
                 prompt=filter_prompt,
                 temperature=0.1,
                 response_mime_type="application/json"
             )
+            self.logger.info(f"[TIMING] Step: filter_obligations_by_query - LLM API call for '{document_name}' took {time.perf_counter() - t_gemini:.3f}s")
             
             # Parse JSON response
             result_text = response.text.strip()
@@ -269,8 +618,8 @@ Output the filtered JSON:"""
                 filtered_result["consolidated_results"] = []
             
             num_results = len(filtered_result.get("consolidated_results", []))
-            self.logger.info(f"  Found {num_results} relevant obligations in {document_name}")
-            
+            elapsed = time.perf_counter() - t0
+            self.logger.info(f"[TIMING] Step: filter_obligations_by_query - done for '{document_name}' in {elapsed:.3f}s ({num_results} obligations)")
             return filtered_result
             
         except Exception as e:
@@ -381,8 +730,12 @@ Output the filtered JSON:"""
             Single merged and ranked JSON
         """
         try:
-            # Filter out empty results
+            t0 = time.perf_counter()
+            self.logger.info("[TIMING] merge_and_rank: start")
+            # 1. Filter out empty results
+            t_step = time.perf_counter()
             non_empty_results = [r for r in filtered_results if r.get("consolidated_results")]
+            self.logger.info(f"[TIMING] merge_and_rank: 1. filter_empty_results - {time.perf_counter() - t_step:.3f}s")
             
             if not non_empty_results:
                 self.logger.info("No relevant obligations found across all documents")
@@ -393,110 +746,73 @@ Output the filtered JSON:"""
                     "results": []
                 }
             
-            # Prepare merge and rank prompt
-            merge_prompt = f"""You are a legal document analyst. You have been provided with filtered financial obligations from multiple legal documents, all relevant to a user's query.
+            # 2. Prepare merge and rank prompt (short prompt for faster API response)
+            t_step = time.perf_counter()
+            merge_prompt = f"""You are a legal document analyst. You have been provided with filtered financial obligations from multiple legal documents.
+
+Financial obligations = monetary responsibility, cost, payment, reimbursement, insurance, indemnification, or financial exposure. Preserve only content traceable to the document; do not invent or assume. Citation must reflect document content only.
+
+RELEVANCE FILTER (apply before merging): Include in your output only obligations that are clearly related to the user's query. The DutyType or Owner Responsibility should directly address the query topic (e.g. for "rent payment" include rent, base rent, monthly rent, late rent; for "utilities" include water, gas, electric, HVAC, etc.). Exclude obligations that are only vaguely or tangentially related (e.g. for "rent payment" exclude obligations that are purely about taxes, insurance, or other payments with no rent connection). When the connection is ambiguous but plausible, include the obligation rather than being overly strict.
 
 Your task is to merge these results into a single JSON and order them by:
 1. RELEVANCE to the user query (most relevant first)
 2. MONETARY VALUE (highest to lowest)
 
 CRITICAL INSTRUCTIONS:
-1. MERGE DUPLICATE OR HIGHLY SIMILAR OBLIGATIONS:
-   - If the same obligation appears in multiple documents (same DutyType, Responsible Party, and similar Owner Responsibility), merge them into a single obligation
-   - When merging, combine all citations from all sources into one Citation field
-   - Example: If "Rent Payment" appears in Document A (Page 3) and Document B (Page 5), create one obligation with Citation: "Document: A.pdf | Page 3, Section X; Document: B.pdf | Page 5, Section Y"
-   - Only merge obligations that are truly the same or highly similar (same duty type, same party, same monetary amount if specified)
-   - Preserve all unique obligations - do not merge obligations that are different
-
-2. COMBINE ALL OBLIGATIONS:
-   - Combine all obligations from all documents into a single array
-   - Do not drop obligations unless they are exact duplicates
-
-3. ORDER BY RELEVANCE AND VALUE:
-   - Order by relevance to the query first (most relevant first)
-   - Then by monetary value (highest amounts first)
-
-4. PRESERVE OBLIGATION CONTENT:
-   - Do NOT modify the content of any obligation - preserve exactly as given
-   - Keep all fields: "DutyType", "Responsible Party", "Owner Responsibility", "Reasoning", "Citation"
-   - Do not add, remove, or modify any other fields
-   - When merging duplicates, use the most complete/accurate version of each field
-
-5. UPDATE CITATION FORMAT:
-   - IMPORTANT: Update each obligation's "Citation" field to include the source document filename
+1. Combine all obligations from all documents into a single array
+2. Order by relevance first, then by monetary value (highest amounts first)
+3. Do NOT modify the content of any obligation - preserve exactly as given
+4. IMPORTANT: Update each obligation's "Citation" field to include the source document filename
    - Format: "Document: [filename] | [original citation]"
    - Example: "Document: Commercial Lease Agreement.pdf | Page 3, Section 5(a)"
-   - When merging duplicates, combine citations: "Document: A.pdf | Page 3, Section X; Document: B.pdf | Page 5, Section Y"
-   - Preserve the original citation format for each source
-
-6. OUTPUT:
-   - Output ONLY valid JSON, no commentary
-   - The total_obligations_found should reflect the count AFTER deduplication/merging
+5. Keep all fields: "DutyType", "Responsible Party", "Owner Responsibility", "Reasoning", "Citation"
+6. Do not add, remove, or modify any other fields
+7. Output ONLY valid JSON, no commentary
 
 User Query: "{user_query}"
 
 Filtered results from multiple documents:
 {json.dumps(non_empty_results, indent=2)}
 
-Return a JSON object with this EXACT structure:
+Return a JSON object with this structure:
 {{
   "query": "{user_query}",
   "total_documents_searched": {len(filtered_results)},
-  "total_obligations_found": <integer count of obligations after merging>,
+  "total_obligations_found": <count of obligations>,
   "results": [
-    {{
-      "DutyType": "string",
-      "Responsible Party": "string",
-      "Owner Responsibility": ["array of strings"],
-      "Reasoning": ["array of strings"],
-      "Citation": "string in format: Document: [filename] | [original citation]"
-      // Note: Citation will be converted to structured format later, so keep as string for now
-      // Format: "Document: [filename] | [original citation]"
-      // When merging duplicates, combine: "Document: A.pdf | Page 3, Section X; Document: B.pdf | Page 5, Section Y"
-    }}
-    // Array of all obligations, ordered by relevance (most relevant first) and monetary value (highest first)
+    // Array of all obligations, ordered by relevance and monetary value
+    // Each obligation must have Citation updated with document filename
   ]
 }}
 
-IMPORTANT OUTPUT FORMAT REQUIREMENTS:
-- "query": string (the user's query)
-- "total_documents_searched": integer (number of documents searched)
-- "total_obligations_found": integer (count of obligations AFTER merging duplicates)
-- "results": array of obligation objects, each with:
-  - "DutyType": string (short label describing the obligation)
-  - "Responsible Party": string (party responsible for the obligation)
-  - "Owner Responsibility": array of strings (list of responsibilities)
-  - "Reasoning": array of strings (explanations for the obligation)
-  - "Citation": string (format: "Document: [filename] | [original citation]")
-
 Output the merged and ranked JSON:"""
-
+            self.logger.info(f"[TIMING] merge_and_rank: 2. build_prompt - {time.perf_counter() - t_step:.3f}s")
             self.logger.info(f"Merging and ranking results for query: '{user_query}'")
             
-            # Call Gemini API asynchronously
+            # 3. Call LLM API asynchronously (Azure OpenAI or Gemini)
+            t_step = time.perf_counter()
             response = await self._generate_content_async(
                 prompt=merge_prompt,
                 temperature=0.1,
                 response_mime_type="application/json"
             )
+            self.logger.info(f"[TIMING] merge_and_rank: 3. llm_api_call - {time.perf_counter() - t_step:.3f}s")
             
-            # Parse JSON response
+            # 4. Parse JSON response (strip, strip markdown, json.loads)
+            t_step = time.perf_counter()
             result_text = response.text.strip()
-            
-            # Handle markdown code blocks if present
             if result_text.startswith("```json"):
                 result_text = result_text[7:]
             if result_text.startswith("```"):
                 result_text = result_text[3:]
             if result_text.endswith("```"):
                 result_text = result_text[:-3]
-            
             result_text = result_text.strip()
-            
-            # Parse JSON
             final_result = json.loads(result_text)
+            self.logger.info(f"[TIMING] merge_and_rank: 4. parse_response - {time.perf_counter() - t_step:.3f}s")
             
-            # Post-process: Convert Citation strings to structured format
+            # 5. Post-process: Convert Citation strings to structured format
+            t_step = time.perf_counter()
             if document_name_to_id:
                 for obligation in final_result.get("results", []):
                     citation_str = obligation.get("Citation", "")
@@ -529,18 +845,16 @@ Output the merged and ranked JSON:"""
                                 "pageNumbers": [],
                                 "section": []
                             }]
+            self.logger.info(f"[TIMING] merge_and_rank: 5. citation_post_process - {time.perf_counter() - t_step:.3f}s")
             
+            # 6. Fix count and finish
+            t_step = time.perf_counter()
             num_results = len(final_result.get("results", []))
-            
-            # Fix: Ensure total_obligations_found matches the actual count in results array
-            # Gemini sometimes reports an incorrect count, so we use the actual array length
             final_result["total_obligations_found"] = num_results
+            self.logger.info(f"[TIMING] merge_and_rank: 6. fix_count - {time.perf_counter() - t_step:.3f}s")
             
-            self.logger.info(
-                f"Final result: {num_results} obligations ranked and merged "
-                f"(updated total_obligations_found to match actual count)"
-            )
-            
+            elapsed = time.perf_counter() - t0
+            self.logger.info(f"[TIMING] merge_and_rank: total - {elapsed:.3f}s ({num_results} obligations)")
             return final_result
             
         except Exception as e:
@@ -566,6 +880,8 @@ Output the merged and ranked JSON:"""
             Final ranked results as JSON
         """
         try:
+            query_start = time.perf_counter()
+            self.logger.info("[TIMING] Query total - start")
             # If no query provided, default to utilities query
             if not user_query or user_query.strip() == "":
                 user_query = "utilities including water, gas, heat, light, electricity, telephone service, HVAC, sprinkler system, electrical and plumbing systems"
@@ -577,7 +893,52 @@ Output the merged and ranked JSON:"""
                 self.logger.info(f"Filtering by document_ids: {document_ids}")
             self.logger.info("=" * 80)
             
-            # Load all consolidated JSONs
+            # Step 1: Try vector store first (semantic search over obligation chunks)
+            t_vector = time.perf_counter()
+            self.logger.info("[TIMING] Step: vector store query - start")
+            vector_obligations = self._query_vector_store(user_query, n_results=50, document_ids=document_ids)
+            self.logger.info(f"[TIMING] Step: vector store query - done in {time.perf_counter() - t_vector:.3f}s ({len(vector_obligations)} results)")
+            
+            if vector_obligations:
+                # Group vector results by document for merge_and_rank (same shape as LLM filter output)
+                doc_to_obligations: Dict[str, List[Dict[str, Any]]] = {}
+                for ob in vector_obligations:
+                    cit = ob.get("Citation") or ""
+                    doc_name = ""
+                    if "Document:" in cit:
+                        doc_name = cit.split("Document:")[1].split("|")[0].strip()
+                    if not doc_name:
+                        doc_name = "Unknown"
+                    doc_to_obligations.setdefault(doc_name, []).append(ob)
+                filtered_results_for_merge = [
+                    {"document_name": doc_name, "consolidated_results": ob_list}
+                    for doc_name, ob_list in doc_to_obligations.items()
+                ]
+                # Build document_name_to_id for merge step (Citation -> doc_id)
+                document_name_to_id = {}
+                if document_ids:
+                    for doc_id in document_ids:
+                        d = (doc_id or "").strip()
+                        if not d:
+                            continue
+                        name = Path(d).name or d
+                        document_name_to_id[name] = doc_id
+                        document_name_to_id[name.lower()] = doc_id
+                # Run merge and rank (LLM: combine, order by relevance + monetary value, Citation with doc id)
+                t_merge = time.perf_counter()
+                self.logger.info("[TIMING] Step: merge_and_rank (vector path) - start")
+                final_result = await self.merge_and_rank_results(user_query, filtered_results_for_merge, document_name_to_id)
+                self.logger.info(f"[TIMING] Step: merge_and_rank (vector path) - done in {time.perf_counter() - t_merge:.3f}s")
+                final_result["processed_at"] = datetime.now().isoformat()
+                if save_output:
+                    self._save_query_result(user_query, final_result)
+                total_elapsed = time.perf_counter() - query_start
+                self.logger.info(f"[TIMING] Query total - done in {total_elapsed:.3f}s (vector path)")
+                self.logger.info(f"Query complete: Found {final_result.get('total_obligations_found', 0)} obligations (vector + merge/rank)")
+                return final_result
+            
+            # Step 2: Fallback to consolidated JSON + LLM filter + merge
+            self.logger.info("No vector results; using consolidated JSON + LLM filter")
             consolidated_files = self.load_consolidated_jsons()
             
             if not consolidated_files:
@@ -586,11 +947,13 @@ Output the merged and ranked JSON:"""
                     "total_documents_searched": 0,
                     "total_obligations_found": 0,
                     "results": [],
-                    "error": "No consolidated JSON files found"
+                    "error": "No consolidated JSON files or vector store results found"
                 }
             
             # Filter by document_ids if provided
             if document_ids:
+                t_doc_filter = time.perf_counter()
+                self.logger.info("[TIMING] Step: filter by document_ids - start")
                 def extract_doc_name_from_url(url: str) -> str:
                     """Extract document name from URL, handling encoding and query params"""
                     try:
@@ -692,8 +1055,11 @@ Output the merged and ranked JSON:"""
                         f"Some documents may not exist or URLs may be incorrect."
                     )
                 self.logger.info(f"Matched documents: {[f.get('document_name') for f in consolidated_files]}")
+                self.logger.info(f"[TIMING] Step: filter by document_ids - done in {time.perf_counter() - t_doc_filter:.3f}s")
             
             # Create mapping of document_name to document_id for citation restructuring
+            t_map = time.perf_counter()
+            self.logger.info("[TIMING] Step: build document_name_to_id - start")
             document_name_to_id = {}
             if document_ids:
                 # Use the matched_doc_id stored in file_info
@@ -703,9 +1069,12 @@ Output the merged and ranked JSON:"""
                     if matched_doc_id:
                         document_name_to_id[doc_name] = matched_doc_id
                         self.logger.info(f"Mapped document name '{doc_name}' to doc_id '{matched_doc_id}'")
+            self.logger.info(f"[TIMING] Step: build document_name_to_id - done in {time.perf_counter() - t_map:.3f}s")
             
             # Step 2: Process each consolidated JSON in PARALLEL
             # OPTIMIZATION: Use asyncio.gather to filter all documents concurrently
+            t_filter_all = time.perf_counter()
+            self.logger.info(f"[TIMING] Step: filter all documents (parallel) - start ({len(consolidated_files)} docs)")
             self.logger.info(f"Filtering {len(consolidated_files)} documents in parallel...")
             
             filter_tasks = [
@@ -719,18 +1088,27 @@ Output the merged and ranked JSON:"""
             
             # Wait for all filtering to complete in parallel
             filtered_results = await asyncio.gather(*filter_tasks)
+            self.logger.info(f"[TIMING] Step: filter all documents (parallel) - done in {time.perf_counter() - t_filter_all:.3f}s")
             
             # Step 3: Merge and rank all results with document_id mapping
+            t_merge = time.perf_counter()
+            self.logger.info("[TIMING] Step: merge_and_rank - start")
             final_result = await self.merge_and_rank_results(user_query, filtered_results, document_name_to_id)
+            self.logger.info(f"[TIMING] Step: merge_and_rank - done in {time.perf_counter() - t_merge:.3f}s")
             
             # Add timestamp
             final_result["processed_at"] = datetime.now().isoformat()
             
             # Save output if requested
             if save_output:
+                t_save = time.perf_counter()
+                self.logger.info("[TIMING] Step: save_query_result - start")
                 self._save_query_result(user_query, final_result)
+                self.logger.info(f"[TIMING] Step: save_query_result - done in {time.perf_counter() - t_save:.3f}s")
             
+            total_elapsed = time.perf_counter() - query_start
             self.logger.info("=" * 80)
+            self.logger.info(f"[TIMING] Query total - done in {total_elapsed:.3f}s")
             self.logger.info(f"Query complete: Found {final_result.get('total_obligations_found', 0)} relevant obligations")
             self.logger.info("=" * 80)
             
@@ -776,7 +1154,7 @@ Output the merged and ranked JSON:"""
 # Pydantic models for request/response
 class QueryRequest(BaseModel):
     """Request model for query endpoint"""
-    query: str = Field(default="", description="Search query for legal obligations (if empty, returns utility-related obligations)")
+    query: Optional[str] = Field(default="", description="Search query for legal obligations (if empty, returns utility-related obligations)")
     document_ids: Optional[List[str]] = Field(
         default=None, 
         description="Optional list of document identifiers to filter by. Each can be a full URL or a document filename that matches the consolidated document name (e.g. 'Commercial Lease Agreement.pdf'). If omitted, all consolidated documents are searched."
@@ -899,11 +1277,11 @@ query_system_instance: Optional[ObligationQuerySystem] = None
 
 @app.on_event("startup")
 async def startup_event():
-    """Initialize the query system on startup (local output folder + Gemini API key)."""
+    """Initialize the query system on startup (local output folder + Azure OpenAI or Gemini)."""
     global query_system_instance
     try:
         local_out = os.getenv("OUTPUT_FOLDER", "output")
-        model = os.getenv('GEMINI_MODEL', 'gemini-2.5-flash')
+        model = get_default_model()
         query_system_instance = ObligationQuerySystem(local_output_folder=local_out, model=model)
         logging.info(f"Query system initialized (output: {local_out}, model: {model})")
     except Exception as e:
@@ -942,43 +1320,47 @@ async def health_check():
 
 
 @app.post("/query", response_model=QueryResponse, tags=["Query"])
-async def query_obligations_post(request: QueryRequest):
+async def query_obligations_post(request: Optional[QueryRequest] = Body(default=None)):
     """
     Query legal obligations using POST method
-    
+
     Searches through all consolidated JSON files and returns relevant obligations
     ranked by relevance and monetary value.
-    
+
     If no query is provided (empty string), returns all utility-related obligations including:
-    water, gas, heat, light, electricity, telephone service, HVAC, sprinkler system, 
+    water, gas, heat, light, electricity, telephone service, HVAC, sprinkler system,
     electrical and plumbing systems.
-    
+
     If document_ids are provided, only searches those specific documents.
     document_ids can be URLs or filenames that match consolidated document names.
-    
+
     Args:
-        request: QueryRequest containing the search query, optional document_ids filter, and optional output folder
-        
+        request: QueryRequest containing the search query, optional document_ids filter, and optional output folder.
+                 Body is optional; omit or send {} for defaults.
+
     Returns:
         QueryResponse with matched obligations
     """
     if query_system_instance is None:
         raise HTTPException(status_code=503, detail="Query system not initialized")
-    
+
+    req = request or QueryRequest()
+    user_query = (req.query or "") if isinstance(req.query, str) else ""
+
     try:
-        if request.output_folder:
-            qs = ObligationQuerySystem(local_output_folder=request.output_folder, model=os.getenv('GEMINI_MODEL', 'gemini-2.5-flash'))
+        if req.output_folder:
+            qs = ObligationQuerySystem(local_output_folder=req.output_folder, model=get_default_model())
             result = await qs.query(
-                user_query=request.query,
-                save_output=request.save_output,
-                document_ids=request.document_ids
+                user_query=user_query,
+                save_output=req.save_output,
+                document_ids=req.document_ids
             )
         else:
             # Use default query system instance
             result = await query_system_instance.query(
-                user_query=request.query,
-                save_output=request.save_output,
-                document_ids=request.document_ids
+                user_query=user_query,
+                save_output=req.save_output,
+                document_ids=req.document_ids
             )
         
         # Check for errors in result
@@ -994,7 +1376,7 @@ async def query_obligations_post(request: QueryRequest):
 
 @app.post("/process", response_model=ProcessResponse, tags=["Processing"])
 async def process_document(request: ProcessRequest):
-    """Process PDFs from docs folder and save consolidated JSON to output folder. Uses Gemini API key only."""
+    """Process PDFs from docs folder and save consolidated JSON to output folder. Uses Azure OpenAI or Gemini via llm_client."""
     try:
         from process_legal_documents import LegalDocumentProcessor
 
@@ -1008,7 +1390,7 @@ async def process_document(request: ProcessRequest):
             logs_folder=os.getenv('LOGS_FOLDER', 'logs'),
             cache_folder=os.getenv('CACHE_FOLDER', 'ocr_cache'),
             prompt_file=os.getenv('PROMPT_FILE', 'prompt.txt'),
-            model=os.getenv('GEMINI_MODEL', 'gemini-2.5-flash'),
+            model=get_default_model(),
             tesseract_cmd=os.getenv('TESSERACT_CMD')
         )
         pdf_path = processor.get_first_pdf()
@@ -1105,7 +1487,7 @@ async def main():
         print("Error: Query cannot be empty")
         return
     
-    query_system = ObligationQuerySystem(local_output_folder=os.getenv('OUTPUT_FOLDER', 'output'), model=os.getenv('GEMINI_MODEL', 'gemini-2.5-flash'))
+    query_system = ObligationQuerySystem(local_output_folder=os.getenv('OUTPUT_FOLDER', 'output'), model=get_default_model())
     print(f"Output folder: {query_system.local_output_folder}")
     
     # Execute query (now async)

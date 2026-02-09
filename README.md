@@ -128,6 +128,22 @@ docker-compose up --build
 
 Ensure `.env` (or Compose env) has `GEMINI_API_KEY` and, if you use fake GCS in Docker, uncomment and configure the `fake-gcs-server` service and `STORAGE_EMULATOR_HOST` accordingly.
 
+### 6. Where ChromaDB lives and how to share it
+
+**ChromaDB is not a separate Docker service.** It runs inside the same process as the API (embedded). All data is stored on disk in a folder under your output directory:
+
+- **Path:** `{OUTPUT_FOLDER}/chroma_db` (default: `output/chroma_db`).
+- **When you run Docker:** The container mounts `./output` from your host into `/app/output`, so the Chroma DB is the folder **on your machine** at `output/chroma_db`. It persists between container restarts.
+
+**To send the index to a friend:**
+
+1. **Zip the `output` folder** (it contains `chroma_db/` and the consolidated JSON files). The query system needs both the vector index and the consolidated JSONs to return full obligation text.
+2. Send the zip (e.g. `output.zip`).
+3. Your friend extracts it into their project root so that the folder is named `output` (or sets `OUTPUT_FOLDER` to the folder they extracted).
+4. **Same embedding model:** They must use the same embedding setup you used when building the index (e.g. `USE_LOCAL_EMBEDDING=true` and the same `SENTENCE_TRANSFORMER_MODEL`, or the same Azure/OpenAI embedding). Otherwise query vectors won’t match the indexed vectors.
+
+They can run the API locally or with Docker; no separate Chroma container is required.
+
 ---
 
 ## Summary

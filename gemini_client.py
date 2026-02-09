@@ -41,6 +41,7 @@ def generate_content(
     api_key: Optional[str] = None,
     temperature: float = 0.1,
     response_mime_type: str = "application/json",
+    max_output_tokens: Optional[int] = None,
 ) -> GeminiResponse:
     """
     Call Gemini generateContent via REST using API key.
@@ -76,21 +77,20 @@ def generate_content(
         }
 
     # Build request body: Vertex expects role in content; both accept contents[].parts[].text
+    gen_config = {
+        "temperature": temperature,
+        "responseMimeType": response_mime_type,
+        "maxOutputTokens": max_output_tokens if max_output_tokens is not None else int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "8192")),
+    }
     if use_vertex:
         body = {
             "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-            "generationConfig": {
-                "temperature": temperature,
-                "responseMimeType": response_mime_type,
-            },
+            "generationConfig": gen_config,
         }
     else:
         body = {
             "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {
-                "temperature": temperature,
-                "responseMimeType": response_mime_type,
-            },
+            "generationConfig": gen_config,
         }
     r = requests.post(url, headers=headers, json=body, timeout=120)
     if r.status_code == 400:
@@ -151,6 +151,7 @@ async def generate_content_async(
     api_key: Optional[str] = None,
     temperature: float = 0.1,
     response_mime_type: str = "application/json",
+    max_output_tokens: Optional[int] = None,
 ) -> GeminiResponse:
     """
     Async version of generate_content using asyncio.to_thread.
@@ -175,5 +176,6 @@ async def generate_content_async(
         model=model,
         api_key=api_key,
         temperature=temperature,
-        response_mime_type=response_mime_type
+        response_mime_type=response_mime_type,
+        max_output_tokens=max_output_tokens,
     )

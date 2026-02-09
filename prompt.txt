@@ -180,4 +180,3 @@ Example acceptable output:
     "Citation": "Page 12, Section 'Insurance'"
   }
 ]
-

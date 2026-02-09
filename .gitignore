@@ -31,6 +31,9 @@ logs/
 ocr_cache/
 __pycache__/
 
+# Fake GCS emulator runtime data
+fake-gcs-data/
+
 # Output files
 output/
 query_results/

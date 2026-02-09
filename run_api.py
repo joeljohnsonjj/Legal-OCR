@@ -10,11 +10,10 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv()
 
-# Force API-key-only auth for Gemini: unset ADC so the client uses GEMINI_API_KEY only.
-# If this is set, Google client libs use it for generativelanguage.googleapis.com and
-# ignore API keys, causing 401 "API keys are not supported".
-if os.getenv("GOOGLE_GENAI_USE_VERTEXAI", "false").lower() != "true":
-    os.environ.pop("GOOGLE_APPLICATION_CREDENTIALS", None)
+# When using Gemini (not Azure): force API-key-only auth by unsetting ADC so the client uses GEMINI_API_KEY only.
+if not os.getenv("USE_AZURE_OPENAI", "").lower() in ("true", "1", "yes"):
+    if os.getenv("GOOGLE_GENAI_USE_VERTEXAI", "false").lower() != "true":
+        os.environ.pop("GOOGLE_APPLICATION_CREDENTIALS", None)
 
 
 def main():
