@@ -227,17 +227,26 @@ def query_obligations(
     chroma_path: Optional[str] = None,
     collection_name: str = DEFAULT_COLLECTION_NAME,
     max_distance: Optional[float] = None,
+    responsible_party: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
     Query the vector store by semantic similarity.
     Returns list of dicts with keys: id, document_name, DutyType, Responsible_Party, Citation, distance, document (chunk text).
     If document_name is provided, results are filtered to that document only.
+    If responsible_party is provided, results are filtered to that party only (e.g. "Tenant", "Landlord").
     If max_distance is set, only results with distance <= max_distance are returned (query uses large n_results then filters).
     """
     try:
         client = get_chroma_client(chroma_path)
         collection = get_or_create_collection(client, collection_name)
-        where = {"document_name": document_name} if document_name else None
+        # Build where filter: combine document_name and responsible_party if provided
+        where = None
+        if document_name and responsible_party:
+            where = {"$and": [{"document_name": document_name}, {"Responsible_Party": responsible_party}]}
+        elif document_name:
+            where = {"document_name": document_name}
+        elif responsible_party:
+            where = {"Responsible_Party": responsible_party}
         # When using distance threshold, fetch more candidates then filter
         fetch_n = 500 if max_distance is not None else n_results
         results = collection.query(

@@ -2,11 +2,15 @@
 Azure OpenAI API client using REST.
 Same interface as gemini_client: generate_content() and generate_content_async()
 return an object with .text for drop-in use in query_system and process_legal_documents.
+Supports streaming via generate_content_stream() for real-time obligation streaming.
 """
 import asyncio
+import json
 import os
-from typing import Optional
+import re
+from typing import AsyncIterator, Optional
 
+import httpx
 import requests
 from dotenv import load_dotenv
 
@@ -110,3 +114,69 @@ async def generate_content_async(
         response_mime_type=response_mime_type,
         max_output_tokens=max_output_tokens,
     )
+
+
+async def generate_content_stream(
+    prompt: str,
+    *,
+    model: Optional[str] = None,
+    api_key: Optional[str] = None,
+    temperature: float = 0.1,
+    response_mime_type: str = "application/json",
+    max_output_tokens: Optional[int] = None,
+) -> AsyncIterator[str]:
+    """
+    Stream Azure OpenAI response token-by-token (async generator).
+    Yields each chunk of text as it arrives from the API.
+    For JSON responses, you'll need to parse incrementally (e.g. detect complete obligations).
+    """
+    endpoint = (os.getenv("AZURE_OPENAI_ENDPOINT") or "").rstrip("/")
+    key = api_key or os.getenv("AZURE_OPENAI_API_KEY") or os.getenv("AZURE_OPENAI_KEY") or os.getenv("OPENAI_API_KEY")
+    deployment = model or os.getenv("AZURE_OPENAI_DEPLOYMENT") or os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME") or os.getenv("OPENAI_DEPLOYMENT_NAME")
+    api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-15-preview")
+
+    if not endpoint or not key:
+        raise ValueError(
+            "Azure OpenAI requires AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_API_KEY in .env"
+        )
+    if not deployment:
+        raise ValueError(
+            "Azure OpenAI requires AZURE_OPENAI_DEPLOYMENT in .env"
+        )
+
+    url = f"{endpoint}/openai/deployments/{deployment}/chat/completions?api-version={api_version}"
+    headers = {
+        "api-key": key,
+        "Content-Type": "application/json",
+    }
+    body = {
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": temperature,
+        "max_tokens": max_output_tokens if max_output_tokens is not None else int(os.getenv("AZURE_OPENAI_MAX_TOKENS") or os.getenv("OPENAI_MAX_OUTPUT_TOKENS", "8192")),
+        "stream": True,
+    }
+    if response_mime_type == "application/json":
+        body["response_format"] = {"type": "json_object"}
+
+    async with httpx.AsyncClient(timeout=300.0) as client:
+        async with client.stream("POST", url, headers=headers, json=body) as response:
+            if response.status_code != 200:
+                error_text = await response.aread()
+                raise ValueError(f"Azure OpenAI error {response.status_code}: {error_text.decode('utf-8', errors='ignore')}")
+            
+            async for line in response.aiter_lines():
+                if not line.strip() or line.strip() == "data: [DONE]":
+                    continue
+                if line.startswith("data: "):
+                    line = line[6:]
+                try:
+                    chunk = json.loads(line)
+                    choices = chunk.get("choices", [])
+                    if not choices:
+                        continue
+                    delta = choices[0].get("delta", {})
+                    content = delta.get("content", "")
+                    if content:
+                        yield content
+                except json.JSONDecodeError:
+                    continue

@@ -5,12 +5,13 @@ Searches through consolidated JSON files and returns relevant obligations based 
 
 import asyncio
 import os
+import sys
 import json
 import logging
 import re
 import time
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import AsyncIterator, List, Dict, Any, Optional
 from datetime import datetime
 from urllib.parse import unquote, urlparse
 
@@ -19,7 +20,7 @@ from llm_client import generate_content as llm_generate_content, get_default_mod
 
 # FastAPI
 from fastapi import Body, FastAPI, HTTPException, Query
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -376,6 +377,7 @@ class ObligationQuerySystem:
     ) -> List[Dict[str, Any]]:
         """
         Query ChromaDB by semantic similarity; only results with distance <= VECTOR_MAX_DISTANCE.
+        Auto-detects party in query (tenant/landlord) and filters by Responsible_Party metadata.
         Returns the top n_results most similar obligation chunks; full obligations
         are resolved from consolidated JSON (document_name + chunk_index).
         Returns list of obligation dicts (DutyType, Responsible Party, Owner Responsibility, Reasoning, Citation)
@@ -387,6 +389,17 @@ class ObligationQuerySystem:
             if not Path(chroma_path).exists():
                 self.logger.info("Vector store path does not exist; skipping vector query")
                 return []
+            
+            # Auto-detect party in query for filtering
+            query_lower = user_query.lower()
+            detected_party = None
+            if "tenant" in query_lower:
+                detected_party = "Tenant"
+                self.logger.info("Detected 'tenant' in query → filtering by Responsible_Party=Tenant")
+            elif "landlord" in query_lower:
+                detected_party = "Landlord"
+                self.logger.info("Detected 'landlord' in query → filtering by Responsible_Party=Landlord")
+            
             # Distance threshold: only results with distance <= VECTOR_MAX_DISTANCE (default 1.4)
             max_dist_str = os.getenv("VECTOR_MAX_DISTANCE", "1.4").strip()
             try:
@@ -400,6 +413,7 @@ class ObligationQuerySystem:
                 document_name=None,
                 chroma_path=chroma_path,
                 max_distance=max_distance,
+                responsible_party=detected_party,
             )
             if not raw:
                 return []
@@ -716,39 +730,10 @@ Output the filtered JSON:"""
         
         return citations
     
-    async def merge_and_rank_results(self, user_query: str, filtered_results: List[Dict[str, Any]], 
-                              document_name_to_id: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
-        """
-        Step 3: Merge all filtered results and rank by relevance and monetary value (ASYNC)
-        
-        Args:
-            user_query: User's search query
-            filtered_results: List of filtered results from all documents
-            document_name_to_id: Optional mapping of document names to document IDs (URLs)
-            
-        Returns:
-            Single merged and ranked JSON
-        """
-        try:
-            t0 = time.perf_counter()
-            self.logger.info("[TIMING] merge_and_rank: start")
-            # 1. Filter out empty results
-            t_step = time.perf_counter()
-            non_empty_results = [r for r in filtered_results if r.get("consolidated_results")]
-            self.logger.info(f"[TIMING] merge_and_rank: 1. filter_empty_results - {time.perf_counter() - t_step:.3f}s")
-            
-            if not non_empty_results:
-                self.logger.info("No relevant obligations found across all documents")
-                return {
-                    "query": user_query,
-                    "total_documents_searched": len(filtered_results),
-                    "total_obligations_found": 0,
-                    "results": []
-                }
-            
-            # 2. Prepare merge and rank prompt (short prompt for faster API response)
-            t_step = time.perf_counter()
-            merge_prompt = f"""You are a legal document analyst. You have been provided with filtered financial obligations from multiple legal documents.
+    def _build_merge_rank_prompt(self, user_query: str, filtered_results: List[Dict[str, Any]]) -> str:
+        """Build the merge-and-rank LLM prompt. Shared by /query, /query/stream, and /query/stream/raw so results are consistent."""
+        non_empty_results = [r for r in filtered_results if r.get("consolidated_results")]
+        return f"""You are a legal document analyst. You have been provided with filtered financial obligations from multiple legal documents.
 
 Financial obligations = monetary responsibility, cost, payment, reimbursement, insurance, indemnification, or financial exposure. Preserve only content traceable to the document; do not invent or assume. Citation must reflect document content only.
 
@@ -786,6 +771,102 @@ Return a JSON object with this structure:
 }}
 
 Output the merged and ranked JSON:"""
+    
+    async def merge_and_rank_results_stream(self, user_query: str, filtered_results: List[Dict[str, Any]], 
+                              document_name_to_id: Optional[Dict[str, str]] = None) -> AsyncIterator[Dict[str, Any]]:
+        """
+        Streaming version: yields obligations one-by-one as they arrive from LLM.
+        Yields dicts with: {"type": "obligation", "data": {...}} or {"type": "metadata", "data": {...}} or {"type": "error", "message": "..."}.
+        """
+        try:
+            # Filter out empty results
+            non_empty_results = [r for r in filtered_results if r.get("consolidated_results")]
+            
+            if not non_empty_results:
+                yield {
+                    "type": "metadata",
+                    "data": {
+                        "query": user_query,
+                        "total_documents_searched": len(filtered_results),
+                        "total_obligations_found": 0,
+                    }
+                }
+                return
+            
+            merge_prompt = self._build_merge_rank_prompt(user_query, filtered_results)
+            # Stream from Azure OpenAI (merge and rank LLM call)
+            self.logger.info("[STREAM] Merge/rank LLM call - streaming response from Azure OpenAI")
+            from azure_openai_client import generate_content_stream
+            from streaming_json_parser import parse_obligations_stream
+            
+            token_stream = generate_content_stream(
+                prompt=merge_prompt,
+                model=self.model,
+                temperature=0.1,
+                response_mime_type="application/json",
+            )
+            # Parse the streamed JSON and yield each obligation; same result as merge/rank, streamed to client.
+            obligation_count = 0
+            async for obligation in parse_obligations_stream(token_stream):
+                # Keep citation as-is from LLM (string format)
+                obligation_count += 1
+                yield {
+                    "type": "obligation",
+                    "data": obligation
+                }
+            
+            # Final metadata
+            yield {
+                "type": "metadata",
+                "data": {
+                    "query": user_query,
+                    "total_documents_searched": len(filtered_results),
+                    "total_obligations_found": obligation_count,
+                }
+            }
+            
+        except Exception as e:
+            import traceback
+            self.logger.error(f"Error in streaming merge_and_rank: {e}")
+            self.logger.error(traceback.format_exc())
+            yield {
+                "type": "error",
+                "message": str(e)
+            }
+
+    async def merge_and_rank_results(self, user_query: str, filtered_results: List[Dict[str, Any]], 
+                              document_name_to_id: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+        """
+        Step 3: Merge all filtered results and rank by relevance and monetary value (ASYNC)
+        
+        Args:
+            user_query: User's search query
+            filtered_results: List of filtered results from all documents
+            document_name_to_id: Optional mapping of document names to document IDs (URLs)
+            
+        Returns:
+            Single merged and ranked JSON
+        """
+        try:
+            t0 = time.perf_counter()
+            self.logger.info("[TIMING] merge_and_rank: start")
+            # 1. Filter out empty results
+            t_step = time.perf_counter()
+            non_empty_results = [r for r in filtered_results if r.get("consolidated_results")]
+            self.logger.info(f"[TIMING] merge_and_rank: 1. filter_empty_results - {time.perf_counter() - t_step:.3f}s")
+            
+            if not non_empty_results:
+                self.logger.info("No relevant obligations found across all documents")
+                return {
+                    "query": user_query,
+                    "total_documents_searched": len(filtered_results),
+                    "total_obligations_found": 0,
+                    "results": []
+                }
+            
+            # 2. Prepare merge and rank prompt (same as /query/stream and /query/stream/raw for consistent results)
+            t_step = time.perf_counter()
+            merge_prompt = self._build_merge_rank_prompt(user_query, filtered_results)
             self.logger.info(f"[TIMING] merge_and_rank: 2. build_prompt - {time.perf_counter() - t_step:.3f}s")
             self.logger.info(f"Merging and ranking results for query: '{user_query}'")
             
@@ -811,41 +892,10 @@ Output the merged and ranked JSON:"""
             final_result = json.loads(result_text)
             self.logger.info(f"[TIMING] merge_and_rank: 4. parse_response - {time.perf_counter() - t_step:.3f}s")
             
-            # 5. Post-process: Convert Citation strings to structured format
+            # 5. Keep citations as-is from LLM (no post-processing)
             t_step = time.perf_counter()
-            if document_name_to_id:
-                for obligation in final_result.get("results", []):
-                    citation_str = obligation.get("Citation", "")
-                    if isinstance(citation_str, str) and citation_str:
-                        # Extract document name from citation string
-                        doc_name = None
-                        if "Document:" in citation_str:
-                            doc_name = citation_str.split("Document:")[1].split("|")[0].strip()
-                        
-                        # Find matching doc_id
-                        doc_id = None
-                        if doc_name and doc_name in document_name_to_id:
-                            doc_id = document_name_to_id[doc_name]
-                        else:
-                            # Try to find by partial match
-                            for name, id_val in document_name_to_id.items():
-                                if name in doc_name or doc_name in name:
-                                    doc_id = id_val
-                                    break
-                        
-                        # Parse citation string into structured format
-                        parsed_citations = self._parse_citation(citation_str, doc_id)
-                        
-                        if parsed_citations:
-                            obligation["Citation"] = parsed_citations
-                        else:
-                            # Fallback: create basic citation structure
-                            obligation["Citation"] = [{
-                                "docId": doc_id or "",
-                                "pageNumbers": [],
-                                "section": []
-                            }]
-            self.logger.info(f"[TIMING] merge_and_rank: 5. citation_post_process - {time.perf_counter() - t_step:.3f}s")
+            # Citations remain in string format: "Document: X.pdf | Page 2, Section 5"
+            self.logger.info(f"[TIMING] merge_and_rank: 5. citation_kept_as_string - {time.perf_counter() - t_step:.3f}s")
             
             # 6. Fix count and finish
             t_step = time.perf_counter()
@@ -1372,6 +1422,246 @@ async def query_obligations_post(request: Optional[QueryRequest] = Body(default=
     except Exception as e:
         logging.error(f"Error processing query: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Error processing query: {str(e)}")
+
+
+@app.post("/query/stream/raw", tags=["Query"])
+async def query_obligations_stream_raw(request: Optional[QueryRequest] = Body(default=None)):
+    """
+    Stream RAW LLM tokens as they're generated during merge and rank.
+    Shows the actual token-by-token generation from GPT-4o-mini.
+    
+    Returns raw text stream showing LLM generating the JSON response in real-time.
+    """
+    if query_system_instance is None:
+        raise HTTPException(status_code=503, detail="Query system not initialized")
+    
+    req = request or QueryRequest()
+    user_query = (req.query or "") if isinstance(req.query, str) else ""
+    
+    async def raw_token_generator():
+        try:
+            # Load and filter documents
+            qs = query_system_instance
+            if req.output_folder:
+                qs = ObligationQuerySystem(local_output_folder=req.output_folder, model=get_default_model())
+            
+            consolidated_files = qs.load_consolidated_jsons()
+            
+            if req.document_ids:
+                consolidated_files = [
+                    f for f in consolidated_files
+                    if any(doc_id in f["document_name"] or doc_id in f["file_name"] for doc_id in req.document_ids)
+                ]
+            
+            def _echo(chunk: str):
+                sys.stdout.write(chunk)
+                sys.stdout.flush()
+                return chunk
+            
+            if not consolidated_files:
+                _echo("[ERROR] No documents found\n")
+                yield "[ERROR] No documents found\n"
+                return
+            
+            # Step 1: Vector search for filtering (same as main query())
+            _echo(f"[QUERY] {user_query}\n")
+            yield f"[QUERY] {user_query}\n"
+            _echo("[STEP 1] Vector search...\n")
+            yield "[STEP 1] Vector search...\n"
+            vector_obligations = qs._query_vector_store(user_query, n_results=50, document_ids=req.document_ids)
+            _echo(f"[STEP 1] Found {len(vector_obligations)} vector results\n")
+            yield f"[STEP 1] Found {len(vector_obligations)} vector results\n"
+            
+            if vector_obligations:
+                _echo("[STEP 2] Using vector results for filtering (no LLM filter)\n")
+                yield "[STEP 2] Using vector results for filtering (no LLM filter)\n"
+                doc_to_obligations = {}
+                for ob in vector_obligations:
+                    cit = ob.get("Citation") or ""
+                    doc_name = ""
+                    if "Document:" in cit:
+                        doc_name = cit.split("Document:")[1].split("|")[0].strip()
+                    if not doc_name:
+                        doc_name = ob.get("document_name") or "Unknown"
+                    doc_to_obligations.setdefault(doc_name, []).append(ob)
+                filtered_results = [
+                    {"document_name": doc_name, "consolidated_results": ob_list}
+                    for doc_name, ob_list in doc_to_obligations.items()
+                ]
+            else:
+                _echo("[STEP 2] No vector results; LLM filtering each document...\n")
+                yield "[STEP 2] No vector results; LLM filtering each document...\n"
+                filter_tasks = [
+                    qs.filter_obligations_by_query(user_query, f["data"], f["document_name"])
+                    for f in consolidated_files
+                ]
+                filtered_results = await asyncio.gather(*filter_tasks)
+            _echo("[STEP 2] Filtering complete\n")
+            yield "[STEP 2] Filtering complete\n"
+            
+            _echo("[STEP 3] Merging and ranking (streaming LLM tokens)...\n")
+            yield "[STEP 3] Merging and ranking (streaming LLM tokens)...\n"
+            _echo("="*80 + "\n")
+            yield "="*80 + "\n"
+            _echo("RAW LLM OUTPUT (watch it generate in real-time):\n")
+            yield "RAW LLM OUTPUT (watch it generate in real-time):\n"
+            _echo("="*80 + "\n")
+            yield "="*80 + "\n"
+            
+            from azure_openai_client import generate_content_stream
+            
+            # Same merge/rank prompt as /query and /query/stream so results are consistent
+            merge_prompt = qs._build_merge_rank_prompt(user_query, filtered_results)
+            
+            # Stream raw tokens (and echo to terminal so you see stream when using Postman)
+            token_count = 0
+            async for token in generate_content_stream(
+                prompt=merge_prompt,
+                model=qs.model,
+                temperature=0.1,
+                response_mime_type="application/json"
+            ):
+                token_count += 1
+                sys.stdout.write(token)
+                sys.stdout.flush()
+                yield token
+                
+                if token_count % 100 == 0:
+                    progress = f"\n[{token_count} tokens]\n"
+                    sys.stdout.write(progress)
+                    sys.stdout.flush()
+                    yield progress
+            
+            tail = "\n" + "="*80 + "\n" + f"[COMPLETE] Generated {token_count} tokens\n" + "="*80 + "\n"
+            sys.stdout.write(tail)
+            sys.stdout.flush()
+            yield tail
+            
+        except Exception as e:
+            err = f"\n[ERROR] {str(e)}\n"
+            import traceback
+            err += traceback.format_exc()
+            sys.stdout.write(err)
+            sys.stdout.flush()
+            yield err
+    
+    return StreamingResponse(raw_token_generator(), media_type="text/plain")
+
+
+@app.post("/query/stream", tags=["Query"])
+async def query_obligations_stream(request: Optional[QueryRequest] = Body(default=None)):
+    """
+    Stream legal obligations one-by-one to the client as the LLM generates them.
+    
+    Yes, it is streaming: each obligation line is sent as soon as it is parsed from the
+    LLM stream (using incremental JSON parsing when ijson is installed). In Postman you
+    will see NDJSON lines appear over time, not all at once.
+    
+    Uses the same merge/rank prompt and filtering as POST /query and /query/stream/raw.
+    For raw token-by-token streaming (see the JSON being typed), use POST /query/stream/raw.
+    
+    Returns NDJSON stream (one JSON object per line):
+    - {"type": "obligation", "data": {...}} - individual obligation
+    - {"type": "metadata", "data": {...}} - query metadata (total count, etc.)
+    - {"type": "error", "message": "..."} - error message
+    
+    Each line is a JSON object followed by newline.
+    """
+    if query_system_instance is None:
+        raise HTTPException(status_code=503, detail="Query system not initialized")
+    
+    req = request or QueryRequest()
+    user_query = (req.query or "") if isinstance(req.query, str) else ""
+    
+    async def event_generator():
+        try:
+            qs = query_system_instance
+            if req.output_folder:
+                qs = ObligationQuerySystem(local_output_folder=req.output_folder, model=get_default_model())
+            
+            consolidated_files = qs.load_consolidated_jsons()
+            
+            if req.document_ids:
+                consolidated_files = [
+                    f for f in consolidated_files
+                    if any(doc_id in f["document_name"] or doc_id in f["file_name"] for doc_id in req.document_ids)
+                ]
+            
+            if not consolidated_files:
+                yield json.dumps({"type": "error", "message": "No documents found"}) + "\n"
+                return
+            
+            document_name_to_id = {}
+            for file_info in consolidated_files:
+                doc_name = file_info["document_name"]
+                doc_id = file_info.get("data", {}).get("document_id") or doc_name
+                document_name_to_id[doc_name] = doc_id
+            if req.document_ids:
+                for doc_id in req.document_ids:
+                    d = (doc_id or "").strip()
+                    if d:
+                        name = Path(d).name or d
+                        document_name_to_id[name] = doc_id
+                        document_name_to_id[name.lower()] = doc_id
+            
+            # Step 1: Vector search for filtering (same as main query())
+            t_vector = time.perf_counter()
+            vector_obligations = qs._query_vector_store(user_query, n_results=50, document_ids=req.document_ids)
+            elapsed_vector = time.perf_counter() - t_vector
+            logging.info(f"[STREAM] Vector store returned {len(vector_obligations)} obligations in {elapsed_vector:.2f}s")
+            
+            if vector_obligations:
+                # Use vector results for filtering: group by document and merge/rank (no LLM filter)
+                logging.info(f"[STREAM] Using vector results for filtering (no per-document LLM filter)")
+                doc_to_obligations: Dict[str, List[Dict[str, Any]]] = {}
+                for ob in vector_obligations:
+                    cit = ob.get("Citation") or ""
+                    doc_name = ""
+                    if "Document:" in cit:
+                        doc_name = cit.split("Document:")[1].split("|")[0].strip()
+                    if not doc_name:
+                        doc_name = ob.get("document_name") or "Unknown"
+                    doc_to_obligations.setdefault(doc_name, []).append(ob)
+                filtered_results = [
+                    {"document_name": doc_name, "consolidated_results": ob_list}
+                    for doc_name, ob_list in doc_to_obligations.items()
+                ]
+            else:
+                # Fallback: LLM filter each document then merge/rank
+                logging.info(f"[STREAM] No vector results; using LLM filter per document")
+                filter_tasks = [
+                    qs.filter_obligations_by_query(
+                        user_query,
+                        file_info["data"],
+                        file_info["document_name"]
+                    )
+                    for file_info in consolidated_files
+                ]
+                filtered_results = await asyncio.gather(*filter_tasks)
+            
+            total_for_merge = sum(len(r.get("consolidated_results", [])) for r in filtered_results)
+            logging.info(f"[STREAM] Merge and rank LLM call - start (input: {total_for_merge} obligations from {len(filtered_results)} doc(s))")
+            
+            # Step 2: Stream merge and rank results (echo to terminal so you see stream when using Postman)
+            obligation_stream_count = 0
+            async for event in qs.merge_and_rank_results_stream(user_query, filtered_results, document_name_to_id):
+                if event.get("type") == "obligation":
+                    obligation_stream_count += 1
+                line = json.dumps(event) + "\n"
+                sys.stdout.write(line)
+                sys.stdout.flush()
+                yield line
+            
+            logging.info(f"[STREAM] Merge and rank LLM call - complete (streamed {obligation_stream_count} obligations)")
+            
+        except Exception as e:
+            logging.error(f"Error in streaming query: {e}", exc_info=True)
+            line = json.dumps({"type": "error", "message": str(e)}) + "\n"
+            sys.stdout.write(line)
+            sys.stdout.flush()
+            yield line
+    
+    return StreamingResponse(event_generator(), media_type="application/x-ndjson")
 
 
 @app.post("/process", response_model=ProcessResponse, tags=["Processing"])
