@@ -1,44 +1,34 @@
-# Google Cloud AI Configuration
-# Set to false to use direct Gemini API (recommended for local development)
-# Set to true to use Vertex AI (requires GCP project and credentials)
-GOOGLE_GENAI_USE_VERTEXAI=True
+# ========== Use Azure OpenAI ==========
+USE_AZURE_OPENAI=True
 
-# Gemini API Key (required for direct API mode)
-# Get your API key from: https://aistudio.google.com/app/apikey
-GEMINI_API_KEY= 
+# Azure OpenAI (required when USE_AZURE_OPENAI=True)
+# Endpoint from Azure Portal: your resource -> Keys and Endpoint
+AZURE_OPENAI_ENDPOINT=https://your-resource.openai.azure.com/
+AZURE_OPENAI_KEY=your-azure-openai-key-here
+AZURE_OPENAI_API_VERSION=2025-01-01-preview
+AZURE_OPENAI_DEPLOYMENT_NAME=gpt-4o-mini
 
-# GCP Project Configuration (optional, only needed if GOOGLE_GENAI_USE_VERTEXAI=true)
-# GOOGLE_CLOUD_PROJECT=
-# GOOGLE_CLOUD_LOCATION=
+# Use local sentence-transformers for embeddings (no Azure embedding call; faster queries)
+USE_LOCAL_EMBEDDING=True
+# Or use Azure embeddings: create a deployment in Azure Portal and set e.g.:
+# AZURE_OPENAI_EMBEDDING_DEPLOYMENT=text-embedding-3-large
 
-# Gemini Model Configuration
-GEMINI_MODEL=gemini-2.5-flash
-
-# Google Cloud Storage Configuration (for future GCS integration)
-GCS_BUCKET=heb-legal
-GCS_DOCS_FOLDER=Documents
-GCS_OUTPUT_FOLDER=Output
-
-# Fake GCS Server Configuration (for local GCS emulation)
-# For standalone mode (run_emulator.py): use http://localhost:4443
-# For Docker mode: use http://fake-gcs-server:4443
+# GCS simulator (fake GCS) - required when using run_emulator.py
 STORAGE_EMULATOR_HOST=http://localhost:4443
-FAKE_GCS_ENDPOINT=http://localhost:4443
+GCS_BUCKET=heb-legal
 
-# GCS Emulator Configuration (for run_emulator.py)
-GCS_EMULATOR_HOST=localhost
-GCS_EMULATOR_PORT=4443
-GCS_EMULATOR_DATA_DIR=./fake-gcs-data
-GCS_EMULATOR_IN_MEMORY=false
+# Vector search: max distance for similarity (default 1.4; higher = more results)
+VECTOR_MAX_DISTANCE=2.0
 
-# Processing Configuration
-PROMPT_FILE=prompt.txt
-DOCS_FOLDER=docs
-OUTPUT_FOLDER=output
-LOGS_FOLDER=logs
-CACHE_FOLDER=ocr_cache
-
-# API Configuration
-API_HOST=0.0.0.0
-API_PORT=8000
-API_RELOAD=false
+# -----------------------------------------------------------------------------
+# Optional: document folders, OCR, API (defaults used if unset)
+# -----------------------------------------------------------------------------
+# DOCS_FOLDER=docs
+# OUTPUT_FOLDER=output
+# LOGS_FOLDER=logs
+# CACHE_FOLDER=ocr_cache
+# PROMPT_FILE=prompt.txt
+# POPPLER_PATH=
+# API_HOST=0.0.0.0
+# API_PORT=8000
+# API_RELOAD=false
