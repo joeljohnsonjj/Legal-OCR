@@ -895,8 +895,8 @@ class LegalDocumentProcessor:
             
             return {
                 "status": "completed",
-                "message": f"Processed {len(pdf_blobs)} documents",
-                "total_documents": len(pdf_blobs),
+                "message": f"Processed {len(pdf_paths)} documents",
+                "total_documents": len(pdf_paths),
                 "successful": successful,
                 "failed": failed,
                 "results": results

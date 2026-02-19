@@ -69,6 +69,90 @@ def _citation_parts_from_ob(ob: Dict[str, Any]) -> List[str]:
     return parts
 
 
+def _parse_one_citation_segment(segment: str) -> Optional[Dict[str, Any]]:
+    """Parse a single citation segment (e.g. 'Document: X.pdf | Page 4, Section 7(a)') into one { docId, pageNumbers, section }."""
+    s = (segment or "").strip()
+    if not s:
+        return None
+    doc_name = ""
+    rest = s
+    if "Document:" in s and "|" in s:
+        idx = s.find("Document:")
+        pipe = s.find("|", idx)
+        if pipe > idx:
+            doc_name = s[idx + len("Document:"):pipe].strip()
+            rest = s[pipe + 1:].strip()
+    page_numbers = []
+    sections = []
+    for part in re.split(r';\s*', rest):
+        part = part.strip()
+        if not part:
+            continue
+        page_m = re.search(r'Page\s*(\d+)', part, re.I)
+        if page_m:
+            page_numbers.append(int(page_m.group(1)))
+        section_matches = re.findall(r'Section\s*([^;,]+?)(?=\s*(?:and\s+Section|;|,?\s*Page|\s*$))', part, re.I)
+        if not section_matches:
+            section_matches = re.findall(r'Section\s*(\S+)', part, re.I)
+        for sec in section_matches:
+            sec = sec.strip().rstrip('.,')
+            if sec and sec not in sections:
+                sections.append(sec)
+    if doc_name or page_numbers or sections:
+        return {"docId": doc_name, "pageNumbers": sorted(set(page_numbers)), "section": sections}
+    return None
+
+
+def citation_string_to_structured(citation: Any) -> List[Dict[str, Any]]:
+    """
+    Convert citation string to structured format [{ docId, pageNumbers, section }].
+    Example: "Document: Commercial Lease Agreement.pdf | Page 4, Section 7(a); Page 5, Section 8(c)"
+    -> [{ "docId": "Commercial Lease Agreement.pdf", "pageNumbers": [4, 5], "section": ["7(a)", "8(c)"] }]
+    Multiple documents (merged obligation): "Document: A.pdf | Page 1, Section 2 ; Document: B.pdf | Page 3, Section 4"
+    -> two objects in list. Separator between documents: " ; " (space-semicolon-space).
+    Accepts already-structured list (normalizes and returns). Returns [] for None/empty.
+    """
+    if citation is None:
+        return []
+    if isinstance(citation, list):
+        out = []
+        for c in citation:
+            if isinstance(c, dict):
+                out.append({
+                    "docId": c.get("docId") or c.get("doc_id") or "",
+                    "pageNumbers": list(c.get("pageNumbers") or c.get("page_numbers") or []),
+                    "section": list(c.get("section") or []),
+                })
+            else:
+                out.append({"docId": "", "pageNumbers": [], "section": [str(c)]})
+        return out
+    s = (citation or "").strip()
+    if not s:
+        return []
+    # Multiple documents: "Document: A | ... ; Document: B | ..." (split only when ; is followed by "Document:")
+    if re.search(r'\s+;\s+Document:\s*', s, re.I):
+        segments = re.split(r'\s+;\s+(?=Document:\s*)', s, flags=re.I)
+        out = []
+        for seg in segments:
+            seg = seg.strip()
+            if not seg:
+                continue
+            one = _parse_one_citation_segment(seg)
+            if one:
+                out.append(one)
+        if out:
+            return out
+    # Single document
+    one = _parse_one_citation_segment(s)
+    return [one] if one else []
+
+
+def convert_result_citations_to_structured(final_result: Dict[str, Any]) -> None:
+    """In-place: convert each result's Citation to structured format [{ docId, pageNumbers, section }]."""
+    for ob in final_result.get("results", []):
+        ob["Citation"] = citation_string_to_structured(ob.get("Citation"))
+
+
 def deduplicate_and_merge_citations(obligations: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     Deduplicate obligations that represent the same duty (same DutyType, Party, and similar obligation text).
@@ -733,23 +817,26 @@ Output the filtered JSON:"""
     def _build_merge_rank_prompt(self, user_query: str, filtered_results: List[Dict[str, Any]]) -> str:
         """Build the merge-and-rank LLM prompt. Shared by /query, /query/stream, and /query/stream/raw so results are consistent."""
         non_empty_results = [r for r in filtered_results if r.get("consolidated_results")]
-        return f"""You are a legal document analyst. You have been provided with filtered financial obligations from multiple legal documents.
+        return f"""You are a legal document analyst. You have been provided with filtered financial obligations from multiple legal documents, all relevant to a user's query.
 
-Financial obligations = monetary responsibility, cost, payment, reimbursement, insurance, indemnification, or financial exposure. Preserve only content traceable to the document; do not invent or assume. Citation must reflect document content only.
-
-RELEVANCE FILTER (apply before merging): Include in your output only obligations that are clearly related to the user's query. The DutyType or Owner Responsibility should directly address the query topic (e.g. for "rent payment" include rent, base rent, monthly rent, late rent; for "utilities" include water, gas, electric, HVAC, etc.). Exclude obligations that are only vaguely or tangentially related (e.g. for "rent payment" exclude obligations that are purely about taxes, insurance, or other payments with no rent connection). When the connection is ambiguous but plausible, include the obligation rather than being overly strict.
+FILTERING (apply before merging): Include only obligations clearly related to the user's query. If full query word appears exactly in an obligation's related_keywords always include that obligation. Exclude vaguely or tangentially related obligations. When the query has clear legal meaning and the connection is ambiguous but plausible, include; if the query is nonsensical, gibberish, or off-topic, return results: [] (zero obligations).
 
 Your task is to merge these results into a single JSON and order them by:
 1. RELEVANCE to the user query (most relevant first)
-2. MONETARY VALUE (highest to lowest)
+2. MONETARY VALUE (highest amounts first)
+
+MERGE SIMILAR OBLIGATIONS FROM DIFFERENT DOCUMENTS (STRICTLY FOLLOW):
+- Merge two or more obligations from different documents into ONE row ONLY if they are semantically similar: same or equivalent meaning (e.g. same duty in substance, same responsible party, and equivalent scope or obligation). Do NOT merge based only on same DutyType and Responsible Party if the actual obligation (Owner Responsibility, scope, or meaning) differs.
+- If obligations are only superficially similar (e.g. same duty type but different scope, amount, or condition), keep them as separate rows. When in doubt, do not merge.
+- For each group of semantically similar obligations (from one or more documents), output exactly ONE row. In the "Citation" field you MUST list every source document that contributed to that obligation. Use this format with " ; " (space-semicolon-space) between documents: "Document: [filename1] | [citation1] ; Document: [filename2] | [citation2]". Include every document; never omit any.
+- If an obligation appears in only one document, output one row with one document in Citation.
+- Result: one row per distinct obligation; when semantically the same obligation appears in multiple documents, that single row MUST have Citation listing all of those documents. This is mandatory.
 
 CRITICAL INSTRUCTIONS:
-1. Combine all obligations from all documents into a single array
+1. Combine all obligations from all documents into a single array. Merge into one row ONLY when obligations are semantically similar (see above). For each merged row, Citation MUST list every source document; strictly include all documents.
 2. Order by relevance first, then by monetary value (highest amounts first)
 3. Do NOT modify the content of any obligation - preserve exactly as given
-4. IMPORTANT: Update each obligation's "Citation" field to include the source document filename
-   - Format: "Document: [filename] | [original citation]"
-   - Example: "Document: Commercial Lease Agreement.pdf | Page 3, Section 5(a)"
+4. Citation: Every obligation must have "Citation" with the source document filename. For one document: "Document: [filename] | [original citation]". For merged (semantically similar) obligations from multiple documents: "Document: [file1] | [citation1] ; Document: [file2] | [citation2]" — you MUST include every source document; do not omit any. Strictly follow. Example: "Document: Commercial Lease Agreement - Buyer Triple Net.pdf | Page 2, Section 'Rent' ; Document: MTNNN.pdf | Page 3, Section 'RENT'".
 5. Keep all fields: "DutyType", "Responsible Party", "Owner Responsibility", "Reasoning", "Citation"
 6. Do not add, remove, or modify any other fields
 7. Output ONLY valid JSON, no commentary
@@ -765,13 +852,12 @@ Return a JSON object with this structure:
   "total_documents_searched": {len(filtered_results)},
   "total_obligations_found": <count of obligations>,
   "results": [
-    // Array of all obligations, ordered by relevance and monetary value
-    // Each obligation must have Citation updated with document filename
+    // One row per obligation. Semantically similar obligations from multiple docs: merge into one row; Citation MUST list every document with " ; " between them. Ordered by relevance then monetary value.
   ]
 }}
 
 Output the merged and ranked JSON:"""
-    
+
     async def merge_and_rank_results_stream(self, user_query: str, filtered_results: List[Dict[str, Any]], 
                               document_name_to_id: Optional[Dict[str, str]] = None) -> AsyncIterator[Dict[str, Any]]:
         """
@@ -808,7 +894,7 @@ Output the merged and ranked JSON:"""
             # Parse the streamed JSON and yield each obligation; same result as merge/rank, streamed to client.
             obligation_count = 0
             async for obligation in parse_obligations_stream(token_stream):
-                # Keep citation as-is from LLM (string format)
+                obligation["Citation"] = citation_string_to_structured(obligation.get("Citation"))
                 obligation_count += 1
                 yield {
                     "type": "obligation",
@@ -822,6 +908,7 @@ Output the merged and ranked JSON:"""
                     "query": user_query,
                     "total_documents_searched": len(filtered_results),
                     "total_obligations_found": obligation_count,
+                    "processed_at": datetime.now().isoformat(),
                 }
             }
             
@@ -861,16 +948,17 @@ Output the merged and ranked JSON:"""
                     "query": user_query,
                     "total_documents_searched": len(filtered_results),
                     "total_obligations_found": 0,
-                    "results": []
+                    "results": [],
+                    "processed_at": datetime.now().isoformat(),
                 }
             
-            # 2. Prepare merge and rank prompt (same as /query/stream and /query/stream/raw for consistent results)
+            # 2. Build full merge+rank+filter prompt (no code merge; LLM does filtering, merging, ranking)
             t_step = time.perf_counter()
             merge_prompt = self._build_merge_rank_prompt(user_query, filtered_results)
             self.logger.info(f"[TIMING] merge_and_rank: 2. build_prompt - {time.perf_counter() - t_step:.3f}s")
-            self.logger.info(f"Merging and ranking results for query: '{user_query}'")
+            self.logger.info(f"Merge and rank (LLM) for query: '{user_query}'")
             
-            # 3. Call LLM API asynchronously (Azure OpenAI or Gemini)
+            # 3. Call LLM API asynchronously (filter + merge + rank in one call)
             t_step = time.perf_counter()
             response = await self._generate_content_async(
                 prompt=merge_prompt,
@@ -892,10 +980,10 @@ Output the merged and ranked JSON:"""
             final_result = json.loads(result_text)
             self.logger.info(f"[TIMING] merge_and_rank: 4. parse_response - {time.perf_counter() - t_step:.3f}s")
             
-            # 5. Keep citations as-is from LLM (no post-processing)
+            # 5. Convert citations to structured format (in case LLM returned string)
             t_step = time.perf_counter()
-            # Citations remain in string format: "Document: X.pdf | Page 2, Section 5"
-            self.logger.info(f"[TIMING] merge_and_rank: 5. citation_kept_as_string - {time.perf_counter() - t_step:.3f}s")
+            convert_result_citations_to_structured(final_result)
+            self.logger.info(f"[TIMING] merge_and_rank: 5. citation_to_structured - {time.perf_counter() - t_step:.3f}s")
             
             # 6. Fix count and finish
             t_step = time.perf_counter()
@@ -914,6 +1002,7 @@ Output the merged and ranked JSON:"""
                 "total_documents_searched": len(filtered_results),
                 "total_obligations_found": 0,
                 "results": [],
+                "processed_at": datetime.now().isoformat(),
                 "error": str(e)
             }
     
@@ -974,7 +1063,7 @@ Output the merged and ranked JSON:"""
                         name = Path(d).name or d
                         document_name_to_id[name] = doc_id
                         document_name_to_id[name.lower()] = doc_id
-                # Run merge and rank (LLM: combine, order by relevance + monetary value, Citation with doc id)
+                # Run merge and rank (LLM: combine, order by relevance + monetary value, merge similar obligations)
                 t_merge = time.perf_counter()
                 self.logger.info("[TIMING] Step: merge_and_rank (vector path) - start")
                 final_result = await self.merge_and_rank_results(user_query, filtered_results_for_merge, document_name_to_id)
@@ -997,6 +1086,7 @@ Output the merged and ranked JSON:"""
                     "total_documents_searched": 0,
                     "total_obligations_found": 0,
                     "results": [],
+                    "processed_at": datetime.now().isoformat(),
                     "error": "No consolidated JSON files or vector store results found"
                 }
             
@@ -1090,6 +1180,7 @@ Output the merged and ranked JSON:"""
                         "total_documents_searched": 0,
                         "total_obligations_found": 0,
                         "results": [],
+                        "processed_at": datetime.now().isoformat(),
                         "error": f"No documents found matching the provided document_ids. Please ensure you provide full URLs pointing to the Documents folder."
                     }
                 
@@ -1171,6 +1262,7 @@ Output the merged and ranked JSON:"""
                 "total_documents_searched": 0,
                 "total_obligations_found": 0,
                 "results": [],
+                "processed_at": datetime.now().isoformat(),
                 "error": str(e)
             }
     
