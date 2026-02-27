@@ -127,17 +127,19 @@ def retry_with_exponential_backoff(
 class PDFProcessor:
     """Handles PDF text extraction - both text-based and scanned documents"""
     
-    def __init__(self, tesseract_cmd: Optional[str] = None, cache_folder: str = "ocr_cache"):
+    def __init__(self, tesseract_cmd: Optional[str] = None, cache_folder: str = "ocr_cache", poppler_path: Optional[str] = None):
         """
         Initialize PDF Processor
         
         Args:
             tesseract_cmd: Path to tesseract executable (optional)
             cache_folder: Folder to cache OCR results
+            poppler_path: Path to poppler binaries (optional, for PDF to image conversion)
         """
         if tesseract_cmd:
             pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
         
+        self.poppler_path = poppler_path
         self.logger = logging.getLogger(__name__)
         self.cache_folder = Path(cache_folder)
         self.cache_folder.mkdir(exist_ok=True)
@@ -167,8 +169,14 @@ class PDFProcessor:
                 
                 return False
         except Exception as e:
+            error_msg = str(e).lower()
+            # If error is due to encryption/crypto, assume text-based and let extract_text_from_pdf handle it
+            if 'pycryptodome' in error_msg or 'crypto' in error_msg or 'aes' in error_msg:
+                self.logger.warning(f"Encryption detected during PDF type check, assuming text-based: {e}")
+                return True
             self.logger.error(f"Error checking PDF type: {e}")
-            return False
+            # Default to text-based to avoid unnecessary OCR attempts
+            return True
     
     def extract_text_from_pdf(self, pdf_path: str) -> Dict[int, str]:
         """
@@ -212,7 +220,10 @@ class PDFProcessor:
         try:
             # Convert PDF to images
             self.logger.info("Converting PDF to images for OCR...")
-            images = convert_from_path(pdf_path)
+            if self.poppler_path:
+                images = convert_from_path(pdf_path, poppler_path=self.poppler_path)
+            else:
+                images = convert_from_path(pdf_path)
             
             # Process each page
             for page_num, image in enumerate(images, start=1):
@@ -692,7 +703,8 @@ class LegalDocumentProcessor:
                  cache_folder: str = "ocr_cache",
                  prompt_file: str = "prompt.txt",
                  model: str = "gemini-2.5-flash-lite",
-                 tesseract_cmd: Optional[str] = None):
+                 tesseract_cmd: Optional[str] = None,
+                 poppler_path: Optional[str] = None):
         """Initialize with local docs and output folders. Requires GEMINI_API_KEY or (when USE_AZURE_OPENAI) Azure env vars in .env."""
         self.logs_folder = Path(logs_folder)
         self.cache_folder = Path(cache_folder)
@@ -704,7 +716,7 @@ class LegalDocumentProcessor:
         self.local_output_folder = str(Path(local_output_folder or os.getenv("OUTPUT_FOLDER", "output")).resolve())
         Path(self.local_output_folder).mkdir(parents=True, exist_ok=True)
         self.logger.info(f"Legal Document Processor (local): docs={self.local_docs_folder}, output={self.local_output_folder}")
-        self.pdf_processor = PDFProcessor(tesseract_cmd, str(self.cache_folder))
+        self.pdf_processor = PDFProcessor(tesseract_cmd, str(self.cache_folder), poppler_path)
         self.gemini_analyzer = GeminiAnalyzer(prompt_file, model)
     
     def _setup_logging(self):
@@ -930,7 +942,7 @@ class LegalDocumentProcessor:
 
 
 def main():
-    """Main entry point: process PDFs from docs/ and write to output/."""
+    """Main entry point: process all PDFs from docs/ and write to output/."""
     processor = LegalDocumentProcessor(
         local_docs_folder=os.getenv('DOCS_FOLDER', 'docs'),
         local_output_folder=os.getenv('OUTPUT_FOLDER', 'output'),
@@ -938,9 +950,10 @@ def main():
         cache_folder=os.getenv('CACHE_FOLDER', 'ocr_cache'),
         prompt_file=os.getenv('PROMPT_FILE', 'prompt.txt'),
         model=get_default_model(),
-        tesseract_cmd=os.getenv('TESSERACT_CMD')
+        tesseract_cmd=os.getenv('TESSERACT_CMD'),
+        poppler_path=os.getenv('POPPLER_PATH')
     )
-    processor.run()
+    processor.process_all_documents()
 
 
 if __name__ == "__main__":

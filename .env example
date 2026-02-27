@@ -1,25 +1,26 @@
 # ========== Use Azure OpenAI ==========
 USE_AZURE_OPENAI=True
-
+ 
 # Azure OpenAI (required when USE_AZURE_OPENAI=True)
 # Endpoint from Azure Portal: your resource -> Keys and Endpoint
-AZURE_OPENAI_ENDPOINT=https://your-resource.openai.azure.com/
-AZURE_OPENAI_KEY=your-azure-openai-key-here
+AZURE_OPENAI_ENDPOINT=https://your-resource-name.openai.azure.com/
+AZURE_OPENAI_KEY=your-azure-openai-api-key-here
 AZURE_OPENAI_API_VERSION=2025-01-01-preview
 AZURE_OPENAI_DEPLOYMENT_NAME=gpt-4o-mini
-
+AZURE_OPENAI_TIMEOUT_SECONDS=300
+ 
 # Use local sentence-transformers for embeddings (no Azure embedding call; faster queries)
 USE_LOCAL_EMBEDDING=True
 # Or use Azure embeddings: create a deployment in Azure Portal and set e.g.:
 # AZURE_OPENAI_EMBEDDING_DEPLOYMENT=text-embedding-3-large
-
+ 
 # GCS simulator (fake GCS) - required when using run_emulator.py
 STORAGE_EMULATOR_HOST=http://localhost:4443
 GCS_BUCKET=heb-legal
-
+ 
 # Vector search: max distance for similarity (default 1.4; higher = more results)
 VECTOR_MAX_DISTANCE=2.0
-
+ 
 # -----------------------------------------------------------------------------
 # Optional: document folders, OCR, API (defaults used if unset)
 # -----------------------------------------------------------------------------

@@ -1328,23 +1328,27 @@ class ProcessResponse(BaseModel):
     """Response model for document processing endpoint"""
     status: str
     message: str
-    document_name: Optional[str] = None
-    output_path: Optional[str] = None
-    total_pages: Optional[int] = None
-    total_obligations: Optional[int] = None
-    consolidated_obligations: Optional[int] = None
+    total_documents: Optional[int] = None
+    successful: Optional[int] = None
+    failed: Optional[int] = None
+    results: Optional[List[Dict[str, Any]]] = None
     error: Optional[str] = None
 
     class Config:
         json_schema_extra = {
             "example": {
                 "status": "success",
-                "message": "Document processed successfully",
-                "document_name": "Commercial Lease Agreement.pdf",
-                "output_path": "gs://heb-legal/Output/Commercial_Lease_Agreement_20251209_143000_consolidated.json",
-                "total_pages": 25,
-                "total_obligations": 45,
-                "consolidated_obligations": 32
+                "message": "Processed 3 documents",
+                "total_documents": 3,
+                "successful": 2,
+                "failed": 1,
+                "results": [
+                    {
+                        "document_name": "Commercial Lease Agreement.pdf",
+                        "status": "success",
+                        "output_path": "output/Commercial_Lease_Agreement_20251209_143000_consolidated.json"
+                    }
+                ]
             }
         }
 
@@ -1758,7 +1762,7 @@ async def query_obligations_stream(request: Optional[QueryRequest] = Body(defaul
 
 @app.post("/process", response_model=ProcessResponse, tags=["Processing"])
 async def process_document(request: ProcessRequest):
-    """Process PDFs from docs folder and save consolidated JSON to output folder. Uses Azure OpenAI or Gemini via llm_client."""
+    """Process all PDFs from docs folder and save consolidated JSON to output folder. Uses Azure OpenAI or Gemini via llm_client."""
     try:
         from process_legal_documents import LegalDocumentProcessor
 
@@ -1773,46 +1777,32 @@ async def process_document(request: ProcessRequest):
             cache_folder=os.getenv('CACHE_FOLDER', 'ocr_cache'),
             prompt_file=os.getenv('PROMPT_FILE', 'prompt.txt'),
             model=get_default_model(),
-            tesseract_cmd=os.getenv('TESSERACT_CMD')
+            tesseract_cmd=os.getenv('TESSERACT_CMD'),
+            poppler_path=os.getenv('POPPLER_PATH')
         )
-        pdf_path = processor.get_first_pdf()
-        if not pdf_path:
-            return ProcessResponse(
-                status="error",
-                message=f"No PDF files found in {docs_folder}",
-                error="No PDF files found in docs folder"
-            )
-        output_path = processor.process_document(pdf_path)
-        doc_name = Path(pdf_path).name
-        if output_path:
-            try:
-                with open(output_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                return ProcessResponse(
-                    status="success",
-                    message="Document processed successfully",
-                    document_name=doc_name,
-                    output_path=output_path,
-                    total_pages=data.get("total_pages", 0),
-                    total_obligations=data.get("total_obligations_found", 0),
-                    consolidated_obligations=data.get("consolidated_obligations_count", 0)
-                )
-            except Exception as e:
-                logging.warning(f"Could not extract statistics from output: {e}")
-                return ProcessResponse(
-                    status="success",
-                    message="Document processed successfully",
-                    document_name=doc_name,
-                    output_path=output_path
-                )
+        
+        result = processor.process_all_documents()
+        
         return ProcessResponse(
-            status="error",
-            message="Document processing failed",
-            error="Processing failed - check logs for details"
+            status=result["status"],
+            message=result["message"],
+            total_documents=result["total_documents"],
+            successful=result["successful"],
+            failed=result["failed"],
+            results=result["results"],
+            error=result.get("error")
         )
     except Exception as e:
-        logging.error(f"Error processing document: {e}", exc_info=True)
-        return ProcessResponse(status="error", message=str(e), error=str(e))
+        logging.error(f"Error processing documents: {e}", exc_info=True)
+        return ProcessResponse(
+            status="error",
+            message=str(e),
+            total_documents=0,
+            successful=0,
+            failed=0,
+            results=[],
+            error=str(e)
+        )
 
 
 @app.get("/documents", tags=["Documents"])

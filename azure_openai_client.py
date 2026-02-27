@@ -63,7 +63,8 @@ def generate_content(
     if response_mime_type == "application/json":
         body["response_format"] = {"type": "json_object"}
 
-    r = requests.post(url, headers=headers, json=body, timeout=120)
+    timeout_seconds = float(os.getenv("AZURE_OPENAI_TIMEOUT_SECONDS", "300"))
+    r = requests.post(url, headers=headers, json=body, timeout=timeout_seconds)
     if r.status_code == 400:
         try:
             err = r.json()
