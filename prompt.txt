@@ -47,6 +47,10 @@ Use concise bullet points.
 
 If the document does not provide explicit reasoning, leave the field empty or state "Not specified".
 
+Section:
+
+When extracting by section, set this to the exact section or article title (e.g. "5. Rent", "8. Operating Expenses"). When not doing section-based extraction, omit or leave empty.
+
 Citation:
 
 Provide a reference to where the extracted information is located in the document.

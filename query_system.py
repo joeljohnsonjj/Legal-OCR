@@ -819,11 +819,12 @@ Output the filtered JSON:"""
         non_empty_results = [r for r in filtered_results if r.get("consolidated_results")]
         return f"""You are a legal document analyst. You have been provided with filtered financial obligations from multiple legal documents, all relevant to a user's query.
 
-FILTERING (apply before merging): Include only obligations clearly related to the user's query. If full query word appears exactly in an obligation's related_keywords always include that obligation. Exclude vaguely or tangentially related obligations. When the query has clear legal meaning and the connection is ambiguous but plausible, include; if the query is nonsensical, gibberish, or off-topic, return results: [] (zero obligations).
+FILTERING (apply before merging): Include only obligations clearly related to the user's query. The most similar obligations to the query MUST be included in the result set — never exclude them. If the full query word appears exactly in an obligation's related_keywords, always include that obligation. Include obligations that are semantically similar to the query. Exclude only vaguely or tangentially related obligations. When the query has clear legal meaning and the connection is ambiguous but plausible, include; if the query is nonsensical, gibberish, or off-topic, return results: [] (zero obligations).
 
 Your task is to merge these results into a single JSON and order them by:
-1. RELEVANCE to the user query (most relevant first)
-2. MONETARY VALUE (highest amounts first)
+1. SIMILARITY TO THE USER QUERY: The most similar obligations to the user query MUST appear in the result set and MUST be ranked first (highest similarity at the top). Do not omit highly similar obligations; include them and place them at the top.
+2. RELEVANCE: Then by overall relevance to the query.
+3. MONETARY VALUE: Then by highest amounts first.
 
 MERGE SIMILAR OBLIGATIONS FROM DIFFERENT DOCUMENTS (STRICTLY FOLLOW):
 - Merge two or more obligations from different documents into ONE row ONLY if they are semantically similar: same or equivalent meaning (e.g. same duty in substance, same responsible party, and equivalent scope or obligation). Do NOT merge based only on same DutyType and Responsible Party if the actual obligation (Owner Responsibility, scope, or meaning) differs.
@@ -834,7 +835,7 @@ MERGE SIMILAR OBLIGATIONS FROM DIFFERENT DOCUMENTS (STRICTLY FOLLOW):
 
 CRITICAL INSTRUCTIONS:
 1. Combine all obligations from all documents into a single array. Merge into one row ONLY when obligations are semantically similar (see above). For each merged row, Citation MUST list every source document; strictly include all documents.
-2. Order by relevance first, then by monetary value (highest amounts first)
+2. Order by similarity to the user query first (most similar obligations at the top and included in the result set), then by relevance, then by monetary value (highest amounts first).
 3. Do NOT modify the content of any obligation - preserve exactly as given
 4. Citation: Every obligation must have "Citation" with the source document filename. For one document: "Document: [filename] | [original citation]". For merged (semantically similar) obligations from multiple documents: "Document: [file1] | [citation1] ; Document: [file2] | [citation2]" — you MUST include every source document; do not omit any. Strictly follow. Example: "Document: Commercial Lease Agreement - Buyer Triple Net.pdf | Page 2, Section 'Rent' ; Document: MTNNN.pdf | Page 3, Section 'RENT'".
 5. Keep all fields: "DutyType", "Responsible Party", "Owner Responsibility", "Reasoning", "Citation"
@@ -852,7 +853,7 @@ Return a JSON object with this structure:
   "total_documents_searched": {len(filtered_results)},
   "total_obligations_found": <count of obligations>,
   "results": [
-    // One row per obligation. Semantically similar obligations from multiple docs: merge into one row; Citation MUST list every document with " ; " between them. Ordered by relevance then monetary value.
+    // One row per obligation. Semantically similar obligations from multiple docs: merge into one row; Citation MUST list every document with " ; " between them. Ordered by similarity to query (most similar first), then relevance, then monetary value. The most similar obligations must be in the result set and ranked at the top.
   ]
 }}
 
@@ -1762,7 +1763,7 @@ async def query_obligations_stream(request: Optional[QueryRequest] = Body(defaul
 
 @app.post("/process", response_model=ProcessResponse, tags=["Processing"])
 async def process_document(request: ProcessRequest):
-    """Process all PDFs from docs folder and save consolidated JSON to output folder. Uses Azure OpenAI or Gemini via llm_client."""
+    """Process all PDFs from docs folder. Writes (1) section-based obligations JSON, (2) consolidated JSON to output folder. Extraction is section-only (regex: ^\\d+\\. , ^\\([a-z]\\) , ^\\(\\d+\\)). Uses Azure OpenAI or Gemini via llm_client."""
     try:
         from process_legal_documents import LegalDocumentProcessor
 
