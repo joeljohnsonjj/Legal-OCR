@@ -18,9 +18,13 @@ pytesseract>=0.3.10
 # Environment Variables
 python-dotenv>=1.0.0
 
+# pkg_resources: required by some deps (e.g. gcp-storage-emulator). Setuptools 82+ removed the pkg_resources module — pin below 82.
+setuptools>=65.0.0,<82
+
 # JSON Processing (built-in + streaming parse)
 # json
 ijson>=3.2.0
+json-repair>=0.30.0
 
 # Logging (built-in)
 # logging
@@ -34,10 +38,17 @@ pydantic>=2.0.0
 requests>=2.31.0
 httpx>=0.25.0
 
+# Optional: unified LLM interface – set LITELLM_MODEL to switch providers (e.g. gemini/gemini-2.5-flash-lite, azure/gpt-4o-mini)
+litellm>=1.50.0
+
 # Vector store for obligation chunks (ChromaDB + optional OpenAI embeddings)
 chromadb>=0.4.0
+# Dual-track RAG (raw page + obligations) — see legal_rag/ and rag_architecture.md
+qdrant-client>=1.9.0
 sentence-transformers>=2.2.0
 openai>=1.0.0
+boto3==1.34.34
+python-dotenv==1.0.0
 
 # GCS Emulator (optional, for local development)
 # Install from local directory: pip install -e ./gcp-storage-emulator-main

@@ -16,17 +16,69 @@ from datetime import datetime
 from urllib.parse import unquote, urlparse
 
 # LLM API (Azure OpenAI or Gemini via llm_client)
-from llm_client import generate_content as llm_generate_content, get_default_model
+from llm_client import generate_content as llm_generate_content, get_default_model, generate_content_stream
 
 # FastAPI
 from fastapi import Body, FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+from api_security import (
+    LegalOCRSecurityMiddleware,
+    http_safe_exception_detail,
+    sanitize_chat_message,
+    sanitize_query_text,
+)
 
 # Environment Variables
 from dotenv import load_dotenv
 load_dotenv()
+
+# Repair malformed LLM JSON (unescaped newlines/quotes in long merge responses)
+try:
+    import json_repair  # type: ignore
+except ImportError:
+    json_repair = None  # type: ignore
+
+# Load LLM config from AWS Parameter Store (AssumeRole flow) if LLM_PARAMETER_PATH is set
+_qs_logger = logging.getLogger(__name__)
+try:
+    from aws_parameter_loader import init_llm_env
+    _llm_cfg = init_llm_env()
+    if _llm_cfg:
+        _qs_logger.info("AWS Bedrock AssumeRole OK: model=%s", _llm_cfg.get("model"))
+    else:
+        _qs_logger.warning("init_llm_env returned None — falling back to LLM_MODEL from .env")
+except Exception as _e:
+    _qs_logger.warning("init_llm_env failed: %s", _e)
+
+# Fallback: if AssumeRole failed but LLM_MODEL is set in .env (e.g. bedrock/...), still use Bedrock via LiteLLM
+# NOTE: without AssumeRole the temporary session token won't be set, so this only works if the base IAM
+# credentials in .env already have bedrock:InvokeModel permission on the target account.
+if not os.getenv("LITELLM_MODEL") and os.getenv("LLM_MODEL"):
+    _lm = (os.getenv("LLM_MODEL") or "").strip()
+    if _lm:
+        os.environ["LITELLM_MODEL"] = _lm
+        _qs_logger.info("Fallback: LITELLM_MODEL set from LLM_MODEL=%s", _lm)
+
+# Sanitize credentials in this process (worker loads query_system directly, so run_api strip doesn't run here)
+def _sanitize_header_value(s):
+    if not s or not isinstance(s, str):
+        return s or ""
+    return s.replace("\r", "").replace("\n", "").strip()
+
+
+for _var in (
+    "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN",
+    "API_KEY", "AWS_REGION", "AWS_REGION_NAME",
+    "LITELLM_MODEL", "LLM_MODEL",
+):
+    _val = os.environ.get(_var)
+    if _val is not None and isinstance(_val, str):
+        _clean = _sanitize_header_value(_val)
+        if _clean != _val:
+            os.environ[_var] = _clean
 
 
 def _normalize_ob_key(ob: Dict[str, Any]) -> tuple:
@@ -529,6 +581,31 @@ class ObligationQuerySystem:
                 results = data.get("consolidated_results") or []
                 if doc_name:
                     doc_to_results[doc_name] = results
+            # ChromaDB persists across runs: it may still contain chunks from PDFs processed earlier
+            # even if those *_consolidated.json files were removed. Restrict hits to documents that
+            # actually have a consolidated (or pagewise-derived) JSON in output/ unless disabled.
+            require_consolidated = os.getenv(
+                "VECTOR_REQUIRE_CONSOLIDATED_JSON", "true"
+            ).strip().lower() in ("true", "1", "yes")
+            if require_consolidated and doc_to_results:
+                lower_to_canon = {k.lower(): k for k in doc_to_results}
+                before_ct = len(raw)
+                filtered_raw = []
+                for r in raw:
+                    dn = (r.get("document_name") or "").strip()
+                    key = dn.lower()
+                    if key in lower_to_canon:
+                        rr = dict(r)
+                        rr["document_name"] = lower_to_canon[key]
+                        filtered_raw.append(rr)
+                raw = filtered_raw
+                if before_ct != len(raw):
+                    self.logger.info(
+                        "Vector: dropped %d hit(s) with no matching *_consolidated.json on disk "
+                        "(orphan Chroma chunks). Remaining: %d. Set VECTOR_REQUIRE_CONSOLIDATED_JSON=false to include them.",
+                        before_ct - len(raw),
+                        len(raw),
+                    )
             obligations = []
             for r in raw:
                 doc_name = (r.get("document_name") or "").strip()
@@ -623,19 +700,19 @@ HOW TO IDENTIFY MATCHED OBLIGATIONS:
       - If query mentions a specific party name, filter by that party
       - Example: Query "H-E-B obligations" should only return obligations where Responsible Party is "H-E-B, L.P."
 
-3. MATCHING CRITERIA (Include obligation if ANY of these are true):
-   - Query term appears in DutyType (exact or semantic match)
-   - Query term appears in any Owner Responsibility item
-   - Query concept is directly related to the obligation's purpose
-   - For broad queries (e.g., "payment", "cost"), include all monetary obligations
-   - For specific queries (e.g., "rent payment"), only include closely related obligations
+3. MATCHING CRITERIA (precision first):
+   - Prefer **direct** topic match: the obligation should be **about** what the user asked (not merely any money duty).
+   - Include if DutyType or Owner Responsibility clearly concerns the query topic (synonyms OK: e.g. rent ↔ base rent, lease rent, holdover rent).
+   - **Do NOT** include an obligation only because it says "payment", "tenant", "cost", or "financial obligation" in the abstract when the **substance** is a different topic (e.g. query "rent" → exclude pure **insurance**, **property tax**, **utilities**, **CAM/operating costs**, **security deposit** unless the text explicitly ties them to **rent** or the user query names that topic).
+   - **related_keywords** (if present) can be overly broad from extraction—**do not** rely on keyword overlap alone; use DutyType + Owner Responsibility meaning.
+   - Broad queries ("all payments", "money obligations"): still require a plausible link to the words in the query; do not return the entire document list unless the query truly asks for everything.
 
 4. EXAMPLES OF MATCHING:
 
    Query: "Rent payment"
-   ✅ MATCH: DutyType = "Rent Payment", "Base Rent", "Monthly Rent", "Additional Rent"
-   ✅ MATCH: Owner Responsibility contains "pay rent", "rental payment", "lease payment"
-   ❌ NO MATCH: DutyType = "Insurance Premium" (unrelated)
+   ✅ MATCH: DutyType = "Rent Payment", "Base Rent", "Monthly Rent", "Additional Rent", "Prepaid Rent", "Holdover Rent"
+   ✅ MATCH: Owner Responsibility clearly about paying rent / rental amount / rent timing
+   ❌ NO MATCH: DutyType or duty is only "Insurance", "Real Estate Taxes", "Utilities", "Operating Costs", "Security Deposit" with no rent-specific duty
    
    Query: "Insurance"
    ✅ MATCH: DutyType = "Insurance Premium", "Insurance Requirement", "Insurance Cost"
@@ -652,9 +729,9 @@ HOW TO IDENTIFY MATCHED OBLIGATIONS:
    ❌ NO MATCH: Responsible Party = "Tenant" (different party)
 
 5. WHEN TO EXCLUDE:
-   - The obligation is clearly about a different topic (e.g., query "rent" vs obligation about "insurance")
-   - No semantic relationship exists between query and obligation
-   - Query specifies a party, but obligation is for a different party
+   - The obligation is clearly about a different legal/financial topic than the query
+   - Match would depend only on generic words ("Tenant", "pay", "amount") without topic alignment
+   - Query specifies a party name, but Responsible Party is a different entity
 
 CRITICAL GUARDRAILS:
 - Use the EXACT same JSON structure as provided - do not modify, add, or remove any fields
@@ -663,7 +740,7 @@ CRITICAL GUARDRAILS:
 - Preserve all fields: "DutyType", "Responsible Party", "Owner Responsibility", "Reasoning", "Citation"
 - Do not add commentary, explanations, or any text outside the JSON structure
 - Output ONLY valid JSON
-- Be inclusive rather than exclusive - if unsure, include the obligation (better to have false positives than miss relevant obligations)
+- Prefer **precision**: when the query names a specific obligation type, exclude rows that are only tangentially related to money in general
 
 User Query: "{user_query}"
 
@@ -814,6 +891,58 @@ Output the filtered JSON:"""
         
         return citations
     
+    @staticmethod
+    def _flatten_obligations_from_filtered(filtered_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """When LLM merge JSON fails, return retrieval results unchanged (best-effort)."""
+        out: List[Dict[str, Any]] = []
+        for fr in filtered_results:
+            for ob in (fr.get("consolidated_results") or []):
+                if isinstance(ob, dict):
+                    out.append(ob)
+        return out
+
+    def _parse_merge_rank_llm_json(self, result_text: str) -> Optional[Dict[str, Any]]:
+        """
+        Parse merge/rank JSON. Bedrock/Haiku sometimes emits invalid JSON (e.g. newline inside
+        a string in Owner Responsibility). Try strict parse, brace slice, then json_repair.
+        """
+        text = (result_text or "").strip()
+        if text.startswith("```json"):
+            text = text[7:]
+        if text.startswith("```"):
+            text = text[3:]
+        if text.endswith("```"):
+            text = text[:-3]
+        text = text.strip()
+        if not text:
+            return None
+        try:
+            parsed = json.loads(text)
+            return parsed if isinstance(parsed, dict) else None
+        except json.JSONDecodeError:
+            pass
+        b, e = text.find("{"), text.rfind("}")
+        if b != -1 and e > b:
+            slice_ = text[b : e + 1]
+            try:
+                parsed = json.loads(slice_)
+                return parsed if isinstance(parsed, dict) else None
+            except json.JSONDecodeError:
+                pass
+            if json_repair is not None:
+                try:
+                    parsed = json_repair.loads(slice_)
+                    return parsed if isinstance(parsed, dict) else None
+                except Exception:
+                    pass
+        if json_repair is not None:
+            try:
+                parsed = json_repair.loads(text)
+                return parsed if isinstance(parsed, dict) else None
+            except Exception:
+                pass
+        return None
+
     def _build_merge_rank_prompt(self, user_query: str, filtered_results: List[Dict[str, Any]]) -> str:
         """Build the merge-and-rank LLM prompt. Shared by /query, /query/stream, and /query/stream/raw so results are consistent."""
         non_empty_results = [r for r in filtered_results if r.get("consolidated_results")]
@@ -883,9 +1012,8 @@ Output the merged and ranked JSON:"""
             merge_prompt = self._build_merge_rank_prompt(user_query, filtered_results)
             # Stream from Azure OpenAI (merge and rank LLM call)
             self.logger.info("[STREAM] Merge/rank LLM call - streaming response from Azure OpenAI")
-            from azure_openai_client import generate_content_stream
             from streaming_json_parser import parse_obligations_stream
-            
+
             token_stream = generate_content_stream(
                 prompt=merge_prompt,
                 model=self.model,
@@ -968,17 +1096,43 @@ Output the merged and ranked JSON:"""
             )
             self.logger.info(f"[TIMING] merge_and_rank: 3. llm_api_call - {time.perf_counter() - t_step:.3f}s")
             
-            # 4. Parse JSON response (strip, strip markdown, json.loads)
+            # 4. Parse JSON (strict + json_repair); on total failure return unmerged retrieval results
             t_step = time.perf_counter()
-            result_text = response.text.strip()
-            if result_text.startswith("```json"):
-                result_text = result_text[7:]
-            if result_text.startswith("```"):
-                result_text = result_text[3:]
-            if result_text.endswith("```"):
-                result_text = result_text[:-3]
-            result_text = result_text.strip()
-            final_result = json.loads(result_text)
+            raw_text = (response.text or "").strip()
+            parsed = self._parse_merge_rank_llm_json(raw_text)
+            if parsed is None:
+                self.logger.warning(
+                    "merge/rank LLM response could not be parsed as JSON (sample): %r",
+                    raw_text[:400],
+                )
+                cap = int(os.getenv("MERGE_FALLBACK_MAX_OBLIGATIONS", "150"))
+                fallback = self._flatten_obligations_from_filtered(filtered_results)[:cap]
+                parsed = {
+                    "query": user_query,
+                    "total_documents_searched": len(filtered_results),
+                    "total_obligations_found": len(fallback),
+                    "results": fallback,
+                    "processed_at": datetime.now().isoformat(),
+                    "merge_warning": (
+                        "LLM merge step returned malformed JSON (often unescaped newlines/quotes in long "
+                        "responses). Returned unmerged obligations from semantic search. "
+                        "Ensure `json-repair` is installed for automatic repair."
+                    ),
+                }
+            # Guard: LLM may return a JSON string (e.g. "No obligations found") instead of an object
+            if not isinstance(parsed, dict):
+                self.logger.warning("LLM returned non-dict JSON (%s): %r", type(parsed).__name__, str(parsed)[:200])
+                cap = int(os.getenv("MERGE_FALLBACK_MAX_OBLIGATIONS", "150"))
+                fallback = self._flatten_obligations_from_filtered(filtered_results)[:cap]
+                parsed = {
+                    "query": user_query,
+                    "total_documents_searched": len(filtered_results),
+                    "total_obligations_found": len(fallback),
+                    "results": fallback,
+                    "processed_at": datetime.now().isoformat(),
+                    "merge_warning": "LLM returned unexpected JSON type; returned unmerged search results.",
+                }
+            final_result = parsed
             self.logger.info(f"[TIMING] merge_and_rank: 4. parse_response - {time.perf_counter() - t_step:.3f}s")
             
             # 5. Convert citations to structured format (in case LLM returned string)
@@ -1305,6 +1459,13 @@ class QueryRequest(BaseModel):
     save_output: bool = Field(default=False, description="Whether to save results to file")
     output_folder: Optional[str] = Field(default=None, description="Local output folder to search for consolidated JSON (if not provided, uses OUTPUT_FOLDER from environment)")
 
+    @field_validator("query", mode="before")
+    @classmethod
+    def _sanitize_query(cls, v):
+        if v is None:
+            return ""
+        return sanitize_query_text(str(v))
+
     class Config:
         json_schema_extra = {
             "example": {
@@ -1323,6 +1484,43 @@ class ProcessRequest(BaseModel):
         json_schema_extra = {
             "example": {"docs_folder": "docs", "output_folder": "output"}
         }
+
+
+class ChatRequest(BaseModel):
+    """RAG chat (Qdrant + legal_rag): router → vector search → context → answer LLM."""
+
+    message: str = Field(..., min_length=1, max_length=16000, description="User message")
+    document_id: Optional[str] = Field(
+        default=None,
+        description="Optional: restrict search to one indexed document (e.g. PDF filename as used at index time).",
+    )
+    top_k: int = Field(default=8, ge=1, le=50, description="Max vector hits to assemble into context")
+
+    @field_validator("message")
+    @classmethod
+    def _sanitize_message(cls, v: str) -> str:
+        return sanitize_chat_message(v)
+
+    @field_validator("document_id", mode="before")
+    @classmethod
+    def _sanitize_document_id(cls, v):
+        if v is None or (isinstance(v, str) and not v.strip()):
+            return None
+        s = str(v).replace("\x00", "").strip()[:512]
+        return s or None
+
+    class Config:
+        json_schema_extra = {"example": {"message": "What is the security deposit amount?", "top_k": 8}}
+
+
+class ChatResponse(BaseModel):
+    """Response from POST /chat (dual-track RAG)."""
+
+    answer: str
+    route: Dict[str, Any]
+    hit_count: int
+    block_count: int
+    context_was_empty: bool
 
 
 class ProcessResponse(BaseModel):
@@ -1417,6 +1615,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+# Optional API key + rate limits on /chat, /query*, /process, DELETE /rag/index/… (see api_security.py)
+app.add_middleware(LegalOCRSecurityMiddleware)
 
 # Global query system instance (initialized on startup)
 query_system_instance: Optional[ObligationQuerySystem] = None
@@ -1445,6 +1645,8 @@ async def root():
         "version": "1.0.0",
         "endpoints": {
             "query_post": "/query (POST)",
+            "chat_post": "/chat (POST) — RAG chat (Qdrant + legal_rag)",
+            "rag_index_delete": "/rag/index/{document_name} (DELETE) — drop Chroma + Qdrant for one PDF",
             "process": "/process (POST)",
             "documents": "/documents (GET)",
             "health": "/health",
@@ -1464,6 +1666,88 @@ async def health_check():
         return {"status": "healthy", "query_system": "initialized", "documents_available": len(files), "output_folder": query_system_instance.local_output_folder}
     except Exception as e:
         return {"status": "degraded", "query_system": "initialized", "error": str(e)}
+
+
+@app.post("/chat", response_model=ChatResponse, tags=["Query"])
+async def chat_rag_post(request: ChatRequest = Body(...)):
+    """
+    Conversational RAG over indexed documents (Qdrant).
+
+    Requires documents indexed via ``RAG_INDEX_QDRANT=true`` during ``/process`` or manual
+    ``legal_rag.qdrant_store.upsert_document_pages_and_obligations``. Legacy ``/query`` uses Chroma + consolidated JSON.
+
+    **Postman:** ``POST`` ``http://localhost:<port>/chat`` with JSON body
+    ``{"message": "Your question", "document_id": null, "top_k": 8}``.
+    """
+    msg = (request.message or "").strip()
+    if not msg:
+        raise HTTPException(status_code=400, detail="message is required")
+
+    try:
+        from legal_rag.pipeline import run_chat_turn
+    except ImportError as e:
+        raise HTTPException(
+            status_code=503,
+            detail=f"legal_rag package not available: {e}",
+        ) from e
+
+    try:
+        out = await run_chat_turn(
+            msg,
+            document_id=(request.document_id or "").strip() or None,
+            top_k=request.top_k,
+        )
+        return ChatResponse(
+            answer=out["answer"],
+            route=out["route"],
+            hit_count=out["hit_count"],
+            block_count=out["block_count"],
+            context_was_empty=out["context_was_empty"],
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        client_msg, log_msg = http_safe_exception_detail(e)
+        logging.error("Error in /chat: %s", log_msg, exc_info=True)
+        raise HTTPException(status_code=500, detail=client_msg) from e
+
+
+@app.delete("/rag/index/{document_name:path}", tags=["Documents"])
+async def delete_rag_index_document(document_name: str):
+    """
+    Remove vector index data for one document (Chroma obligation chunks + Qdrant RAG points).
+    Does not delete JSON files under output/. Set LEGAL_OCR_API_KEY to require authentication.
+    """
+    doc = unquote(document_name).strip()
+    if not doc:
+        raise HTTPException(status_code=400, detail="document_name is required")
+
+    if query_system_instance is None:
+        raise HTTPException(status_code=503, detail="Query system not initialized")
+
+    out_dir = Path(query_system_instance.local_output_folder)
+    chroma_path = str(out_dir / "chroma_db")
+    errors: List[str] = []
+
+    try:
+        from vector_store import delete_obligations_by_document
+
+        delete_obligations_by_document(document_name=doc, chroma_path=chroma_path)
+    except Exception as e:
+        errors.append(f"chroma: {e}")
+
+    try:
+        from legal_rag.qdrant_store import delete_document
+
+        delete_document(doc)
+    except Exception as e:
+        errors.append(f"qdrant: {e}")
+
+    return {
+        "status": "ok" if not errors else "partial",
+        "document_name": doc,
+        "warnings": errors,
+    }
 
 
 @app.post("/query", response_model=QueryResponse, tags=["Query"])
@@ -1605,11 +1889,9 @@ async def query_obligations_stream_raw(request: Optional[QueryRequest] = Body(de
             _echo("="*80 + "\n")
             yield "="*80 + "\n"
             
-            from azure_openai_client import generate_content_stream
-            
             # Same merge/rank prompt as /query and /query/stream so results are consistent
             merge_prompt = qs._build_merge_rank_prompt(user_query, filtered_results)
-            
+
             # Stream raw tokens (and echo to terminal so you see stream when using Postman)
             token_count = 0
             async for token in generate_content_stream(

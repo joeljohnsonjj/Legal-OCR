@@ -19,12 +19,45 @@ emulator_src_path = Path(__file__).parent / "gcp-storage-emulator-main" / "src"
 if emulator_src_path.exists():
     sys.path.insert(0, str(emulator_src_path))
 
+def _ensure_pkg_resources():
+    """
+    gcp-storage-emulator (or a dependency) imports pkg_resources.
+    Setuptools 82+ no longer ships a top-level pkg_resources module — pin setuptools<82.
+    """
+    import subprocess
+
+    try:
+        import pkg_resources  # noqa: F401
+        return
+    except ImportError:
+        pass
+    print("Installing setuptools<82 (provides pkg_resources; required by GCS emulator deps)...")
+    subprocess.check_call(
+        [sys.executable, "-m", "pip", "install", "setuptools>=65,<82"],
+    )
+    import pkg_resources  # noqa: F401  # retry after install
+
+
 try:
+    _ensure_pkg_resources()
     from gcp_storage_emulator.server import create_server
+except ModuleNotFoundError as _mnf:
+    # Downgrade path: venv had setuptools 82+ without pkg_resources
+    if getattr(_mnf, "name", None) == "pkg_resources" or "pkg_resources" in str(_mnf):
+        import subprocess
+
+        print("Fixing missing pkg_resources (setuptools 82+ removed it)...")
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "setuptools>=65,<82"],
+        )
+        from gcp_storage_emulator.server import create_server
+    else:
+        raise
 except ImportError:
     # Try installing from local directory
     try:
         import subprocess
+
         emulator_dir = Path(__file__).parent / "gcp-storage-emulator-main"
         if emulator_dir.exists():
             print(f"Installing gcp-storage-emulator from {emulator_dir}...")
@@ -35,8 +68,11 @@ except ImportError:
             print("Please install it with: pip install gcp-storage-emulator")
             sys.exit(1)
     except Exception as e:
+        err = str(e).lower()
         print(f"ERROR: Failed to import or install gcp-storage-emulator: {e}")
-        print("Please install it with: pip install gcp-storage-emulator")
+        if "pkg_resources" in err or "No module named 'pkg_resources'" in str(e):
+            print("Fix: pip install setuptools")
+        print("Or: pip install gcp-storage-emulator")
         sys.exit(1)
 
 logging.basicConfig(

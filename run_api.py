@@ -10,6 +10,44 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv()
 
+# Load LLM config from AWS Parameter Store (AssumeRole flow) if LLM_PARAMETER_PATH is set
+import logging as _logging
+_ra_logger = _logging.getLogger(__name__)
+try:
+    from aws_parameter_loader import init_llm_env
+    _llm_cfg = init_llm_env()
+    if _llm_cfg:
+        _ra_logger.info("AWS Bedrock AssumeRole OK: model=%s", _llm_cfg.get("model"))
+    else:
+        _ra_logger.warning("init_llm_env returned None — falling back to LLM_MODEL from .env")
+except Exception as _e:
+    _ra_logger.warning("init_llm_env failed: %s", _e)
+
+# Fallback: if AssumeRole failed but LLM_MODEL is set in .env, still route to LiteLLM/Bedrock
+if not os.getenv("LITELLM_MODEL") and os.getenv("LLM_MODEL"):
+    _lm = (os.getenv("LLM_MODEL") or "").strip()
+    if _lm:
+        os.environ["LITELLM_MODEL"] = _lm
+        _ra_logger.info("Fallback: LITELLM_MODEL set from LLM_MODEL=%s", _lm)
+
+# Sanitize credentials: remove ALL newlines/carriage returns (prevents "Newline in headers" with Bedrock/LiteLLM)
+def _sanitize_header_value(s: str) -> str:
+    if not s or not isinstance(s, str):
+        return s or ""
+    return s.replace("\r", "").replace("\n", "").strip()
+
+
+for _var in (
+    "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN",
+    "API_KEY", "AWS_REGION", "AWS_REGION_NAME",
+    "LITELLM_MODEL", "LLM_MODEL",
+):
+    _val = os.environ.get(_var)
+    if _val is not None and isinstance(_val, str):
+        _clean = _sanitize_header_value(_val)
+        if _clean != _val:
+            os.environ[_var] = _clean
+
 # When using Gemini (not Azure): force API-key-only auth by unsetting ADC so the client uses GEMINI_API_KEY only.
 if not os.getenv("USE_AZURE_OPENAI", "").lower() in ("true", "1", "yes"):
     if os.getenv("GOOGLE_GENAI_USE_VERTEXAI", "false").lower() != "true":

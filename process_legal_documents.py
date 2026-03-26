@@ -28,6 +28,52 @@ from llm_client import generate_content as llm_generate_content, get_default_mod
 from dotenv import load_dotenv
 load_dotenv()
 
+# Load LLM config from AWS Parameter Store if LLM_PARAMETER_PATH is set (e.g. Claude)
+try:
+    from aws_parameter_loader import init_llm_env
+    init_llm_env()
+except Exception:
+    pass
+
+
+def _obligation_pages_for_rag(consolidated_results: List[Dict[str, Any]]) -> List[int]:
+    """
+    Best-effort page number per obligation for Qdrant indexing (_source_page, Citation.pageNumbers, or regex).
+    Falls back to 1.
+    """
+    import re
+
+    out: List[int] = []
+    for ob in consolidated_results:
+        sp = ob.get("_source_page")
+        if sp is not None:
+            try:
+                out.append(int(sp))
+                continue
+            except (TypeError, ValueError):
+                pass
+        cit = ob.get("Citation")
+        found: Optional[int] = None
+        if isinstance(cit, list):
+            for c in cit:
+                if isinstance(c, dict):
+                    pgs = c.get("pageNumbers") or []
+                    if pgs:
+                        try:
+                            found = int(pgs[0])
+                            break
+                        except (TypeError, ValueError, IndexError):
+                            pass
+        if found is None:
+            m = re.search(r"[Pp]age\s+(\d+)", str(cit))
+            if m:
+                try:
+                    found = int(m.group(1))
+                except ValueError:
+                    pass
+        out.append(found if found is not None else 1)
+    return out
+
 
 def _normalize_key(s: Any) -> str:
     """Normalize for dedup key: strip, lower, collapse whitespace."""
@@ -127,6 +173,45 @@ def _extract_obligations_list(parsed: Any) -> List[Dict[str, Any]]:
     return []
 
 
+def _strip_llm_json_fences(text: str) -> str:
+    """Remove markdown code fences from LLM output."""
+    t = (text or "").strip()
+    if t.startswith("```json"):
+        t = t[7:]
+    elif t.startswith("```"):
+        t = t[3:]
+    if t.endswith("```"):
+        t = t[:-3]
+    return t.strip()
+
+
+def _parse_llm_json_obligations_response(result_text: str) -> Any:
+    """
+    Parse a JSON object or array from obligation-extraction LLM output.
+    Tolerates leading prose, trailing junk, and markdown fences (same idea as
+    _consolidate_batch). Raises json.JSONDecodeError only if unrecoverable.
+    """
+    t = _strip_llm_json_fences(result_text)
+    if not t:
+        raise json.JSONDecodeError("Empty LLM response", "", 0)
+    try:
+        return json.loads(t)
+    except json.JSONDecodeError:
+        pass
+    # Outer object { "obligations": [...] }
+    b, e = t.find("{"), t.rfind("}")
+    if b != -1 and e > b:
+        try:
+            return json.loads(t[b : e + 1])
+        except json.JSONDecodeError:
+            pass
+    # Outer array [ {...}, ... ]
+    b, e = t.find("["), t.rfind("]")
+    if b != -1 and e > b:
+        return json.loads(t[b : e + 1])
+    raise json.JSONDecodeError("Could not extract JSON object or array", t, 0)
+
+
 # Exponential backoff retry decorator
 def retry_with_exponential_backoff(
     max_retries: int = 5,
@@ -207,62 +292,38 @@ class PDFProcessor:
         self.cache_folder.mkdir(exist_ok=True)
     
     def is_text_based_pdf(self, pdf_path: str) -> bool:
-        """
-        Check if PDF contains extractable text
-        
-        Args:
-            pdf_path: Path to PDF file
-            
-        Returns:
-            True if PDF contains text, False if scanned
-        """
+        """Check if PDF contains extractable text (PyPDF2, first pages)."""
         try:
-            with open(pdf_path, 'rb') as file:
+            with open(pdf_path, "rb") as file:
                 pdf_reader = PyPDF2.PdfReader(file)
-                
-                # Check first few pages for text
                 pages_to_check = min(3, len(pdf_reader.pages))
-                
                 for i in range(pages_to_check):
                     text = pdf_reader.pages[i].extract_text()
-                    # If we find meaningful text (more than 50 chars), it's text-based
                     if text and len(text.strip()) > 50:
                         return True
-                
                 return False
         except Exception as e:
             error_msg = str(e).lower()
-            # If error is due to encryption/crypto, assume text-based and let extract_text_from_pdf handle it
-            if 'pycryptodome' in error_msg or 'crypto' in error_msg or 'aes' in error_msg:
+            if "pycryptodome" in error_msg or "crypto" in error_msg or "aes" in error_msg:
                 self.logger.warning(f"Encryption detected during PDF type check, assuming text-based: {e}")
                 return True
             self.logger.error(f"Error checking PDF type: {e}")
-            # Default to text-based to avoid unnecessary OCR attempts
-            return True
-    
+            return False
+
     def extract_text_from_pdf(self, pdf_path: str) -> Dict[int, str]:
         """
-        Extract text from text-based PDF
-        
-        Args:
-            pdf_path: Path to PDF file
-            
-        Returns:
-            Dictionary mapping page numbers to extracted text
+        Extract text from a text-based PDF: PyPDF2 only, page by page (same pipeline as
+        the original Legal-OCR flow — no section/column layout parsing).
         """
-        page_texts = {}
-        
+        page_texts: Dict[int, str] = {}
         try:
-            with open(pdf_path, 'rb') as file:
+            with open(pdf_path, "rb") as file:
                 pdf_reader = PyPDF2.PdfReader(file)
-                
                 for page_num in range(len(pdf_reader.pages)):
                     text = pdf_reader.pages[page_num].extract_text()
-                    page_texts[page_num + 1] = text  # 1-indexed pages
-                    
-            self.logger.info(f"Extracted text from {len(page_texts)} pages")
+                    page_texts[page_num + 1] = text or ""
+            self.logger.info(f"Extracted text from {len(page_texts)} pages (PyPDF2)")
             return page_texts
-            
         except Exception as e:
             self.logger.error(f"Error extracting text from PDF: {e}")
             return {}
@@ -400,19 +461,140 @@ class PDFProcessor:
     _LV3_UPERCASE_DOT = re.compile(r"^\s*([A-Z])\.\s*(.*)$", re.MULTILINE)
     _LV4_NUM = re.compile(r"^\s*\((\d+)\)\s*(.*)$", re.MULTILINE)
 
+    # PyPDF2 sometimes glues the end of one numbered item directly to the start of the next
+    # on the same line (e.g. "is provided.10. Landlords must...") because the two-column layout
+    # has no newline between them in the PDF stream.  This pattern finds those cases and splits them.
+    _GLUED_SECTION = re.compile(r"([^\n])(\d{1,3})\.\s+([A-Z])")
+
+    @staticmethod
+    def _fix_glued_sections(text: str) -> str:
+        """
+        Insert a newline before any section number that PyPDF2 glued onto the end of the
+        previous sentence (e.g. "is provided.10. Landlords" → "is provided.\n10. Landlords").
+
+        PyPDF2 produces this artefact on two-column PDFs: the last word of column-left item N
+        and the "N+1. Title" of column-right item N+1 end up on the same line with no newline.
+
+        Pattern: a non-digit, non-newline char (end of previous sentence) immediately followed
+        by a number then ". " then an uppercase letter (start of next section title).
+        """
+        # Use a non-digit lookbehind so the full number is captured, not split mid-digit.
+        # e.g. "provided.10. L" → group(1)="provided.", group(2)="10", group(3)="L"
+        pat = re.compile(r"(?<!\d)([^\n\d])(\d{1,3})\.\s+([A-Z])")
+        prev = None
+        while prev != text:
+            prev = text
+            text = pat.sub(lambda m: m.group(1) + "\n" + m.group(2) + ". " + m.group(3), text)
+        return text
+
+    # Optional "### " heading prefix (e.g. from manual markup or other extractors)
+    _HEADING_TAG    = re.compile(r"^###\s+(.+)$", re.MULTILINE)
+    # Numbered items inside a heading block: "1. …", "2. …" etc.
+    _NUMBERED_ITEM  = re.compile(r"^\s*(\d+)\.\s+(.+)$", re.MULTILINE)
+
     def extract_document_structure(
         self, full_text: str
     ) -> Dict[str, Any]:
         """
-        Extract sections from lines starting with 1. 2. 3. etc. (one level only).
-        Leaf sections get (a),(b) or (1),(2) etc. subsections (one type per section, from first marker).
+        Section extraction — heading-first strategy.
+
+        The primary section boundaries are lines that look like markdown headings
+        ("### Title"). Everything between two consecutive headings
+        is the content of that section.  Numbered items (1. 2. 3.) found inside a
+        heading block become subsections of that heading, not top-level sections.
+
+        This completely avoids:
+        - Blank / fill-in form pages being treated as sections.
+        - Local form-field numbering (pages 7-26 re-start "1." for every topic)
+          being misread as new top-level sections.
+
+        Fallback: if the text has NO ### headings (e.g. old cached text or a
+        plain single-column doc), the legacy numbered-section regex is used
+        so nothing breaks.
         """
-        # Collect headers: (start, end, level, section_number, section_title); level always 0
+        # Safety net for any legacy glued artefacts (PyPDF2 cache files)
+        full_text = self._fix_glued_sections(full_text)
+
+        # ── Primary path: heading-based ───────────────────────────────────────
+        heading_matches = list(self._HEADING_TAG.finditer(full_text))
+
+        # Only use heading-first strategy when headings are STRUCTURAL (not decorative).
+        # Criteria: at least 3 headings that each have a non-trivial content block
+        # (>50 chars) between them. This prevents title-page bold text on
+        # single-column numbered docs from hijacking the numbered-section fallback.
+        def _has_structural_headings(matches) -> bool:
+            if len(matches) < 3:
+                return False
+            substantial = 0
+            for i, m in enumerate(matches):
+                end = matches[i + 1].start() if i + 1 < len(matches) else len(full_text)
+                if len(full_text[m.end():end].strip()) > 50:
+                    substantial += 1
+            # Need at least 3 headings that each introduce real content
+            return substantial >= 3
+
+        if heading_matches and _has_structural_headings(heading_matches):
+            sections: List[Dict[str, Any]] = []
+
+            # Build boundary pairs: (heading_start, content_start, content_end, title)
+            boundaries = []
+            for i, m in enumerate(heading_matches):
+                h_start       = m.start()
+                content_start = m.end()
+                content_end   = heading_matches[i + 1].start() if i + 1 < len(heading_matches) else len(full_text)
+                boundaries.append((h_start, content_start, content_end, m.group(1).strip()))
+
+            for h_start, content_start, content_end, title in boundaries:
+                raw_content = full_text[content_start:content_end].strip()
+
+                # Skip heading blocks that are basically empty (blank/form pages)
+                if len(raw_content) < 10:
+                    continue
+
+                # Numbered items inside this block become subsections
+                subsections: List[Dict[str, Any]] = []
+                item_matches = list(self._NUMBERED_ITEM.finditer(raw_content))
+
+                if item_matches:
+                    for j, im in enumerate(item_matches):
+                        item_content_start = im.end()
+                        item_content_end   = item_matches[j + 1].start() if j + 1 < len(item_matches) else len(raw_content)
+                        item_body = raw_content[item_content_start:item_content_end].strip()
+                        subsections.append({
+                            "section_number": im.group(1),
+                            "section_title":  im.group(2).strip(),
+                            "content":        item_body,
+                            "level":          1,
+                            "subsections":    [],
+                        })
+                    # Content of parent = everything before the first numbered item
+                    parent_content = raw_content[:item_matches[0].start()].strip()
+                else:
+                    parent_content = raw_content
+
+                node: Dict[str, Any] = {
+                    "section_number": "",
+                    "section_title":  title,
+                    "content":        parent_content,
+                    "level":          0,
+                    "subsections":    subsections,
+                }
+                sections.append(node)
+
+            # Apply (a),(b)/(i),(ii) sub-subsections on leaf nodes
+            for sec in self._iter_sections(sections):
+                if not sec.get("subsections") and sec.get("content", "").strip():
+                    sec["subsections"] = self._parse_subsections_hierarchical(sec["content"])
+
+            return {"sections": sections}
+
+        # ── Fallback path: legacy numbered-section regex ───────────────────────
+        # Used when text has no ### headings (old cache, plain single-column docs).
         raw = []
         for m in self._SECTION_TOP.finditer(full_text):
             raw.append((m.start(), m.end(), 0, m.group(1), (m.group(2) or "").strip()))
         raw.sort(key=lambda x: x[0])
-        seen_start = set()
+        seen_start: set = set()
         merged = []
         for start, end, level, num, title in raw:
             if start in seen_start:
@@ -423,7 +605,6 @@ class PDFProcessor:
         if not merged:
             return {"sections": []}
 
-        # Content end for each: next header at same or shallower level
         content_ends = []
         for i, (start, end, level, _num, _title) in enumerate(merged):
             j = i + 1
@@ -435,28 +616,27 @@ class PDFProcessor:
             else:
                 content_ends.append(len(full_text))
 
-        # Build tree: stack, pop until parent level < current, then append and push
-        root = {"section_number": "", "section_title": "", "content": "", "level": -1, "subsections": []}
+        root: Dict[str, Any] = {
+            "section_number": "", "section_title": "", "content": "", "level": -1, "subsections": []
+        }
         stack = [root]
         for i, (start, end, level, sec_num, title) in enumerate(merged):
             content = full_text[end:content_ends[i]].strip()
             node = {
                 "section_number": sec_num,
-                "section_title": title,
-                "content": content,
-                "start_offset": start,
-                "end_offset": content_ends[i],
-                "level": level,
-                "subsections": [],
+                "section_title":  title,
+                "content":        content,
+                "start_offset":   start,
+                "end_offset":     content_ends[i],
+                "level":          level,
+                "subsections":    [],
             }
             while len(stack) > 1 and stack[-1]["level"] >= level:
                 stack.pop()
             stack[-1]["subsections"].append(node)
             stack.append(node)
 
-        # Top-level nodes (level 0) are the sections list
         sections = root["subsections"]
-        # For each section, add (a),(b) or (1),(2) etc. subsections from content (one type per section)
         for sec in self._iter_sections(sections):
             if not sec.get("subsections") and sec.get("content", "").strip():
                 sec["subsections"] = self._parse_subsections_hierarchical(sec["content"])
@@ -764,8 +944,8 @@ CRITICAL — OUTPUT FORMAT: Respond with a single JSON object that has exactly o
             
             result_text = result_text.strip()
             
-            # Parse JSON (handle array, or object with obligations/results/items/etc., or single obligation object)
-            parsed = json.loads(result_text)
+            # Parse JSON (tolerate preamble / markdown; same recovery as consolidation)
+            parsed = _parse_llm_json_obligations_response(result_text)
             if isinstance(parsed, list):
                 obligations = parsed
             elif isinstance(parsed, dict):
@@ -815,157 +995,115 @@ CRITICAL — OUTPUT FORMAT: Respond with a single JSON object that has exactly o
                 self.logger.error(f"Error analyzing page {page_num}: {e}")
                 return []
 
-    @retry_with_exponential_backoff(max_retries=5, initial_delay=5.0, exponential_base=2.0)
-    def analyze_section(
-        self,
-        section_number: str,
-        section_title: str,
-        section_content: str,
-        extract_parties: bool = False,
-    ) -> List[Dict[str, Any]]:
-        """
-        Analyze a single document section (regex-extracted) and return obligations.
-        extract_parties: run party extraction on this section (typically True only for first section).
-        """
+    # Claude 3 Haiku (Bedrock) has a hard 4096 output-token limit.
+    # Each obligation JSON object is roughly 200-400 tokens; keep batches small enough
+    # that the ENTIRE response (JSON array of obligations) fits within the output limit.
+    _CONSOLIDATION_BATCH_SIZE = 15  # obligations per LLM call
+    _CONSOLIDATION_MAX_TOKENS = 3500  # safe headroom below Haiku's 4096 limit
+
+    @retry_with_exponential_backoff(max_retries=3, initial_delay=3.0, exponential_base=2.0)
+    def _consolidate_batch(self, batch: List[Dict[str, Any]], metadata_context: str) -> List[Dict[str, Any]]:
+        """Run one consolidation LLM call for a batch of obligations. Returns parsed list."""
+        num_input = len(batch)
+        prompt = f"""You are a legal analyst. You have been provided with financial obligations extracted from multiple pages of a legal document.
+
+Your task is to consolidate the following {num_input} obligations into a single deduplicated JSON array. Follow these rules EXPLICITLY:
+
+1. Merge duplicate or highly similar obligations (same DutyType, same Responsible Party, and substantively overlapping text) into ONE entry.
+2. Preserve every UNIQUE obligation — do not drop distinct duties.
+3. Keep the same JSON structure for each element: "DutyType", "Responsible Party", "Owner Responsibility" (array), "Reasoning" (array), "Citation" (string), and "related_keywords" (8-15 keywords including DutyType and synonyms).
+4. "DutyType" must be a short, precise label for the monetary/financial obligation (e.g. "Rent Payment", "Security Deposit", "Property Tax Payment").
+5. Use "Responsible Party" values as given; when merging, preserve the clearest formulation.
+6. When merging duplicates, combine citations into one string (e.g. "Page 3; Page 7" or "Page 3, Section A; Page 7, Section B").
+7. Maintain legal accuracy and precision; do not invent obligations not present in the input.
+8. Output ONLY a valid JSON array starting with [ and ending with ]. No preamble, no markdown, no explanation.{metadata_context}
+
+Obligations to merge:
+{json.dumps(batch, indent=2)}
+
+Output the consolidated JSON array only:"""
+        response = self._generate_content(
+            prompt=prompt,
+            temperature=0.1,
+            response_mime_type="application/json",
+            max_output_tokens=self._CONSOLIDATION_MAX_TOKENS,
+        )
+        result_text = (response.text or "").strip()
+        for prefix in ("```json", "```"):
+            if result_text.startswith(prefix):
+                result_text = result_text[len(prefix):]
+                break
+        if result_text.endswith("```"):
+            result_text = result_text[:-3]
+        result_text = result_text.strip()
+        # Extract JSON array even if model adds preamble text
         try:
-            if extract_parties and section_content.strip():
-                self.extract_party_metadata(1, f"Section {section_number}. {section_title}\n\n{section_content}")
-            metadata_context = ""
-            if self.party_metadata:
-                metadata_context = "\n\n--- PARTY METADATA (Use actual names in 'Responsible Party' field) ---\n\n"
-                metadata_context += "The following parties have been identified in this document:\n\n"
-                for ref_label, info in self.party_metadata.items():
-                    actual_name = info.get("actual_name", "")
-                    additional_info = info.get("additional_info", "")
-                    if actual_name:
-                        metadata_context += f"- '{ref_label}' refers to: {actual_name}"
-                        if additional_info:
-                            metadata_context += f" ({additional_info})"
-                        metadata_context += "\n"
-                metadata_context += "\nIMPORTANT: When extracting obligations, use the actual party names in 'Responsible Party', NOT reference labels.\n"
-            full_prompt = f"""{self.prompt_template}{metadata_context}
-
-CRITICAL — OUTPUT FORMAT: Respond with a single JSON object that has exactly one key: "obligations". The value of "obligations" must be a JSON array listing EVERY financial obligation in this section. One obligation = one object. If the section mentions rent, deposit, taxes, insurance, utilities, maintenance, fees, etc., each must be a separate object. Do NOT combine them. Example: {{ "obligations": [ {{ "DutyType": "...", "Responsible Party": "...", ... }} ] }}
-
---- SECTION {section_number}. {section_title} (extract every financial obligation below; put each as an object in the "obligations" array) ---
-
-{section_content}"""
-            display_num = (section_number or "").strip() or "(unnumbered)"
-            self.logger.info(f"Analyzing section {display_num} with LLM...")
-            response = self._generate_content(
-                prompt=full_prompt,
-                temperature=0.1,
-                response_mime_type="application/json",
-            )
-            result_text = response.text.strip()
-            if result_text.startswith("```json"):
-                result_text = result_text[7:]
-            if result_text.startswith("```"):
-                result_text = result_text[3:]
-            if result_text.endswith("```"):
-                result_text = result_text[:-3]
-            result_text = result_text.strip()
             parsed = json.loads(result_text)
-            if isinstance(parsed, list):
-                obligations = parsed
-            elif isinstance(parsed, dict):
-                for key in ("obligations", "results", "items", "data", "consolidated_results", "records"):
-                    if isinstance(parsed.get(key), list):
-                        obligations = parsed[key]
-                        break
-                else:
-                    if any(k in parsed for k in ("DutyType", "Responsible Party", "Owner Responsibility")):
-                        obligations = [parsed]
-                    else:
-                        obligations = []
-                        for v in parsed.values():
-                            if isinstance(v, list) and v and isinstance(v[0], dict) and "DutyType" in v[0]:
-                                obligations = v
-                                break
+        except json.JSONDecodeError:
+            b = result_text.find("[")
+            e = result_text.rfind("]")
+            if b != -1 and e > b:
+                parsed = json.loads(result_text[b:e + 1])
             else:
-                obligations = []
-            display_num = (section_number or "").strip() or "(unnumbered)"
-            self.logger.info(f"Section {display_num}: Found {len(obligations)} financial obligations")
-            return obligations
-        except json.JSONDecodeError as e:
-            display_num = (section_number or "").strip() or "(unnumbered)"
-            self.logger.error(f"Error parsing JSON for section {display_num}: {e}")
-            return []
-        except Exception as e:
-            error_str = str(e).lower()
-            if any(k in error_str for k in ["rate limit", "quota", "resource exhausted", "429", "throttl"]):
                 raise
-            display_num = (section_number or "").strip() or "(unnumbered)"
-            self.logger.error(f"Error analyzing section {display_num}: {e}")
-            return []
+        return _extract_obligations_list(parsed)
 
-    @retry_with_exponential_backoff(max_retries=5, initial_delay=5.0, exponential_base=2.0)
     def consolidate_results_to_json(self, all_page_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
         Consolidate obligations from all pages into a single, deduplicated JSON array using the LLM.
-        Returns the list of consolidated obligation dicts (same structure: DutyType, Responsible Party, Owner Responsibility, Reasoning, Citation).
+        Uses batched processing so each LLM call stays within the model's output token limit
+        (Claude 3 Haiku: 4096 tokens; batches of ~15 obligations per call).
         """
         try:
             self.logger.info("Consolidating results into JSON...")
+            if not all_page_results:
+                return []
+
             metadata_context = ""
             if self.party_metadata:
-                metadata_context = "\n\nParty metadata (use Responsible Party as given or from metadata):\n"
+                metadata_context = "\n\nParty metadata:\n"
                 for ref_label, info in self.party_metadata.items():
                     actual_name = info.get("actual_name", "") or ref_label
                     metadata_context += f"- {ref_label}: {actual_name}\n"
+
             num_input = len(all_page_results)
-            consolidation_prompt = f"""You are a legal analyst. You have been provided with {num_input} financial obligations extracted from multiple pages of a legal document.
+            batch_size = self._CONSOLIDATION_BATCH_SIZE
 
-Your task is to consolidate these into a single, deduplicated JSON array. The consolidated JSON must be produced directly from this input.
+            if num_input <= batch_size:
+                # Small document: single LLM call
+                self.logger.info(f"Consolidating {num_input} obligations in one call")
+                consolidated = self._consolidate_batch(all_page_results, metadata_context)
+            else:
+                # Large document: process in batches, then merge-deduplicate the batched results
+                batches = [all_page_results[i:i + batch_size] for i in range(0, num_input, batch_size)]
+                self.logger.info(f"Consolidating {num_input} obligations in {len(batches)} batches of {batch_size}")
+                partial_results: List[Dict[str, Any]] = []
+                for idx, batch in enumerate(batches):
+                    self.logger.info(f"  Batch {idx + 1}/{len(batches)}: {len(batch)} obligations")
+                    try:
+                        partial = self._consolidate_batch(batch, metadata_context)
+                        partial_results.extend(partial)
+                    except Exception as batch_err:
+                        self.logger.error(f"  Batch {idx + 1} failed: {batch_err}; keeping raw obligations")
+                        partial_results.extend(batch)
 
-CRITICAL: You MUST output a non-empty JSON array. The input contains {num_input} obligations; your output must be a deduplicated/merged array of those obligations (fewer items after merging duplicates). Never return an empty array [].
+                # Final merge pass: deduplicate across batches (if partial_results still large, do one more pass)
+                if len(partial_results) > batch_size:
+                    self.logger.info(f"Final merge pass: {len(partial_results)} partial results → dedup")
+                    try:
+                        consolidated = self._consolidate_batch(partial_results[:batch_size * 2], metadata_context)
+                        consolidated.extend(partial_results[batch_size * 2:])
+                    except Exception:
+                        consolidated = partial_results
+                else:
+                    consolidated = partial_results
 
-Rules:
-1. Merge duplicate or highly similar obligations (same Duty Type, same Party, same or similar obligation text).
-2. Preserve all unique obligations.
-3. Each element must have: "DutyType", "Responsible Party", "Owner Responsibility" (array of strings), "Reasoning" (array of strings), "Citation" (string), and "related_keywords" (array of strings).
-4. DutyType: short, precise label (e.g. Rent Payment, Security Deposit, Property Tax Payment).
-5. Responsible Party: use as given or from metadata below.
-6. When merging, combine citations (e.g., "Page 3, Section A; Page 7, Section B").
-7. related_keywords: for each obligation, add an array of 8–20 search keywords/phrases. You MUST include the DutyType itself (and normalised variations, e.g. "Rent Payment" → "rent payment", "rent") in this array. Add synonyms and related concepts so semantic search can find this obligation. Example: for DutyType "Property Insurance", related_keywords must include "Property Insurance" or "property insurance", plus e.g. ["insurance", "property insurance", "liability", "coverage", "premium", "tenant insurance"].
-8. Maintain legal accuracy. Output ONLY a valid JSON array, no other text.
-{metadata_context}
-Extracted obligations from the document:
-
-{json.dumps(all_page_results, indent=2)}
-
-Output ONLY the consolidated JSON array (non-empty, deduplicated), starting with [ and ending with ]:"""
-            response = self._generate_content(
-                prompt=consolidation_prompt,
-                temperature=0.1,
-                response_mime_type="application/json",
-                max_output_tokens=16384,
-            )
-            result_text = (response.text or "").strip()
-            for prefix in ("```json", "```"):
-                if result_text.startswith(prefix):
-                    result_text = result_text[len(prefix):]
-                    break
-            if result_text.endswith("```"):
-                result_text = result_text[:-3]
-            result_text = result_text.strip()
-            try:
-                parsed = json.loads(result_text)
-            except json.JSONDecodeError as e:
-                self.logger.error(
-                    "Consolidation JSON parse failed (possible truncation or invalid format). Error: %s. Response length: %d. First 500 chars: %s",
-                    e, len(result_text), result_text[:500],
-                )
-                raise
-            consolidated = _extract_obligations_list(parsed)
             if not consolidated and all_page_results:
                 self.logger.error(
-                    "LLM consolidation returned 0 obligations although %d were extracted from the PDF. Parsed type: %s, keys: %s. Raw response (first 800 chars): %s",
+                    "LLM consolidation returned 0 obligations although %d were extracted from the PDF.",
                     num_input,
-                    type(parsed).__name__,
-                    list(parsed.keys()) if isinstance(parsed, dict) else "n/a",
-                    result_text[:800],
                 )
+
             # Ensure DutyType is always in related_keywords for semantic search
             for ob in consolidated:
                 ob.pop("_source_page", None)
@@ -980,13 +1118,15 @@ Output ONLY the consolidated JSON array (non-empty, deduplicated), starting with
                             seen = {str(x).strip().lower() for x in kw if x}
                             if duty_str.lower() not in seen:
                                 ob["related_keywords"] = [duty_str] + [x for x in kw if x]
-            # Programmatic merge: same DutyType + Responsible Party → one entry (LLM often leaves duplicates)
+
+            # Programmatic merge: same DutyType + Responsible Party → one entry
             before_merge = len(consolidated)
             consolidated = _merge_duplicate_obligations(consolidated)
             if len(consolidated) < before_merge:
-                self.logger.info(f"Programmatic dedup: {before_merge} → {len(consolidated)} (same DutyType + Responsible Party merged)")
+                self.logger.info(f"Programmatic dedup: {before_merge} → {len(consolidated)} obligations")
             self.logger.info(f"Consolidated into JSON ({len(consolidated)} obligations)")
             return consolidated
+
         except Exception as e:
             error_str = str(e).lower()
             is_rate_limit = any(k in error_str for k in [
@@ -1076,61 +1216,56 @@ class LegalDocumentProcessor:
             if not page_texts:
                 self.logger.error("No text extracted from PDF")
                 return None
-            # Build full text and extract section structure (regex: ^\d+\. , ^\([a-z]\) , ^\(\d+\))
             sorted_pages = sorted(page_texts.keys())
-            full_text = "\n\n".join(page_texts[p] for p in sorted_pages)
-            structure = self.pdf_processor.extract_document_structure(full_text)
-            sections_tree = structure.get("sections", [])
-            # Flatten tree so Section 1, 1.1, 1.1.1 each get obligation extraction
-            sections = self.pdf_processor.flatten_sections_for_processing(sections_tree)
-            total_sections = len(sections)
-            self.logger.info(f"Extracted {total_sections} sections (flattened); running obligation extraction per section")
-            # Use ordinal index (1-based) as key so restarted numbering doesn't overwrite
-            section_results = {}
-            all_obligations = []
+
+            # Page-by-page pipeline (original): PyPDF2 text → one LLM call per page → consolidate.
+            party_pages_max = int(os.getenv("PARTY_METADATA_MAX_PAGE", "5"))
+            self.logger.info(
+                f"Page-by-page extraction: {len(sorted_pages)} pages; "
+                f"party metadata on pages 1–{party_pages_max} only"
+            )
+            page_results_by_page: Dict[int, List[Dict[str, Any]]] = {}
+            all_obligations: List[Dict[str, Any]] = []
             page_delay = float(os.getenv("PAGE_PROCESSING_DELAY", "3.5"))
-            for i, sec in enumerate(sections):
-                section_index = str(i + 1)
-                sec_num = (sec.get("section_number") or "").strip() or section_index
-                sec_title = (sec.get("section_title") or "").strip()
-                content = (sec.get("content") or "").strip()
-                title_snippet = (sec_title[:50] + "…") if len(sec_title) > 50 else sec_title
-                self.logger.info(f"--- Section [{i + 1}/{total_sections}]: {sec_num} — {title_snippet or '(no title)'} ---")
-                if not content:
-                    self.logger.info(f"  Skipping section {sec_num} (no content)")
-                    section_results[section_index] = {
-                        "section_number": sec_num,
-                        "section_title": sec_title,
-                        "obligations": [],
-                    }
-                    continue
-                extract_parties = i == 0
-                obligations = self.gemini_analyzer.analyze_section(
-                    sec_num, sec_title, content, extract_parties=extract_parties
+            pages_with_text = [p for p in sorted_pages if (page_texts.get(p) or "").strip()]
+            total_to_process = len(pages_with_text)
+            for idx, page_num in enumerate(pages_with_text):
+                page_text = (page_texts.get(page_num) or "").strip()
+                extract_parties = page_num <= party_pages_max
+                if extract_parties:
+                    self.logger.info(
+                        f"Page {page_num}: party metadata + obligations "
+                        f"[{idx + 1}/{total_to_process}]"
+                    )
+                else:
+                    self.logger.info(
+                        f"Page {page_num}: obligations only [{idx + 1}/{total_to_process}]"
+                    )
+                obligations = self.gemini_analyzer.analyze_page(
+                    page_num, page_text, extract_parties=extract_parties
                 )
-                self.logger.info(f"  Section {sec_num}: extracted {len(obligations)} obligations")
-                section_results[section_index] = {
-                    "section_number": sec_num,
-                    "section_title": sec_title,
-                    "obligations": obligations,
-                }
+                page_results_by_page[page_num] = obligations
                 all_obligations.extend(obligations)
-                if i < len(sections) - 1:
+                self.logger.info(f"  Page {page_num}: extracted {len(obligations)} obligations")
+                if idx < total_to_process - 1:
                     time.sleep(page_delay)
+
             consolidated_results = self.gemini_analyzer.consolidate_results_to_json(all_obligations)
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            section_based_filename = f"{doc_stem}_{timestamp}_section_based.json"
-            section_based_data = {
+            granular_filename = f"{doc_stem}_{timestamp}_pagewise.json"
+            pagewise_data = {
                 "document_name": doc_name,
                 "processed_at": datetime.now().isoformat(),
-                "total_sections": len(sections),
+                "pipeline": "page_by_page",
+                "total_pages": len(page_texts),
                 "total_obligations_found": len(all_obligations),
                 "party_metadata": self.gemini_analyzer.party_metadata,
-                "section_results": section_results,
+                "page_results": {str(k): v for k, v in sorted(page_results_by_page.items())},
             }
             consolidated_data = {
                 "document_name": doc_name,
                 "processed_at": datetime.now().isoformat(),
+                "pipeline": "page_by_page",
                 "total_pages": len(page_texts),
                 "total_obligations_found": len(all_obligations),
                 "consolidated_obligations_count": len(consolidated_results),
@@ -1139,13 +1274,13 @@ class LegalDocumentProcessor:
             }
             out_dir = Path(self.local_output_folder)
             out_dir.mkdir(parents=True, exist_ok=True)
-            section_based_path = out_dir / section_based_filename
+            pagewise_path = out_dir / granular_filename
             consolidated_json_path = out_dir / f"{doc_stem}_{timestamp}_consolidated.json"
-            with open(section_based_path, "w", encoding="utf-8") as f:
-                json.dump(section_based_data, f, indent=2, ensure_ascii=False)
+            with open(pagewise_path, "w", encoding="utf-8") as f:
+                json.dump(pagewise_data, f, indent=2, ensure_ascii=False)
             with open(consolidated_json_path, "w", encoding="utf-8") as f:
                 json.dump(consolidated_data, f, indent=2, ensure_ascii=False)
-            self.logger.info(f"Section-based results saved to: {section_based_path}")
+            self.logger.info(f"Page-wise results saved to: {pagewise_path}")
             self.logger.info(f"Consolidated JSON saved to: {consolidated_json_path}")
             # Vector store: one chunk per consolidated (deduplicated) obligation in ChromaDB
             # index_obligations deletes this document's old chunks first, then re-indexes (no orphans)
@@ -1171,8 +1306,35 @@ class LegalDocumentProcessor:
                     )
                 else:
                     self.logger.warning(f"Vector indexing failed (processing succeeded): {e}")
+            # Optional: dual-track RAG index in Qdrant (pages + obligations) for POST /chat
+            if os.getenv("RAG_INDEX_QDRANT", "").lower() in ("true", "1", "yes"):
+                try:
+                    from legal_rag.qdrant_store import delete_document, upsert_document_pages_and_obligations
+
+                    delete_document(doc_name)
+                    page_map = {int(k): v for k, v in page_texts.items()}
+                    stats = upsert_document_pages_and_obligations(
+                        document_id=doc_name,
+                        page_texts=page_map,
+                        consolidated_obligations=consolidated_results,
+                        page_for_obligation=_obligation_pages_for_rag(consolidated_results),
+                    )
+                    self.logger.info(
+                        "Qdrant RAG index updated for %s: %s (set RAG_INDEX_QDRANT=false to skip)",
+                        doc_name,
+                        stats,
+                    )
+                except ImportError:
+                    self.logger.warning(
+                        "RAG_INDEX_QDRANT set but legal_rag / qdrant-client missing; pip install qdrant-client"
+                    )
+                except Exception as e:
+                    self.logger.warning("Qdrant RAG indexing failed (processing succeeded): %s", e)
             result_path = str(consolidated_json_path.resolve())
-            self.logger.info(f"Processing complete! Sections: {len(sections)}, obligations: {len(all_obligations)}, consolidated: {len(consolidated_results)}")
+            self.logger.info(
+                f"Processing complete! Pages processed (with text): {total_to_process}, "
+                f"obligations: {len(all_obligations)}, consolidated: {len(consolidated_results)}"
+            )
             return result_path
         except Exception as e:
             self.logger.error(f"Error processing document: {e}", exc_info=True)
@@ -1274,10 +1436,10 @@ class LegalDocumentProcessor:
 
 
 def main():
-    """Main entry point: process PDF(s) and write section-based + consolidated JSON to output/."""
+    """Main entry point: process PDF(s) and write pagewise + consolidated JSON to output/."""
     import argparse
     parser = argparse.ArgumentParser(
-        description="Process legal PDFs: produces (1) section-based obligations JSON, (2) consolidated JSON."
+        description="Process legal PDFs: produces (1) pagewise obligations JSON, (2) consolidated JSON."
     )
     parser.add_argument(
         "pdf_path",
@@ -1305,7 +1467,7 @@ def main():
             return
         out = processor.process_document(str(path.resolve()))
         if out:
-            processor.logger.info("Done. Output files: 1) section-based JSON, 2) consolidated JSON.")
+            processor.logger.info("Done. Output files: 1) *_pagewise.json, 2) *_consolidated.json.")
         else:
             processor.logger.error("Processing failed.")
     else:
