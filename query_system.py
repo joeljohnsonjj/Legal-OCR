@@ -26,6 +26,9 @@ from pydantic import BaseModel, Field
 
 # Environment Variables
 from dotenv import load_dotenv
+
+from citation_utils import merge_structured_citations_by_doc_id
+
 load_dotenv()
 
 
@@ -111,6 +114,7 @@ def citation_string_to_structured(citation: Any) -> List[Dict[str, Any]]:
     Multiple documents (merged obligation): "Document: A.pdf | Page 1, Section 2 ; Document: B.pdf | Page 3, Section 4"
     -> two objects in list. Separator between documents: " ; " (space-semicolon-space).
     Accepts already-structured list (normalizes and returns). Returns [] for None/empty.
+    Multiple objects with the same docId are merged into one (combined pages and sections).
     """
     if citation is None:
         return []
@@ -125,7 +129,7 @@ def citation_string_to_structured(citation: Any) -> List[Dict[str, Any]]:
                 })
             else:
                 out.append({"docId": "", "pageNumbers": [], "section": [str(c)]})
-        return out
+        return merge_structured_citations_by_doc_id(out)
     s = (citation or "").strip()
     if not s:
         return []
@@ -141,10 +145,10 @@ def citation_string_to_structured(citation: Any) -> List[Dict[str, Any]]:
             if one:
                 out.append(one)
         if out:
-            return out
+            return merge_structured_citations_by_doc_id(out)
     # Single document
     one = _parse_one_citation_segment(s)
-    return [one] if one else []
+    return merge_structured_citations_by_doc_id([one]) if one else []
 
 
 def convert_result_citations_to_structured(final_result: Dict[str, Any]) -> None:
@@ -830,13 +834,14 @@ MERGE SIMILAR OBLIGATIONS FROM DIFFERENT DOCUMENTS (STRICTLY FOLLOW):
 - Merge two or more obligations from different documents into ONE row ONLY if they are semantically similar: same or equivalent meaning (e.g. same duty in substance, same responsible party, and equivalent scope or obligation). Do NOT merge based only on same DutyType and Responsible Party if the actual obligation (Owner Responsibility, scope, or meaning) differs.
 - If obligations are only superficially similar (e.g. same duty type but different scope, amount, or condition), keep them as separate rows. When in doubt, do not merge.
 - For each group of semantically similar obligations (from one or more documents), output exactly ONE row. In the "Citation" field you MUST list every source document that contributed to that obligation. Use this format with " ; " (space-semicolon-space) between documents: "Document: [filename1] | [citation1] ; Document: [filename2] | [citation2]". Include every document; never omit any.
+- When you merge two or more such obligations, combine "Owner Responsibility" and "Reasoning" from every contributing obligation efficiently: pull only material, non-redundant information from each source row in the consolidated JSON; drop near-duplicate lines; keep distinct facts, amounts, conditions, or scope from each document so the merged row still reflects what each document said. Prefer short bullet-style strings in those arrays over pasting duplicate prose.
 - If an obligation appears in only one document, output one row with one document in Citation.
 - Result: one row per distinct obligation; when semantically the same obligation appears in multiple documents, that single row MUST have Citation listing all of those documents. This is mandatory.
 
 CRITICAL INSTRUCTIONS:
 1. Combine all obligations from all documents into a single array. Merge into one row ONLY when obligations are semantically similar (see above). For each merged row, Citation MUST list every source document; strictly include all documents.
 2. Order by similarity to the user query first (most similar obligations at the top and included in the result set), then by relevance, then by monetary value (highest amounts first).
-3. Do NOT modify the content of any obligation - preserve exactly as given
+3. For rows you do not merge (single-document or kept separate), preserve "Owner Responsibility", "Reasoning", and other fields exactly as given. For rows merged across documents per the rules above, intelligently combine "Owner Responsibility" and "Reasoning" from each contributing obligation as described — do not discard unique substance from any source document.
 4. Citation: Every obligation must have "Citation" with the source document filename. For one document: "Document: [filename] | [original citation]". For merged (semantically similar) obligations from multiple documents: "Document: [file1] | [citation1] ; Document: [file2] | [citation2]" — you MUST include every source document; do not omit any. Strictly follow. Example: "Document: Commercial Lease Agreement - Buyer Triple Net.pdf | Page 2, Section 'Rent' ; Document: MTNNN.pdf | Page 3, Section 'RENT'".
 5. Keep all fields: "DutyType", "Responsible Party", "Owner Responsibility", "Reasoning", "Citation"
 6. Do not add, remove, or modify any other fields
@@ -853,7 +858,7 @@ Return a JSON object with this structure:
   "total_documents_searched": {len(filtered_results)},
   "total_obligations_found": <count of obligations>,
   "results": [
-    // One row per obligation. Semantically similar obligations from multiple docs: merge into one row; Citation MUST list every document with " ; " between them. Ordered by similarity to query (most similar first), then relevance, then monetary value. The most similar obligations must be in the result set and ranked at the top.
+    // One row per obligation. Merged cross-doc rows: combined Owner Responsibility + Reasoning from each source (deduped, material facts only); Citation lists every document with " ; ". Order: similarity to query, relevance, monetary value.
   ]
 }}
 

@@ -24,6 +24,8 @@ import pytesseract
 # LLM API (Azure OpenAI or Gemini via llm_client)
 from llm_client import generate_content as llm_generate_content, get_default_model
 
+from citation_utils import merge_structured_citations_by_doc_id
+
 # Environment Variables
 from dotenv import load_dotenv
 load_dotenv()
@@ -914,27 +916,25 @@ CRITICAL — OUTPUT FORMAT: Respond with a single JSON object that has exactly o
                     actual_name = info.get("actual_name", "") or ref_label
                     metadata_context += f"- {ref_label}: {actual_name}\n"
             num_input = len(all_page_results)
-            consolidation_prompt = f"""You are a legal analyst. You have been provided with {num_input} financial obligations extracted from multiple pages of a legal document.
+            consolidation_prompt = f"""You are a legal analyst. You have been provided with financial obligations extracted from multiple pages of a legal document.
 
-Your task is to consolidate these into a single, deduplicated JSON array. The consolidated JSON must be produced directly from this input.
+Your task is to consolidate these obligations into a single, deduplicated JSON array. Follow these rules:
 
-CRITICAL: You MUST output a non-empty JSON array. The input contains {num_input} obligations; your output must be a deduplicated/merged array of those obligations (fewer items after merging duplicates). Never return an empty array [].
-
-Rules:
-1. Merge duplicate or highly similar obligations (same Duty Type, same Party, same or similar obligation text).
-2. Preserve all unique obligations.
-3. Each element must have: "DutyType", "Responsible Party", "Owner Responsibility" (array of strings), "Reasoning" (array of strings), "Citation" (string), and "related_keywords" (array of strings).
-4. DutyType: short, precise label (e.g. Rent Payment, Security Deposit, Property Tax Payment).
-5. Responsible Party: use as given or from metadata below.
-6. When merging, combine citations (e.g., "Page 3, Section A; Page 7, Section B").
-7. related_keywords: for each obligation, add an array of 8–20 search keywords/phrases. You MUST include the DutyType itself (and normalised variations, e.g. "Rent Payment" → "rent payment", "rent") in this array. Add synonyms and related concepts so semantic search can find this obligation. Example: for DutyType "Property Insurance", related_keywords must include "Property Insurance" or "property insurance", plus e.g. ["insurance", "property insurance", "liability", "coverage", "premium", "tenant insurance"].
-8. Maintain legal accuracy. Output ONLY a valid JSON array, no other text.
+1. Merge duplicate or highly similar obligations
+2. Preserve all unique obligations
+3. Keep the same JSON structure with fields: "DutyType", "Responsible Party", "Owner Responsibility" (array of strings), "Reasoning" (array of strings), "Citation", and "related_keywords" (array of strings)
+4. The "DutyType" field must be a short, precise label describing the specific monetary obligation (e.g., "Rent Payment", "Security Deposit", "Property Tax Payment", etc.)
+5. The "Responsible Party" field must be used as is.
+6. When merging, combine citations (e.g., "Page 3, Section A; Page 7, Section B")
+7. "related_keywords": for each obligation, add 8–20 search keywords/phrases. Include the DutyType (and normalised variations, e.g. "Rent Payment" → "rent payment", "rent") plus synonyms and related concepts so semantic search can find the obligation.
+8. Maintain legal accuracy and precision
+9. Output ONLY a valid JSON array, no other text. The input contains {num_input} obligations; your output must be a non-empty deduplicated array (never return []).
 {metadata_context}
-Extracted obligations from the document:
+Here are the extracted obligations:
 
 {json.dumps(all_page_results, indent=2)}
 
-Output ONLY the consolidated JSON array (non-empty, deduplicated), starting with [ and ending with ]:"""
+Provide the consolidated JSON array:"""
             response = self._generate_content(
                 prompt=consolidation_prompt,
                 temperature=0.1,
@@ -985,6 +985,10 @@ Output ONLY the consolidated JSON array (non-empty, deduplicated), starting with
             consolidated = _merge_duplicate_obligations(consolidated)
             if len(consolidated) < before_merge:
                 self.logger.info(f"Programmatic dedup: {before_merge} → {len(consolidated)} (same DutyType + Responsible Party merged)")
+            for ob in consolidated:
+                cit = ob.get("Citation")
+                if isinstance(cit, list) and cit and all(isinstance(x, dict) for x in cit):
+                    ob["Citation"] = merge_structured_citations_by_doc_id(cit)
             self.logger.info(f"Consolidated into JSON ({len(consolidated)} obligations)")
             return consolidated
         except Exception as e:
@@ -1076,58 +1080,131 @@ class LegalDocumentProcessor:
             if not page_texts:
                 self.logger.error("No text extracted from PDF")
                 return None
-            # Build full text and extract section structure (regex: ^\d+\. , ^\([a-z]\) , ^\(\d+\))
+
             sorted_pages = sorted(page_texts.keys())
-            full_text = "\n\n".join(page_texts[p] for p in sorted_pages)
-            structure = self.pdf_processor.extract_document_structure(full_text)
-            sections_tree = structure.get("sections", [])
-            # Flatten tree so Section 1, 1.1, 1.1.1 each get obligation extraction
-            sections = self.pdf_processor.flatten_sections_for_processing(sections_tree)
-            total_sections = len(sections)
-            self.logger.info(f"Extracted {total_sections} sections (flattened); running obligation extraction per section")
-            # Use ordinal index (1-based) as key so restarted numbering doesn't overwrite
-            section_results = {}
-            all_obligations = []
             page_delay = float(os.getenv("PAGE_PROCESSING_DELAY", "3.5"))
-            for i, sec in enumerate(sections):
-                section_index = str(i + 1)
-                sec_num = (sec.get("section_number") or "").strip() or section_index
-                sec_title = (sec.get("section_title") or "").strip()
-                content = (sec.get("content") or "").strip()
-                title_snippet = (sec_title[:50] + "…") if len(sec_title) > 50 else sec_title
-                self.logger.info(f"--- Section [{i + 1}/{total_sections}]: {sec_num} — {title_snippet or '(no title)'} ---")
-                if not content:
-                    self.logger.info(f"  Skipping section {sec_num} (no content)")
+            use_sections = (os.getenv("LEGAL_OCR_USE_SECTION_EXTRACTION", "").lower() in ("1", "true", "yes"))
+            all_obligations: List[Dict[str, Any]] = []
+            sections: List[Dict[str, Any]] = []
+            section_results: Dict[str, Any] = {}
+
+            if use_sections:
+                self.logger.info(
+                    "Obligation extraction: section-based (set LEGAL_OCR_USE_SECTION_EXTRACTION=false to use page-wise)"
+                )
+                full_text = "\n\n".join(page_texts[p] for p in sorted_pages)
+                structure = self.pdf_processor.extract_document_structure(full_text)
+                sections_tree = structure.get("sections", [])
+                sections = self.pdf_processor.flatten_sections_for_processing(sections_tree)
+                total_sections = len(sections)
+                self.logger.info(
+                    f"Extracted {total_sections} sections (flattened); running obligation extraction per section"
+                )
+                for i, sec in enumerate(sections):
+                    section_index = str(i + 1)
+                    sec_num = (sec.get("section_number") or "").strip() or section_index
+                    sec_title = (sec.get("section_title") or "").strip()
+                    content = (sec.get("content") or "").strip()
+                    title_snippet = (sec_title[:50] + "…") if len(sec_title) > 50 else sec_title
+                    self.logger.info(
+                        f"--- Section [{i + 1}/{total_sections}]: {sec_num} — {title_snippet or '(no title)'} ---"
+                    )
+                    if not content:
+                        self.logger.info(f"  Skipping section {sec_num} (no content)")
+                        section_results[section_index] = {
+                            "section_number": sec_num,
+                            "section_title": sec_title,
+                            "obligations": [],
+                        }
+                        continue
+                    extract_parties = i == 0
+                    obligations = self.gemini_analyzer.analyze_section(
+                        sec_num, sec_title, content, extract_parties=extract_parties
+                    )
+                    self.logger.info(f"  Section {sec_num}: extracted {len(obligations)} obligations")
                     section_results[section_index] = {
                         "section_number": sec_num,
                         "section_title": sec_title,
-                        "obligations": [],
+                        "obligations": obligations,
                     }
-                    continue
-                extract_parties = i == 0
-                obligations = self.gemini_analyzer.analyze_section(
-                    sec_num, sec_title, content, extract_parties=extract_parties
+                    all_obligations.extend(obligations)
+                    if i < len(sections) - 1:
+                        time.sleep(page_delay)
+            else:
+                self.logger.info(
+                    "Obligation extraction: page-wise (default). Set LEGAL_OCR_USE_SECTION_EXTRACTION=true for section-based."
                 )
-                self.logger.info(f"  Section {sec_num}: extracted {len(obligations)} obligations")
-                section_results[section_index] = {
-                    "section_number": sec_num,
-                    "section_title": sec_title,
-                    "obligations": obligations,
-                }
-                all_obligations.extend(obligations)
-                if i < len(sections) - 1:
-                    time.sleep(page_delay)
+                try:
+                    n_party_meta_pages = int(os.getenv("LEGAL_OCR_PARTY_METADATA_PAGES", "5"))
+                except ValueError:
+                    n_party_meta_pages = 5
+                n_party_meta_pages = max(1, min(50, n_party_meta_pages))
+                self.logger.info(
+                    f"Party metadata extraction on first {n_party_meta_pages} non-empty pages "
+                    f"(override with LEGAL_OCR_PARTY_METADATA_PAGES); matches analyze_page guidance."
+                )
+                page_results: Dict[str, List[Dict[str, Any]]] = {}
+                n_pages = len(sorted_pages)
+                pages_party_scanned = 0
+                for idx, page_num in enumerate(sorted_pages):
+                    text = page_texts[page_num] or ""
+                    self.logger.info(f"--- Page [{idx + 1}/{n_pages}]: page {page_num} ---")
+                    if not str(text).strip():
+                        self.logger.info(f"  Skipping page {page_num} (no text)")
+                        page_results[str(page_num)] = []
+                        continue
+                    # Section-based mode often sees parties in a long first "section"; page 1 alone is often cover.
+                    # Scan party definitions on the first N pages (default 5), same intent as analyze_page docstring.
+                    extract_parties = pages_party_scanned < n_party_meta_pages
+                    obligations = self.gemini_analyzer.analyze_page(
+                        page_num, text, extract_parties=extract_parties
+                    )
+                    tagged: List[Dict[str, Any]] = []
+                    for ob in obligations:
+                        o = dict(ob)
+                        o["_source_page"] = page_num
+                        tagged.append(o)
+                    page_results[str(page_num)] = tagged
+                    all_obligations.extend(tagged)
+                    self.logger.info(f"  Page {page_num}: extracted {len(obligations)} obligations")
+                    if extract_parties:
+                        pages_party_scanned += 1
+                    if idx < n_pages - 1:
+                        time.sleep(page_delay)
+
             consolidated_results = self.gemini_analyzer.consolidate_results_to_json(all_obligations)
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            section_based_filename = f"{doc_stem}_{timestamp}_section_based.json"
-            section_based_data = {
-                "document_name": doc_name,
-                "processed_at": datetime.now().isoformat(),
-                "total_sections": len(sections),
-                "total_obligations_found": len(all_obligations),
-                "party_metadata": self.gemini_analyzer.party_metadata,
-                "section_results": section_results,
-            }
+            out_dir = Path(self.local_output_folder)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            consolidated_json_path = out_dir / f"{doc_stem}_{timestamp}_consolidated.json"
+
+            if use_sections:
+                section_based_data = {
+                    "document_name": doc_name,
+                    "processed_at": datetime.now().isoformat(),
+                    "total_sections": len(sections),
+                    "total_obligations_found": len(all_obligations),
+                    "party_metadata": self.gemini_analyzer.party_metadata,
+                    "section_results": section_results,
+                }
+                section_based_path = out_dir / f"{doc_stem}_{timestamp}_section_based.json"
+                with open(section_based_path, "w", encoding="utf-8") as f:
+                    json.dump(section_based_data, f, indent=2, ensure_ascii=False)
+                self.logger.info(f"Section-based results saved to: {section_based_path}")
+            else:
+                pagewise_data = {
+                    "document_name": doc_name,
+                    "processed_at": datetime.now().isoformat(),
+                    "total_pages": len(page_texts),
+                    "total_obligations_found": len(all_obligations),
+                    "party_metadata": self.gemini_analyzer.party_metadata,
+                    "page_results": page_results,
+                }
+                pagewise_path = out_dir / f"{doc_stem}_{timestamp}_pagewise.json"
+                with open(pagewise_path, "w", encoding="utf-8") as f:
+                    json.dump(pagewise_data, f, indent=2, ensure_ascii=False)
+                self.logger.info(f"Pagewise results saved to: {pagewise_path}")
+
             consolidated_data = {
                 "document_name": doc_name,
                 "processed_at": datetime.now().isoformat(),
@@ -1137,15 +1214,8 @@ class LegalDocumentProcessor:
                 "party_metadata": self.gemini_analyzer.party_metadata,
                 "consolidated_results": consolidated_results,
             }
-            out_dir = Path(self.local_output_folder)
-            out_dir.mkdir(parents=True, exist_ok=True)
-            section_based_path = out_dir / section_based_filename
-            consolidated_json_path = out_dir / f"{doc_stem}_{timestamp}_consolidated.json"
-            with open(section_based_path, "w", encoding="utf-8") as f:
-                json.dump(section_based_data, f, indent=2, ensure_ascii=False)
             with open(consolidated_json_path, "w", encoding="utf-8") as f:
                 json.dump(consolidated_data, f, indent=2, ensure_ascii=False)
-            self.logger.info(f"Section-based results saved to: {section_based_path}")
             self.logger.info(f"Consolidated JSON saved to: {consolidated_json_path}")
             # Vector store: one chunk per consolidated (deduplicated) obligation in ChromaDB
             # index_obligations deletes this document's old chunks first, then re-indexes (no orphans)
@@ -1172,7 +1242,16 @@ class LegalDocumentProcessor:
                 else:
                     self.logger.warning(f"Vector indexing failed (processing succeeded): {e}")
             result_path = str(consolidated_json_path.resolve())
-            self.logger.info(f"Processing complete! Sections: {len(sections)}, obligations: {len(all_obligations)}, consolidated: {len(consolidated_results)}")
+            if use_sections:
+                self.logger.info(
+                    f"Processing complete! Sections: {len(sections)}, obligations: {len(all_obligations)}, "
+                    f"consolidated: {len(consolidated_results)}"
+                )
+            else:
+                self.logger.info(
+                    f"Processing complete! Pages: {len(page_texts)}, obligations: {len(all_obligations)}, "
+                    f"consolidated: {len(consolidated_results)}"
+                )
             return result_path
         except Exception as e:
             self.logger.error(f"Error processing document: {e}", exc_info=True)
@@ -1274,10 +1353,13 @@ class LegalDocumentProcessor:
 
 
 def main():
-    """Main entry point: process PDF(s) and write section-based + consolidated JSON to output/."""
+    """Main entry point: process PDF(s); default is page-wise extraction + pagewise + consolidated JSON."""
     import argparse
     parser = argparse.ArgumentParser(
-        description="Process legal PDFs: produces (1) section-based obligations JSON, (2) consolidated JSON."
+        description=(
+            "Process legal PDFs: by default (1) *_pagewise.json, (2) *_consolidated.json. "
+            "Set env LEGAL_OCR_USE_SECTION_EXTRACTION=true for (1) *_section_based.json instead of pagewise."
+        )
     )
     parser.add_argument(
         "pdf_path",
@@ -1305,7 +1387,9 @@ def main():
             return
         out = processor.process_document(str(path.resolve()))
         if out:
-            processor.logger.info("Done. Output files: 1) section-based JSON, 2) consolidated JSON.")
+            processor.logger.info(
+                "Done. Output: pagewise + consolidated (or section-based + consolidated if LEGAL_OCR_USE_SECTION_EXTRACTION=true)."
+            )
         else:
             processor.logger.error("Processing failed.")
     else:
