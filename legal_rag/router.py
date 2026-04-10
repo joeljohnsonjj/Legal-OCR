@@ -9,7 +9,11 @@ Backends:
   - **AWS Bedrock** (recommended with Parameter Store + AssumeRole): when ``RAG_ROUTER_MODEL`` or
     ``LITELLM_MODEL`` / ``LLM_MODEL`` is ``bedrock/...``, uses LiteLLM with the same IAM session
     as ``aws_parameter_loader.init_llm_env`` (no OpenAI key required).
-  - **OpenAI / Azure OpenAI**: otherwise uses the OpenAI SDK (Azure when endpoint + key are set).
+  - **Gemini (Google AI Studio)**: when there is no OpenAI/Azure key for the router but
+    ``GEMINI_API_KEY`` or ``GOOGLE_API_KEY`` is set, uses LiteLLM with ``gemini/<GEMINI_MODEL>``
+    (same preview/stable id as the rest of the app). Override with ``RAG_ROUTER_MODEL=gemini/...``.
+  - **OpenAI / Azure OpenAI**: when OpenAI-compatible credentials are available, uses the OpenAI SDK
+    (Azure when endpoint + key are set).
 """
 
 from __future__ import annotations
@@ -98,6 +102,8 @@ def _router_model() -> str:
     litellm_m = (os.getenv("LITELLM_MODEL") or "").strip()
     if litellm_m.lower().startswith("bedrock/"):
         return litellm_m
+    if litellm_m.lower().startswith("gemini/"):
+        return litellm_m
     llm_m = (os.getenv("LLM_MODEL") or "").strip()
     if llm_m.lower().startswith("bedrock/"):
         return llm_m
@@ -111,6 +117,41 @@ def _router_model() -> str:
 
 def _is_bedrock_model(model: str) -> bool:
     return (model or "").strip().lower().startswith("bedrock/")
+
+
+def _is_litellm_gemini_model(model: str) -> bool:
+    return (model or "").strip().lower().startswith("gemini/")
+
+
+def _has_openai_router_credentials() -> bool:
+    if (os.getenv("AZURE_OPENAI_ENDPOINT") or "").strip() and (
+        os.getenv("AZURE_OPENAI_API_KEY")
+        or os.getenv("AZURE_OPENAI_KEY")
+        or os.getenv("OPENAI_API_KEY")
+    ):
+        return True
+    return bool((os.getenv("OPENAI_API_KEY") or "").strip())
+
+
+def _has_gemini_api_key() -> bool:
+    return bool((os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or "").strip())
+
+
+def _gemini_is_primary_llm_stack() -> bool:
+    """True when the app is configured for direct Gemini (not Azure, not unified LiteLLM)."""
+    if os.getenv("USE_AZURE_OPENAI", "").lower() in ("true", "1", "yes"):
+        return False
+    if (os.getenv("LITELLM_MODEL") or "").strip():
+        return False
+    return True
+
+
+def _gemini_litellm_router_model() -> str:
+    """LiteLLM model id for Gemini (e.g. gemini/gemini-3.1-flash-lite-preview)."""
+    raw = (os.getenv("GEMINI_MODEL") or "gemini-2.5-flash-lite").strip()
+    if raw.lower().startswith("gemini/"):
+        return raw
+    return f"gemini/{raw}"
 
 
 def _route_result_from_tool_name(name: str, rationale: str) -> RouteResult:
@@ -190,6 +231,45 @@ def _route_via_litellm_bedrock(user_message: str, model: str) -> RouteResult:
     return _route_result_from_tool_name(name, rationale)
 
 
+def _route_via_litellm_gemini(user_message: str, model: str) -> RouteResult:
+    """Tool-calling router via LiteLLM → Gemini API (Google AI Studio key)."""
+    import litellm
+
+    sys_prompt = (
+        "You route user messages to exactly one search function. "
+        "Choose search_financial_obligations for money, rent, fees, deposits, payment duties, costs. "
+        "Choose search_general_document for pets, rules, termination, definitions, notices, non-monetary clauses. "
+        "If both apply, prefer search_financial_obligations when any payment or money is central."
+    )
+
+    max_router = int(os.getenv("RAG_ROUTER_MAX_TOKENS", "512"))
+    key = (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or "").strip()
+    if not key:
+        raise ValueError("GEMINI_API_KEY or GOOGLE_API_KEY must be set for Gemini RAG router")
+
+    kwargs = {
+        "model": model,
+        "api_key": key,
+        "temperature": 0,
+        "max_tokens": max_router,
+        "messages": [
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": user_message},
+        ],
+        "tools": ROUTER_TOOLS,
+        "tool_choice": "required",
+    }
+
+    resp = litellm.completion(**kwargs)
+    ch0 = resp.choices[0]
+    msg = ch0.message
+    name, rationale = _parse_tool_call_openai_style(msg)
+    if not name:
+        logger.warning("Gemini router returned no tool_calls; defaulting to extracted_obligation")
+        return RouteResult("extracted_obligation", "search_financial_obligations", "")
+    return _route_result_from_tool_name(name, rationale)
+
+
 @dataclass
 class RouteResult:
     """Outcome of routing + optional model rationale."""
@@ -212,6 +292,16 @@ def route_chat_query(user_message: str, model: Optional[str] = None) -> RouteRes
 
     if _is_bedrock_model(m):
         return _route_via_litellm_bedrock(user_message, m)
+
+    # Explicit LiteLLM Gemini id (e.g. RAG_ROUTER_MODEL=gemini/gemini-3.1-flash-lite-preview)
+    if _is_litellm_gemini_model(m):
+        return _route_via_litellm_gemini(user_message, m)
+
+    # Gemini stack: use Gemini for routing (avoids OpenAI when GEMINI is primary even if OPENAI_API_KEY is set in env)
+    if _has_gemini_api_key() and (
+        not _has_openai_router_credentials() or _gemini_is_primary_llm_stack()
+    ):
+        return _route_via_litellm_gemini(user_message, _gemini_litellm_router_model())
 
     client = _openai_client()
     sys_prompt = (

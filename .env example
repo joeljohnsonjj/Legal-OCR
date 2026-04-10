@@ -1,35 +1,42 @@
-# ========== Use Azure OpenAI ==========
-USE_AZURE_OPENAI=True
- 
-# Azure OpenAI (required when USE_AZURE_OPENAI=True)
-# Endpoint from Azure Portal: your resource -> Keys and Endpoint
-AZURE_OPENAI_ENDPOINT=https://your-resource-name.openai.azure.com/
-AZURE_OPENAI_KEY=your-azure-openai-api-key-here
-AZURE_OPENAI_API_VERSION=2025-01-01-preview
-AZURE_OPENAI_DEPLOYMENT_NAME=gpt-4o-mini
-AZURE_OPENAI_TIMEOUT_SECONDS=300
- 
-# Use local sentence-transformers for embeddings (no Azure embedding call; faster queries)
+# ========== LLM: Azure OpenAI OR Gemini ==========
+USE_AZURE_OPENAI=false
+
+# --- Gemini / Google AI Studio (GEMINI_API_KEY from https://aistudio.google.com/app/apikey) ---
+GOOGLE_GENAI_USE_VERTEXAI=false
+GEMINI_API_KEY=your_googleaistudio_api_key
+# Gemini 3.1 Flash Lite — API model code (Google AI Studio; same GEMINI_API_KEY above)
+GEMINI_MODEL=gemini-3.1-flash-lite-preview
+# POST /chat RAG router uses this model via LiteLLM when no OpenAI/Azure key is set (optional override: RAG_ROUTER_MODEL=gemini/gemini-3.1-flash-lite-preview)
+
+# Seconds between PDF pages during processing (free tier ~20 requests/min; raise if you see 429)
+PAGE_PROCESSING_DELAY=6
+
+# Use local sentence-transformers for embeddings
 USE_LOCAL_EMBEDDING=True
-# Or use Azure embeddings: create a deployment in Azure Portal and set e.g.:
-# AZURE_OPENAI_EMBEDDING_DEPLOYMENT=text-embedding-3-large
- 
+
+# POST /chat (Qdrant RAG): set true when processing PDFs so obligations + pages are indexed for chat
+# RAG_INDEX_QDRANT=true
+
 # GCS simulator (fake GCS) - required when using run_emulator.py
 STORAGE_EMULATOR_HOST=http://localhost:4443
+FAKE_GCS_ENDPOINT=http://localhost:4443
 GCS_BUCKET=heb-legal
- 
-# Vector search: max distance for similarity (default 1.4; higher = more results)
+GCS_DOCS_FOLDER=Documents
+GCS_OUTPUT_FOLDER=Output
+
+GCS_EMULATOR_HOST=localhost
+GCS_EMULATOR_PORT=4443
+GCS_EMULATOR_DATA_DIR=./fake-gcs-data
+GCS_EMULATOR_IN_MEMORY=false
+
 VECTOR_MAX_DISTANCE=2.0
- 
-# -----------------------------------------------------------------------------
-# Optional: document folders, OCR, API (defaults used if unset)
-# -----------------------------------------------------------------------------
-# DOCS_FOLDER=docs
-# OUTPUT_FOLDER=output
-# LOGS_FOLDER=logs
-# CACHE_FOLDER=ocr_cache
-# PROMPT_FILE=prompt.txt
-# POPPLER_PATH=
-# API_HOST=0.0.0.0
-# API_PORT=8000
-# API_RELOAD=false
+
+PROMPT_FILE=prompt.txt
+DOCS_FOLDER=docs
+OUTPUT_FOLDER=output
+LOGS_FOLDER=logs
+CACHE_FOLDER=ocr_cache
+
+API_HOST=0.0.0.0
+API_PORT=8000
+API_RELOAD=false

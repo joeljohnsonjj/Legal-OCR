@@ -31,6 +31,17 @@ _remote_qdrant_key: Optional[Tuple[str, str]] = None
 _UPSERT_BATCH = 128
 
 
+def _is_missing_collection_error(exc: BaseException) -> bool:
+    """True if Qdrant has no such collection (RAG index never built)."""
+    msg = str(exc).lower()
+    if "collection" not in msg:
+        return False
+    return any(
+        s in msg
+        for s in ("not found", "does not exist", "doesn't exist", "unknown collection", "404")
+    )
+
+
 def _client():
     from qdrant_client import QdrantClient
 
@@ -224,13 +235,24 @@ def search(
     flt = Filter(must=must)
 
     # qdrant-client 1.12+ uses query_points; local client may not expose legacy .search()
-    resp = client.query_points(
-        collection_name=name,
-        query=query_vector,
-        query_filter=flt,
-        limit=limit,
-        with_payload=True,
-    )
+    try:
+        resp = client.query_points(
+            collection_name=name,
+            query=query_vector,
+            query_filter=flt,
+            limit=limit,
+            with_payload=True,
+        )
+    except Exception as e:
+        if _is_missing_collection_error(e):
+            logger.warning(
+                "Qdrant collection %r missing — build the RAG index with RAG_INDEX_QDRANT=true on /process "
+                "or legal_rag.qdrant_store.upsert_document_pages_and_obligations. (%s)",
+                name,
+                e,
+            )
+            return []
+        raise
     out = []
     for h in resp.points or []:
         out.append(
@@ -257,7 +279,15 @@ def fetch_raw_page(document_id: str, page_number: int) -> Optional[str]:
             FieldCondition(key="page_number", match=MatchValue(value=page_number)),
         ]
     )
-    points, _ = client.scroll(collection_name=name, scroll_filter=flt, limit=2, with_payload=True)
+    try:
+        points, _ = client.scroll(collection_name=name, scroll_filter=flt, limit=2, with_payload=True)
+    except Exception as e:
+        if _is_missing_collection_error(e):
+            logger.warning(
+                "Qdrant collection %r missing — cannot fetch raw page for RAG parent fetch. (%s)", name, e
+            )
+            return None
+        raise
     if not points:
         return None
     pl = points[0].payload or {}
