@@ -5,10 +5,11 @@ Run this file to start the API server
 
 import uvicorn
 import os
+from pathlib import Path
 from dotenv import load_dotenv
 
-# Load environment variables
-load_dotenv()
+# Load environment variables from repo root (cwd may differ under uvicorn reload / IDEs)
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 # When using Gemini (not Azure): force API-key-only auth by unsetting ADC so the client uses GEMINI_API_KEY only.
 if not os.getenv("USE_AZURE_OPENAI", "").lower() in ("true", "1", "yes"):

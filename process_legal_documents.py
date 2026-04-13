@@ -22,13 +22,38 @@ from PIL import Image
 import pytesseract
 
 # LLM API (Azure OpenAI or Gemini via llm_client)
-from llm_client import generate_content as llm_generate_content, get_default_model
+from llm_client import generate_content as llm_generate_content, get_default_model, use_bedrock_llm
 
 from citation_utils import merge_structured_citations_by_doc_id
+from obligation_categories import (
+    assign_financial_categories,
+    flatten_obligations_from_category_buckets,
+    group_obligations_by_category,
+)
 
 # Environment Variables
 from dotenv import load_dotenv
 load_dotenv()
+
+_REPO_ROOT = Path(__file__).resolve().parent
+
+
+def _configured_llm_label() -> str:
+    """Human-readable LLM provider for logs (matches llm_client routing)."""
+    if os.getenv("USE_AZURE_OPENAI", "").lower() in ("true", "1", "yes"):
+        return "Azure OpenAI"
+    if use_bedrock_llm():
+        return "AWS Bedrock"
+    return "Gemini API"
+
+
+def _resolve_workspace_path(path_str: Optional[str], env_key: str, default: str) -> Path:
+    """Resolve DOCS_FOLDER/OUTPUT_FOLDER relative to repo root, not the process CWD."""
+    raw = (path_str or os.getenv(env_key) or default).strip()
+    p = Path(raw).expanduser()
+    if p.is_absolute():
+        return p.resolve()
+    return (_REPO_ROOT / p).resolve()
 
 
 def _normalize_key(s: Any) -> str:
@@ -127,6 +152,48 @@ def _extract_obligations_list(parsed: Any) -> List[Dict[str, Any]]:
             if is_obligation_list(val):
                 return val
     return []
+
+
+def _strip_llm_json_response(text: str) -> str:
+    t = (text or "").strip()
+    for prefix in ("```json", "```"):
+        if t.startswith(prefix):
+            t = t[len(prefix) :].lstrip()
+            break
+    if t.endswith("```"):
+        t = t[:-3].strip()
+    return t.strip()
+
+
+def _consolidation_max_output_tokens() -> int:
+    try:
+        n = int(os.getenv("LEGAL_OCR_CONSOLIDATION_MAX_TOKENS", "32768"))
+    except ValueError:
+        n = 32768
+    return max(4096, min(n, 200000))
+
+
+def _consolidation_use_llm() -> bool:
+    """Primary consolidation path: LLM merge. Set LEGAL_OCR_CONSOLIDATION_USE_LLM=false for programmatic-only."""
+    v = os.getenv("LEGAL_OCR_CONSOLIDATION_USE_LLM", "true").strip().lower()
+    return v not in ("false", "0", "no", "off")
+
+
+def _consolidation_llm_max_obligations() -> Optional[int]:
+    """
+    Optional soft cap: if set and count exceeds it, logs a warning but the LLM merge still runs (LLM-only path).
+    None / 0 / unlimited = no warning threshold.
+    """
+    raw = os.getenv("LEGAL_OCR_CONSOLIDATION_LLM_MAX_OBLIGATIONS", "0").strip().lower()
+    if raw in ("0", "", "none", "unlimited"):
+        return None
+    try:
+        n = int(raw)
+    except ValueError:
+        return None
+    if n <= 0:
+        return None
+    return max(5, n)
 
 
 # Exponential backoff retry decorator
@@ -574,10 +641,12 @@ class GeminiAnalyzer:
                 raise ValueError("USE_AZURE_OPENAI is set; AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_API_KEY (or AZURE_OPENAI_KEY) must be set in .env")
             if not os.getenv("AZURE_OPENAI_DEPLOYMENT") and not os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME") and not os.getenv("OPENAI_DEPLOYMENT_NAME"):
                 raise ValueError("USE_AZURE_OPENAI is set; AZURE_OPENAI_DEPLOYMENT or AZURE_OPENAI_DEPLOYMENT_NAME must be set in .env")
+        elif use_bedrock_llm():
+            self.logger.info("LLM client: AWS Bedrock (credentials from env / default chain)")
         else:
             if not os.getenv('GEMINI_API_KEY') and not os.getenv('GOOGLE_API_KEY'):
                 raise ValueError("GEMINI_API_KEY must be set in .env (Gemini API key from https://aistudio.google.com/app/apikey)")
-        self.logger.info("LLM client (Azure OpenAI or Gemini) ready")
+        self.logger.info("LLM client (Azure OpenAI, Bedrock, or Gemini) ready")
     
     def reset_party_metadata(self):
         """
@@ -703,7 +772,7 @@ Extract party metadata as JSON:"""
     @retry_with_exponential_backoff(max_retries=5, initial_delay=5.0, exponential_base=2.0)
     def analyze_page(self, page_num: int, page_text: str, extract_parties: bool = True) -> List[Dict[str, Any]]:
         """
-        Analyze a single page using Gemini API
+        Analyze a single page using the configured LLM (Azure, Bedrock, or Gemini)
         
         Args:
             page_num: Page number
@@ -744,9 +813,9 @@ CRITICAL — OUTPUT FORMAT: Respond with a single JSON object that has exactly o
 
 {page_text}"""
             
-            self.logger.info(f"Analyzing page {page_num} with Gemini API...")
+            self.logger.info(f"Analyzing page {page_num} with {_configured_llm_label()}...")
             
-            # Call Gemini API
+            # Call configured LLM
             response = self._generate_content(
                 prompt=full_prompt,
                 temperature=0.1,  # Low temperature for consistent, factual extraction
@@ -901,22 +970,22 @@ CRITICAL — OUTPUT FORMAT: Respond with a single JSON object that has exactly o
             self.logger.error(f"Error analyzing section {display_num}: {e}")
             return []
 
-    @retry_with_exponential_backoff(max_retries=5, initial_delay=5.0, exponential_base=2.0)
-    def consolidate_results_to_json(self, all_page_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _llm_merge_obligation_batch(
+        self,
+        batch: List[Dict[str, Any]],
+        metadata_context: str,
+        *,
+        batch_desc: str,
+        max_output_tokens: int,
+    ) -> List[Dict[str, Any]]:
         """
-        Consolidate obligations from all pages into a single, deduplicated JSON array using the LLM.
-        Returns the list of consolidated obligation dicts (same structure: DutyType, Responsible Party, Owner Responsibility, Reasoning, Citation).
+        Optional LLM pass to merge semantically similar obligations across the given list (whole document
+        when batch is already globally deduped). Prefer programmatic _merge_duplicate_obligations for speed.
         """
-        try:
-            self.logger.info("Consolidating results into JSON...")
-            metadata_context = ""
-            if self.party_metadata:
-                metadata_context = "\n\nParty metadata (use Responsible Party as given or from metadata):\n"
-                for ref_label, info in self.party_metadata.items():
-                    actual_name = info.get("actual_name", "") or ref_label
-                    metadata_context += f"- {ref_label}: {actual_name}\n"
-            num_input = len(all_page_results)
-            consolidation_prompt = f"""You are a legal analyst. You have been provided with financial obligations extracted from multiple pages of a legal document.
+        num_input = len(batch)
+        if num_input == 0:
+            return []
+        consolidation_prompt = f"""You are a legal analyst. You have been provided with financial obligations extracted from multiple pages of a legal document.
 
 Your task is to consolidate these obligations into a single, deduplicated JSON array. Follow these rules:
 
@@ -932,39 +1001,116 @@ Your task is to consolidate these obligations into a single, deduplicated JSON a
 {metadata_context}
 Here are the extracted obligations:
 
-{json.dumps(all_page_results, indent=2)}
+{json.dumps(batch, ensure_ascii=False, indent=2)}
 
 Provide the consolidated JSON array:"""
+
+        last_err: Optional[Exception] = None
+        for attempt in range(2):
+            prompt = consolidation_prompt
+            if attempt == 1:
+                prompt += (
+                    "\n\nREMEDIATION: Your previous output was invalid JSON (often unterminated string or unescaped \" inside a value). "
+                    "Reply with ONLY a valid JSON array. Escape internal double-quotes as \\\". "
+                    "Shorten verbose Owner Responsibility / Reasoning lines to ~400 characters each if needed to stay within limits."
+                )
             response = self._generate_content(
-                prompt=consolidation_prompt,
+                prompt=prompt,
                 temperature=0.1,
                 response_mime_type="application/json",
-                max_output_tokens=16384,
+                max_output_tokens=max_output_tokens,
             )
-            result_text = (response.text or "").strip()
-            for prefix in ("```json", "```"):
-                if result_text.startswith(prefix):
-                    result_text = result_text[len(prefix):]
-                    break
-            if result_text.endswith("```"):
-                result_text = result_text[:-3]
-            result_text = result_text.strip()
+            result_text = _strip_llm_json_response(response.text or "")
             try:
                 parsed = json.loads(result_text)
             except json.JSONDecodeError as e:
-                self.logger.error(
-                    "Consolidation JSON parse failed (possible truncation or invalid format). Error: %s. Response length: %d. First 500 chars: %s",
-                    e, len(result_text), result_text[:500],
+                last_err = e
+                self.logger.warning(
+                    "Consolidation batch parse failed (%s), attempt %d/%d: %s (response len=%d)",
+                    batch_desc,
+                    attempt + 1,
+                    2,
+                    e,
+                    len(result_text),
                 )
-                raise
-            consolidated = _extract_obligations_list(parsed)
+                continue
+            out = _extract_obligations_list(parsed)
+            if out:
+                return out
+            self.logger.warning("Consolidation batch returned empty list (%s), attempt %d", batch_desc, attempt + 1)
+
+        if last_err:
+            self.logger.error(
+                "Consolidation batch failed after retries (%s): %s; returning input obligations unchanged (no programmatic dedup).",
+                batch_desc,
+                last_err,
+            )
+        return [dict(x) for x in batch]
+
+    @retry_with_exponential_backoff(max_retries=5, initial_delay=5.0, exponential_base=2.0)
+    def consolidate_results_to_json(self, all_page_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Merge obligations across the whole document.
+        When LEGAL_OCR_CONSOLIDATION_USE_LLM=true (default): only the consolidation LLM merges rows; no programmatic dedup.
+        If the LLM call fails or returns an empty list, the raw extracted obligations are kept (duplicates may remain).
+        When USE_LLM=false: programmatic _merge_duplicate_obligations only.
+        """
+        try:
+            self.logger.info("Consolidating results into JSON...")
+            metadata_context = ""
+            if self.party_metadata:
+                metadata_context = "\n\nParty metadata (use Responsible Party as given or from metadata):\n"
+                for ref_label, info in self.party_metadata.items():
+                    actual_name = info.get("actual_name", "") or ref_label
+                    metadata_context += f"- {ref_label}: {actual_name}\n"
+            num_input = len(all_page_results)
+            if not all_page_results:
+                return []
+
+            working = [dict(ob) for ob in all_page_results]
+            consolidated: List[Dict[str, Any]] = []
+            max_tok = _consolidation_max_output_tokens()
+            cap = _consolidation_llm_max_obligations()
+
+            if _consolidation_use_llm():
+                if cap is not None and len(working) > cap:
+                    self.logger.warning(
+                        "Consolidation: %d obligations exceed LEGAL_OCR_CONSOLIDATION_LLM_MAX_OBLIGATIONS (%d); "
+                        "still invoking LLM merge (no programmatic dedup on this path).",
+                        len(working),
+                        cap,
+                    )
+                self.logger.info(
+                    "Consolidation: LLM merge only on full document (%d obligations, max_output_tokens=%d)",
+                    len(working),
+                    max_tok,
+                )
+                merged_llm = self._llm_merge_obligation_batch(
+                    working,
+                    metadata_context,
+                    batch_desc=f"Full document ({len(working)} obligations)",
+                    max_output_tokens=max_tok,
+                )
+                if merged_llm:
+                    consolidated = merged_llm
+                else:
+                    self.logger.warning(
+                        "LLM consolidation returned no obligations; keeping %d raw extracted rows (no programmatic dedup)",
+                        num_input,
+                    )
+                    consolidated = [dict(x) for x in working]
+            else:
+                consolidated = _merge_duplicate_obligations(working)
+                self.logger.info(
+                    "Consolidation: programmatic dedup only (LEGAL_OCR_CONSOLIDATION_USE_LLM=false) %d → %d",
+                    num_input,
+                    len(consolidated),
+                )
+
             if not consolidated and all_page_results:
                 self.logger.error(
-                    "LLM consolidation returned 0 obligations although %d were extracted from the PDF. Parsed type: %s, keys: %s. Raw response (first 800 chars): %s",
+                    "Consolidation produced 0 obligations although %d were extracted from the PDF.",
                     num_input,
-                    type(parsed).__name__,
-                    list(parsed.keys()) if isinstance(parsed, dict) else "n/a",
-                    result_text[:800],
                 )
             # Ensure DutyType is always in related_keywords for semantic search
             for ob in consolidated:
@@ -980,15 +1126,20 @@ Provide the consolidated JSON array:"""
                             seen = {str(x).strip().lower() for x in kw if x}
                             if duty_str.lower() not in seen:
                                 ob["related_keywords"] = [duty_str] + [x for x in kw if x]
-            # Programmatic merge: same DutyType + Responsible Party → one entry (LLM often leaves duplicates)
-            before_merge = len(consolidated)
-            consolidated = _merge_duplicate_obligations(consolidated)
-            if len(consolidated) < before_merge:
-                self.logger.info(f"Programmatic dedup: {before_merge} → {len(consolidated)} (same DutyType + Responsible Party merged)")
+            if not _consolidation_use_llm():
+                before_final = len(consolidated)
+                consolidated = _merge_duplicate_obligations(consolidated)
+                if len(consolidated) < before_final:
+                    self.logger.info(
+                        "Programmatic dedup (post keywords): %d → %d",
+                        before_final,
+                        len(consolidated),
+                    )
             for ob in consolidated:
                 cit = ob.get("Citation")
                 if isinstance(cit, list) and cit and all(isinstance(x, dict) for x in cit):
                     ob["Citation"] = merge_structured_citations_by_doc_id(cit)
+            assign_financial_categories(consolidated, model=self.model)
             self.logger.info(f"Consolidated into JSON ({len(consolidated)} obligations)")
             return consolidated
         except Exception as e:
@@ -1012,22 +1163,22 @@ class LegalDocumentProcessor:
                  logs_folder: str = "logs",
                  cache_folder: str = "ocr_cache",
                  prompt_file: str = "prompt.txt",
-                 model: str = "gemini-2.5-flash-lite",
+                 model: Optional[str] = None,
                  tesseract_cmd: Optional[str] = None,
                  poppler_path: Optional[str] = None):
-        """Initialize with local docs and output folders. Requires GEMINI_API_KEY or (when USE_AZURE_OPENAI) Azure env vars in .env."""
+        """Initialize with local docs and output folders. Uses get_default_model() when model is None."""
         self.logs_folder = Path(logs_folder)
         self.cache_folder = Path(cache_folder)
         self.logs_folder.mkdir(exist_ok=True)
         self.cache_folder.mkdir(exist_ok=True)
         self._setup_logging()
         self.logger = logging.getLogger(__name__)
-        self.local_docs_folder = str(Path(local_docs_folder or os.getenv("DOCS_FOLDER", "docs")).resolve())
-        self.local_output_folder = str(Path(local_output_folder or os.getenv("OUTPUT_FOLDER", "output")).resolve())
+        self.local_docs_folder = str(_resolve_workspace_path(local_docs_folder, "DOCS_FOLDER", "docs"))
+        self.local_output_folder = str(_resolve_workspace_path(local_output_folder, "OUTPUT_FOLDER", "output"))
         Path(self.local_output_folder).mkdir(parents=True, exist_ok=True)
         self.logger.info(f"Legal Document Processor (local): docs={self.local_docs_folder}, output={self.local_output_folder}")
         self.pdf_processor = PDFProcessor(tesseract_cmd, str(self.cache_folder), poppler_path)
-        self.gemini_analyzer = GeminiAnalyzer(prompt_file, model)
+        self.gemini_analyzer = GeminiAnalyzer(prompt_file, model or get_default_model())
     
     def _setup_logging(self):
         """Setup logging configuration"""
@@ -1205,14 +1356,16 @@ class LegalDocumentProcessor:
                     json.dump(pagewise_data, f, indent=2, ensure_ascii=False)
                 self.logger.info(f"Pagewise results saved to: {pagewise_path}")
 
-            consolidated_data = {
+            by_category = group_obligations_by_category(consolidated_results)
+            flat_for_vector_index = flatten_obligations_from_category_buckets(by_category)
+            consolidated_data: Dict[str, Any] = {
                 "document_name": doc_name,
                 "processed_at": datetime.now().isoformat(),
                 "total_pages": len(page_texts),
                 "total_obligations_found": len(all_obligations),
                 "consolidated_obligations_count": len(consolidated_results),
                 "party_metadata": self.gemini_analyzer.party_metadata,
-                "consolidated_results": consolidated_results,
+                "consolidated_results_by_category": by_category,
             }
             with open(consolidated_json_path, "w", encoding="utf-8") as f:
                 json.dump(consolidated_data, f, indent=2, ensure_ascii=False)
@@ -1224,7 +1377,7 @@ class LegalDocumentProcessor:
                 chroma_path = str(out_dir / "chroma_db")
                 num_indexed = index_obligations(
                     document_name=doc_name,
-                    consolidated_results=consolidated_results,
+                    consolidated_results=flat_for_vector_index,
                     chroma_path=chroma_path,
                 )
                 self.logger.info(f"Vector index: {num_indexed} obligation chunks (from consolidated deduplicated list) indexed in ChromaDB at {chroma_path}")

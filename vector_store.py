@@ -191,6 +191,8 @@ def index_obligations(
     Convert each obligation into a chunk and add to ChromaDB.
     Removes any existing chunks for this document first, then upserts the new set.
     Returns the number of chunks indexed.
+    List order must match obligation_categories.flatten_obligations_from_category_buckets when the
+    on-disk JSON is category-only (chunk_index resolution in the query path).
     """
     if not consolidated_results:
         logger.warning("No obligations to index")

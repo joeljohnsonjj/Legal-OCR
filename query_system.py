@@ -16,10 +16,15 @@ from datetime import datetime
 from urllib.parse import unquote, urlparse
 
 # LLM API (Azure OpenAI or Gemini via llm_client)
-from llm_client import generate_content as llm_generate_content, get_default_model
+from llm_client import (
+    generate_content as llm_generate_content,
+    generate_content_stream,
+    get_default_model,
+    use_bedrock_llm,
+)
 
 # FastAPI
-from fastapi import Body, FastAPI, HTTPException, Query
+from fastapi import Body, FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -28,8 +33,20 @@ from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
 from citation_utils import merge_structured_citations_by_doc_id
+from obligation_categories import obligations_from_consolidated_json
 
-load_dotenv()
+load_dotenv(Path(__file__).resolve().parent / ".env")
+
+from gcs_document_versioning import (
+    default_archive_prefix,
+    list_archived_versions,
+    maybe_sync_live_bytes_to_docs,
+    maybe_sync_live_from_bucket_to_docs,
+    publish_new_version,
+    publish_result_to_dict,
+    restore_archived_to_live,
+    restore_version_by_id,
+)
 
 
 def _normalize_ob_key(ob: Dict[str, Any]) -> tuple:
@@ -309,10 +326,10 @@ class ObligationQuerySystem:
         local_output_folder: Optional[str] = None,
         model: Optional[str] = None,
     ):
-        """Initialize with local output folder. Requires GEMINI_API_KEY or (when USE_AZURE_OPENAI) Azure env vars in .env."""
+        """Initialize with local output folder. Requires GEMINI_API_KEY, or Azure vars when USE_AZURE_OPENAI, or AWS creds for Bedrock."""
         self.local_output_folder = str(Path(local_output_folder or os.getenv("OUTPUT_FOLDER", "output")).resolve())
         _use_azure = os.getenv("USE_AZURE_OPENAI", "").lower() in ("true", "1", "yes")
-        self.model = model or (os.getenv("AZURE_OPENAI_DEPLOYMENT") or os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME") or os.getenv("OPENAI_DEPLOYMENT_NAME") if _use_azure else os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite"))
+        self.model = model or get_default_model()
         self.logger = logging.getLogger(__name__)
         self._setup_logging()
         if _use_azure:
@@ -320,6 +337,8 @@ class ObligationQuerySystem:
                 raise ValueError("USE_AZURE_OPENAI is set; AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_API_KEY (or AZURE_OPENAI_KEY) must be set in .env")
             if not os.getenv("AZURE_OPENAI_DEPLOYMENT") and not os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME") and not os.getenv("OPENAI_DEPLOYMENT_NAME"):
                 raise ValueError("USE_AZURE_OPENAI is set; AZURE_OPENAI_DEPLOYMENT or AZURE_OPENAI_DEPLOYMENT_NAME must be set in .env")
+        elif use_bedrock_llm():
+            pass
         else:
             if not os.getenv("GEMINI_API_KEY") and not os.getenv("GOOGLE_API_KEY"):
                 raise ValueError("GEMINI_API_KEY must be set in .env (https://aistudio.google.com/app/apikey)")
@@ -346,7 +365,9 @@ class ObligationQuerySystem:
         return await generate_content_async(prompt, model=self.model, temperature=temperature, response_mime_type=response_mime_type)
     
     def load_consolidated_jsons(self) -> List[Dict[str, Any]]:
-        """Load *_consolidated.json first, then *_consolidated.md, then *_pagewise.json. Prefers JSON."""
+        """Load *_consolidated.json first, then *_consolidated.md, then *_pagewise.json. Prefers JSON.
+        Consolidated JSON may store obligations only under consolidated_results_by_category (no duplicate flat list).
+        """
         t0 = time.perf_counter()
         self.logger.info("[TIMING] Step: load_consolidated_jsons - start")
         root = Path(self.local_output_folder)
@@ -530,7 +551,7 @@ class ObligationQuerySystem:
             for entry in loaded:
                 data = entry.get("data") or {}
                 doc_name = (data.get("document_name") or "").strip()
-                results = data.get("consolidated_results") or []
+                results = obligations_from_consolidated_json(data)
                 if doc_name:
                     doc_to_results[doc_name] = results
             obligations = []
@@ -589,7 +610,7 @@ class ObligationQuerySystem:
             t0 = time.perf_counter()
             self.logger.info(f"[TIMING] Step: filter_obligations_by_query - start for doc '{document_name}'")
             # Extract obligations from consolidated data
-            obligations = consolidated_data.get("consolidated_results", [])
+            obligations = obligations_from_consolidated_json(consolidated_data)
             
             if not obligations:
                 self.logger.warning(f"No obligations found in {document_name}")
@@ -886,11 +907,9 @@ Output the merged and ranked JSON:"""
                 return
             
             merge_prompt = self._build_merge_rank_prompt(user_query, filtered_results)
-            # Stream from Azure OpenAI (merge and rank LLM call)
-            self.logger.info("[STREAM] Merge/rank LLM call - streaming response from Azure OpenAI")
-            from azure_openai_client import generate_content_stream
+            self.logger.info("[STREAM] Merge/rank LLM call - streaming response from LLM")
             from streaming_json_parser import parse_obligations_stream
-            
+
             token_stream = generate_content_stream(
                 prompt=merge_prompt,
                 model=self.model,
@@ -1359,6 +1378,51 @@ class ProcessResponse(BaseModel):
         }
 
 
+class GcsVersionedUploadResponse(BaseModel):
+    """Response after uploading a new live version (previous live archived if it existed)."""
+    status: str
+    bucket: str
+    live_object_name: str
+    archived_previous: bool
+    archive_object_name: Optional[str] = None
+    version_id: Optional[str] = None
+    error: Optional[str] = None
+    synced_local_path: Optional[str] = Field(
+        default=None,
+        description="Set when GCS_SYNC_LIVE_TO_DOCS is enabled: absolute path written under DOCS_FOLDER.",
+    )
+    sync_error: Optional[str] = Field(
+        default=None,
+        description="Local mirror failed (upload/restore to GCS may still have succeeded).",
+    )
+
+
+class GcsArchivedVersionItem(BaseModel):
+    archive_object_name: str
+    version_id: str
+    size: Optional[int] = None
+    updated: Optional[str] = None
+
+
+class GcsListVersionsResponse(BaseModel):
+    live_object_name: str
+    archive_prefix: str
+    versions: List[GcsArchivedVersionItem]
+
+
+class GcsRestoreVersionRequest(BaseModel):
+    """Restore an archived version to become the new live object (current live is archived first)."""
+    live_object_name: str = Field(..., description="Stable GCS object name for the live document, e.g. Documents/Lease.pdf")
+    archive_object_name: Optional[str] = Field(
+        default=None,
+        description="Full object path of an archived blob (from list versions). Use this OR version_id.",
+    )
+    version_id: Optional[str] = Field(
+        default=None,
+        description="Version folder id (e.g. 20260407T103000Z). Use this OR archive_object_name.",
+    )
+
+
 class QueryResponse(BaseModel):
     """Response model for query endpoint"""
     query: str
@@ -1610,8 +1674,6 @@ async def query_obligations_stream_raw(request: Optional[QueryRequest] = Body(de
             _echo("="*80 + "\n")
             yield "="*80 + "\n"
             
-            from azure_openai_client import generate_content_stream
-            
             # Same merge/rank prompt as /query and /query/stream so results are consistent
             merge_prompt = qs._build_merge_rank_prompt(user_query, filtered_results)
             
@@ -1845,6 +1907,132 @@ async def list_documents():
     except Exception as e:
         logging.error(f"Error listing documents: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Error listing documents: {str(e)}")
+
+
+@app.post("/gcs/versioned-upload", response_model=GcsVersionedUploadResponse, tags=["GCS versioning"])
+async def gcs_versioned_upload(
+    file: UploadFile = File(...),
+    live_object_name: str = Form(
+        ...,
+        description='Stable object path in the bucket (the "live" document), e.g. Documents/Lease.pdf',
+    ),
+):
+    """
+    Upload a new file to the given live object path. If an object already exists there, it is
+    copied into the archive tree under `Documents/.versions/...` (see `GCS_VERSION_ARCHIVE_PREFIX`),
+    then replaced by this upload. Works with the local GCS emulator when `STORAGE_EMULATOR_HOST` is set.
+
+    When `GCS_SYNC_LIVE_TO_DOCS` is true, the same bytes are written to `DOCS_FOLDER` / basename(live_object_name)
+    so `/process` and CLI flows see the new PDF without a manual copy.
+    """
+    try:
+        data = await file.read()
+        if not data:
+            raise HTTPException(status_code=400, detail="Empty file")
+        ct = file.content_type
+        r = publish_new_version(live_object_name, data, content_type=ct if ct else None)
+        synced_path, sync_err = maybe_sync_live_bytes_to_docs(r.live_object_name, data)
+        return GcsVersionedUploadResponse(
+            status="success",
+            bucket=r.bucket,
+            live_object_name=r.live_object_name,
+            archived_previous=r.archived_previous,
+            archive_object_name=r.archive_object_name,
+            version_id=r.version_id,
+            synced_local_path=synced_path,
+            sync_error=sync_err,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except Exception as e:
+        logging.error(f"GCS versioned upload failed: {e}", exc_info=True)
+        return GcsVersionedUploadResponse(
+            status="error",
+            bucket=os.getenv("GCS_BUCKET", "heb-legal"),
+            live_object_name=live_object_name,
+            archived_previous=False,
+            error=str(e),
+            synced_local_path=None,
+            sync_error=None,
+        )
+
+
+@app.get("/gcs/versions", response_model=GcsListVersionsResponse, tags=["GCS versioning"])
+async def gcs_list_versions(
+    live_object_name: str = Query(..., description="Same live path used when uploading, e.g. Documents/Lease.pdf"),
+):
+    """List archived versions for a live object path (newest `version_id` first)."""
+    try:
+        items = list_archived_versions(live_object_name)
+        return GcsListVersionsResponse(
+            live_object_name=live_object_name.strip().lstrip("/"),
+            archive_prefix=default_archive_prefix(),
+            versions=[
+                GcsArchivedVersionItem(
+                    archive_object_name=v.archive_object_name,
+                    version_id=v.version_id,
+                    size=v.size,
+                    updated=v.updated,
+                )
+                for v in items
+            ],
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except Exception as e:
+        logging.error(f"GCS list versions failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.post("/gcs/restore-version", response_model=GcsVersionedUploadResponse, tags=["GCS versioning"])
+async def gcs_restore_version(body: GcsRestoreVersionRequest):
+    """
+    Promote an archived blob to become the live object. The current live object is archived
+    first (same behavior as a new upload), then the selected archive is written to the live path.
+    When `GCS_SYNC_LIVE_TO_DOCS` is true, the new live object is mirrored into `DOCS_FOLDER`.
+    """
+    if body.archive_object_name and body.version_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide only one of archive_object_name or version_id",
+        )
+    if not body.archive_object_name and not body.version_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide archive_object_name or version_id",
+        )
+    try:
+        if body.version_id:
+            r = restore_version_by_id(body.live_object_name, body.version_id)
+        else:
+            assert body.archive_object_name is not None
+            r = restore_archived_to_live(body.live_object_name, body.archive_object_name)
+        synced_path, sync_err = maybe_sync_live_from_bucket_to_docs(r.live_object_name)
+        return GcsVersionedUploadResponse(
+            status="success",
+            bucket=r.bucket,
+            live_object_name=r.live_object_name,
+            archived_previous=r.archived_previous,
+            archive_object_name=r.archive_object_name,
+            version_id=r.version_id,
+            synced_local_path=synced_path,
+            sync_error=sync_err,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    except Exception as e:
+        logging.error(f"GCS restore failed: {e}", exc_info=True)
+        return GcsVersionedUploadResponse(
+            status="error",
+            bucket=os.getenv("GCS_BUCKET", "heb-legal"),
+            live_object_name=body.live_object_name,
+            archived_previous=False,
+            error=str(e),
+            synced_local_path=None,
+            sync_error=None,
+        )
 
 
 # ============================================================================
