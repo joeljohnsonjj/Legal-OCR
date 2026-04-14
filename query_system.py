@@ -16,7 +16,12 @@ from datetime import datetime
 from urllib.parse import unquote, urlparse
 
 # LLM API (Azure OpenAI or Gemini via llm_client)
-from llm_client import generate_content as llm_generate_content, get_default_model, generate_content_stream
+from llm_client import (
+    generate_content as llm_generate_content,
+    generate_content_stream,
+    get_default_model,
+    validate_llm_environment,
+)
 
 # FastAPI
 from fastapi import Body, FastAPI, HTTPException, Query
@@ -350,27 +355,19 @@ def parse_markdown_table_to_obligations(md_text: str) -> List[Dict[str, Any]]:
 
 
 class ObligationQuerySystem:
-    """Query legal obligations from consolidated JSON in output folder. Uses Azure OpenAI or Gemini via llm_client."""
+    """Query legal obligations from consolidated JSON in output folder. Uses llm_client (LiteLLM, Azure OpenAI, or Gemini)."""
 
     def __init__(
         self,
         local_output_folder: Optional[str] = None,
         model: Optional[str] = None,
     ):
-        """Initialize with local output folder. Requires GEMINI_API_KEY or (when USE_AZURE_OPENAI) Azure env vars in .env."""
+        """Initialize with local output folder. Credentials depend on llm_client routing (see .env / LITELLM_MODEL)."""
         self.local_output_folder = str(Path(local_output_folder or os.getenv("OUTPUT_FOLDER", "output")).resolve())
-        _use_azure = os.getenv("USE_AZURE_OPENAI", "").lower() in ("true", "1", "yes")
-        self.model = model or (os.getenv("AZURE_OPENAI_DEPLOYMENT") or os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME") or os.getenv("OPENAI_DEPLOYMENT_NAME") if _use_azure else os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite"))
+        self.model = model or get_default_model()
         self.logger = logging.getLogger(__name__)
         self._setup_logging()
-        if _use_azure:
-            if not os.getenv("AZURE_OPENAI_ENDPOINT") or not (os.getenv("AZURE_OPENAI_API_KEY") or os.getenv("AZURE_OPENAI_KEY") or os.getenv("OPENAI_API_KEY")):
-                raise ValueError("USE_AZURE_OPENAI is set; AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_API_KEY (or AZURE_OPENAI_KEY) must be set in .env")
-            if not os.getenv("AZURE_OPENAI_DEPLOYMENT") and not os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME") and not os.getenv("OPENAI_DEPLOYMENT_NAME"):
-                raise ValueError("USE_AZURE_OPENAI is set; AZURE_OPENAI_DEPLOYMENT or AZURE_OPENAI_DEPLOYMENT_NAME must be set in .env")
-        else:
-            if not os.getenv("GEMINI_API_KEY") and not os.getenv("GOOGLE_API_KEY"):
-                raise ValueError("GEMINI_API_KEY must be set in .env (https://aistudio.google.com/app/apikey)")
+        validate_llm_environment()
         self.logger.info(f"ObligationQuerySystem: output={self.local_output_folder}, model={self.model}")
     
     def _setup_logging(self):

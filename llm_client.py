@@ -31,6 +31,52 @@ def get_default_model() -> str:
     return os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
 
 
+def validate_llm_environment() -> None:
+    """
+    Raise ValueError if required credentials for the active llm_client routing are missing.
+    Matches generate_content: LiteLLM (LITELLM_MODEL) first, else Azure, else Gemini.
+    """
+    _litellm = (os.getenv("LITELLM_MODEL") or "").strip()
+    _use_azure = _use_azure_openai()
+    if _litellm:
+        lm = _litellm.lower()
+        if lm.startswith("bedrock/"):
+            region = (os.getenv("AWS_REGION_NAME") or os.getenv("AWS_REGION") or "").strip()
+            if not region:
+                raise ValueError(
+                    "LITELLM_MODEL is Bedrock (bedrock/...); set AWS_REGION or AWS_REGION_NAME in .env. "
+                    "Ensure AWS credentials can call bedrock:InvokeModel (fix SSM/init_llm_env IAM or use static keys / profile)."
+                )
+        elif lm.startswith("azure/"):
+            if not os.getenv("AZURE_OPENAI_ENDPOINT") or not (
+                os.getenv("AZURE_OPENAI_API_KEY") or os.getenv("AZURE_OPENAI_KEY") or os.getenv("OPENAI_API_KEY")
+            ):
+                raise ValueError(
+                    "LITELLM_MODEL is azure/...; set AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_API_KEY (or AZURE_OPENAI_KEY) in .env"
+                )
+        elif lm.startswith("gemini/") or lm.startswith("vertex_ai/"):
+            if not os.getenv("GEMINI_API_KEY") and not os.getenv("GOOGLE_API_KEY"):
+                raise ValueError(
+                    "LITELLM_MODEL is Gemini/Vertex; set GEMINI_API_KEY or GOOGLE_API_KEY in .env (https://aistudio.google.com/app/apikey)"
+                )
+    elif _use_azure:
+        if not os.getenv("AZURE_OPENAI_ENDPOINT") or not (
+            os.getenv("AZURE_OPENAI_API_KEY") or os.getenv("AZURE_OPENAI_KEY") or os.getenv("OPENAI_API_KEY")
+        ):
+            raise ValueError(
+                "USE_AZURE_OPENAI is set; AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_API_KEY (or AZURE_OPENAI_KEY) must be set in .env"
+            )
+        if not os.getenv("AZURE_OPENAI_DEPLOYMENT") and not os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME") and not os.getenv(
+            "OPENAI_DEPLOYMENT_NAME"
+        ):
+            raise ValueError(
+                "USE_AZURE_OPENAI is set; AZURE_OPENAI_DEPLOYMENT or AZURE_OPENAI_DEPLOYMENT_NAME must be set in .env"
+            )
+    else:
+        if not os.getenv("GEMINI_API_KEY") and not os.getenv("GOOGLE_API_KEY"):
+            raise ValueError("GEMINI_API_KEY must be set in .env (https://aistudio.google.com/app/apikey)")
+
+
 def generate_content(
     prompt: str,
     *,

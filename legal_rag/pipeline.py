@@ -15,6 +15,19 @@ from legal_rag.retrieval import RetrievedBlock, assemble_chat_context
 from legal_rag.router import RouteResult, route_chat_query
 
 
+def _format_chat_answer(text: str) -> str:
+    """Normalize line endings; keep paragraph/list structure for readable multi-line answers."""
+    s = (text or "").strip()
+    if not s:
+        return s
+    s = s.replace("\r\n", "\n").replace("\r", "\n")
+    # Strip accidental JSON-style escapes if the model emitted them literally
+    s = s.replace('\\"', '"')
+    while "\n\n\n" in s:
+        s = s.replace("\n\n\n", "\n\n")
+    return s.strip()
+
+
 def run_chat_retrieval(
     user_message: str,
     *,
@@ -89,7 +102,7 @@ async def run_chat_turn(
     )
 
     return {
-        "answer": (resp.text or "").strip(),
+        "answer": _format_chat_answer(resp.text or ""),
         "route": {
             "record_type_filter": route.record_type_filter,
             "tool_name": route.tool_name,

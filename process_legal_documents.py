@@ -21,19 +21,27 @@ from pdf2image import convert_from_path
 from PIL import Image
 import pytesseract
 
-# LLM API (Azure OpenAI or Gemini via llm_client)
-from llm_client import generate_content as llm_generate_content, get_default_model
+# LLM API (LiteLLM / Azure OpenAI / Gemini via llm_client)
+from llm_client import generate_content as llm_generate_content, get_default_model, validate_llm_environment
 
 # Environment Variables
 from dotenv import load_dotenv
 load_dotenv()
 
 # Load LLM config from AWS Parameter Store if LLM_PARAMETER_PATH is set (e.g. Claude)
+_proc_logger = logging.getLogger(__name__)
 try:
     from aws_parameter_loader import init_llm_env
     init_llm_env()
 except Exception:
     pass
+
+# Same as query_system: if AssumeRole/SSM failed but LLM_MODEL is bedrock/..., propagate to LITELLM_MODEL
+if not os.getenv("LITELLM_MODEL") and os.getenv("LLM_MODEL"):
+    _lm = (os.getenv("LLM_MODEL") or "").strip()
+    if _lm:
+        os.environ["LITELLM_MODEL"] = _lm
+        _proc_logger.info("Fallback: LITELLM_MODEL set from LLM_MODEL=%s", _lm)
 
 
 def _obligation_pages_for_rag(consolidated_results: List[Dict[str, Any]]) -> List[int]:
@@ -746,16 +754,8 @@ class GeminiAnalyzer:
         
         # Initialize party metadata tracking
         self.party_metadata = {}
-        _use_azure = os.getenv("USE_AZURE_OPENAI", "").lower() in ("true", "1", "yes")
-        if _use_azure:
-            if not os.getenv("AZURE_OPENAI_ENDPOINT") or not (os.getenv("AZURE_OPENAI_API_KEY") or os.getenv("AZURE_OPENAI_KEY") or os.getenv("OPENAI_API_KEY")):
-                raise ValueError("USE_AZURE_OPENAI is set; AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_API_KEY (or AZURE_OPENAI_KEY) must be set in .env")
-            if not os.getenv("AZURE_OPENAI_DEPLOYMENT") and not os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME") and not os.getenv("OPENAI_DEPLOYMENT_NAME"):
-                raise ValueError("USE_AZURE_OPENAI is set; AZURE_OPENAI_DEPLOYMENT or AZURE_OPENAI_DEPLOYMENT_NAME must be set in .env")
-        else:
-            if not os.getenv('GEMINI_API_KEY') and not os.getenv('GOOGLE_API_KEY'):
-                raise ValueError("GEMINI_API_KEY must be set in .env (Gemini API key from https://aistudio.google.com/app/apikey)")
-        self.logger.info("LLM client (Azure OpenAI or Gemini) ready")
+        validate_llm_environment()
+        self.logger.info("LLM client ready (routing: LITELLM_MODEL / Azure / Gemini per llm_client)")
     
     def reset_party_metadata(self):
         """
@@ -1140,7 +1140,7 @@ Output the consolidated JSON array only:"""
 
 
 class LegalDocumentProcessor:
-    """Legal document processing: local docs folder -> output folder. Uses Azure OpenAI or Gemini via llm_client."""
+    """Legal document processing: local docs folder -> output folder. Uses llm_client (LiteLLM / Azure / Gemini)."""
 
     def __init__(self,
                  local_docs_folder: Optional[str] = None,
@@ -1151,7 +1151,7 @@ class LegalDocumentProcessor:
                  model: str = "gemini-2.5-flash-lite",
                  tesseract_cmd: Optional[str] = None,
                  poppler_path: Optional[str] = None):
-        """Initialize with local docs and output folders. Requires GEMINI_API_KEY or (when USE_AZURE_OPENAI) Azure env vars in .env."""
+        """Initialize with local docs and output folders. Credentials: see validate_llm_environment / .env (LITELLM_MODEL, Azure, or Gemini)."""
         self.logs_folder = Path(logs_folder)
         self.cache_folder = Path(cache_folder)
         self.logs_folder.mkdir(exist_ok=True)
