@@ -11,7 +11,7 @@ import logging
 import re
 import time
 from pathlib import Path
-from typing import AsyncIterator, List, Dict, Any, Optional
+from typing import AsyncIterator, List, Dict, Any, Optional, Tuple
 from datetime import datetime
 from urllib.parse import unquote, urlparse
 
@@ -168,10 +168,282 @@ def citation_string_to_structured(citation: Any) -> List[Dict[str, Any]]:
     return merge_structured_citations_by_doc_id([one]) if one else []
 
 
-def convert_result_citations_to_structured(final_result: Dict[str, Any]) -> None:
-    """In-place: convert each result's Citation to structured format [{ docId, pageNumbers, section }]."""
-    for ob in final_result.get("results", []):
+def _ensure_obligation_category_fields(ob: Dict[str, Any]) -> None:
+    """Ensure API-facing obligation dicts include string category (subcategory is not exposed)."""
+    if not isinstance(ob, dict):
+        return
+    c = ob.get("category")
+    ob["category"] = "" if c is None else str(c).strip()
+    ob.pop("subcategory", None)
+
+
+def strip_subcategory_from_api_results(results: Optional[List[Dict[str, Any]]]) -> None:
+    """Remove subcategory from each result row (smaller payloads; not used by clients)."""
+    if not results:
+        return
+    for ob in results:
+        if isinstance(ob, dict):
+            ob.pop("subcategory", None)
+
+
+def backfill_obligation_categories_from_filter_sources(
+    results: List[Dict[str, Any]],
+    filtered_results: Optional[List[Dict[str, Any]]],
+) -> None:
+    """
+    Copy category from pre-merge consolidated rows when the merge LLM omitted it.
+    Matches on DutyType + Responsible Party; prefers the document named in the first Citation docId.
+    """
+    if not results or not filtered_results:
+        return
+
+    def _norm(x: Any) -> str:
+        return str(x or "").strip().lower()
+
+    index: List[Tuple[str, Dict[str, Any]]] = []
+    for fr in filtered_results:
+        if not isinstance(fr, dict):
+            continue
+        dname = str(fr.get("document_name") or "").strip()
+        for ob in fr.get("consolidated_results") or []:
+            if isinstance(ob, dict):
+                index.append((dname, ob))
+
+    def _doc_match(cit_doc: str, fr_doc: str) -> bool:
+        if not cit_doc or not fr_doc:
+            return True
+        a, b = _norm(cit_doc), _norm(fr_doc)
+        if a == b:
+            return True
+        an, bn = Path(cit_doc).name.lower(), Path(fr_doc).name.lower()
+        if an == bn:
+            return True
+        return a in b or b in a or an in b or bn in a
+
+    for r in results:
+        if not isinstance(r, dict):
+            continue
+        need_cat = not str(r.get("category") or "").strip()
+        if not need_cat:
+            continue
+        dt, party = _norm(r.get("DutyType")), _norm(r.get("Responsible Party"))
+        candidates = [
+            (dn, ob) for dn, ob in index
+            if _norm(ob.get("DutyType")) == dt and _norm(ob.get("Responsible Party")) == party
+        ]
+        if not candidates:
+            continue
+        cit = r.get("Citation")
+        doc_hint = ""
+        if isinstance(cit, list) and cit and isinstance(cit[0], dict):
+            doc_hint = str(cit[0].get("docId") or "")
+        elif isinstance(cit, str) and "Document:" in cit:
+            part = cit.split("Document:", 1)[1].split("|", 1)[0].strip()
+            doc_hint = part
+        chosen = None
+        if doc_hint:
+            for dn, ob in candidates:
+                if _doc_match(doc_hint, dn):
+                    chosen = ob
+                    break
+        if chosen is None:
+            chosen = candidates[0][1]
+        if need_cat:
+            c = chosen.get("category")
+            if c is not None and str(c).strip():
+                r["category"] = str(c).strip()
+
+
+def convert_result_citations_to_structured(
+    final_result: Dict[str, Any],
+    filtered_results: Optional[List[Dict[str, Any]]] = None,
+) -> None:
+    """In-place: structured Citation, category backfill, strip subcategory from API shape."""
+    res = final_result.get("results")
+    if not isinstance(res, list):
+        return
+    for ob in res:
+        if not isinstance(ob, dict):
+            continue
         ob["Citation"] = citation_string_to_structured(ob.get("Citation"))
+    backfill_obligation_categories_from_filter_sources(res, filtered_results)
+    for ob in res:
+        if isinstance(ob, dict):
+            _ensure_obligation_category_fields(ob)
+    strip_subcategory_from_api_results(res)
+
+
+def _merge_max_input_obligations() -> int:
+    raw = os.getenv("MERGE_MAX_INPUT_OBLIGATIONS", "24").strip()
+    try:
+        n = int(raw)
+        return max(1, min(n, 200))
+    except ValueError:
+        return 24
+
+
+def _merge_rank_max_output_tokens() -> Optional[int]:
+    raw = os.getenv("MERGE_RANK_MAX_OUTPUT_TOKENS", "").strip()
+    if not raw:
+        # Lower default = faster generations; raise via env if merge JSON gets truncated.
+        return 12288
+    try:
+        return max(1024, int(raw))
+    except ValueError:
+        return 12288
+
+
+def _count_obligations_in_filtered(filtered_results: List[Dict[str, Any]]) -> int:
+    return sum(len(r.get("consolidated_results") or []) for r in filtered_results if isinstance(r, dict))
+
+
+def cap_merge_filtered_results(
+    filtered_results: List[Dict[str, Any]],
+    max_total: int,
+) -> tuple:
+    """
+    Return (possibly truncated copy of filtered_results, original_count).
+    Preserves document buckets; trims consolidated_results in order until max_total obligations.
+    """
+    orig = _count_obligations_in_filtered(filtered_results)
+    if max_total <= 0 or orig <= max_total:
+        return filtered_results, orig
+    out: List[Dict[str, Any]] = []
+    n = 0
+    for fr in filtered_results:
+        if not isinstance(fr, dict):
+            continue
+        crs = list(fr.get("consolidated_results") or [])
+        if n >= max_total:
+            out.append({**fr, "consolidated_results": []})
+            continue
+        take = crs[: max_total - n]
+        n += len(take)
+        out.append({**fr, "consolidated_results": take})
+    return out, orig
+
+
+def parse_llm_json_object(raw: str) -> Dict[str, Any]:
+    """
+    Parse JSON from merge/rank (and similar) LLM output: fences, trailing commas, optional json-repair.
+    """
+    text = (raw or "").strip()
+    if text.startswith("```json"):
+        text = text[7:]
+    elif text.startswith("```"):
+        text = text[3:]
+    if text.endswith("```"):
+        text = text[:-3]
+    text = text.strip()
+
+    def _loads(s: str) -> Dict[str, Any]:
+        obj = json.loads(s)
+        if not isinstance(obj, dict):
+            raise ValueError("LLM JSON root must be an object")
+        return obj
+
+    last_err: Optional[BaseException] = None
+    for candidate in (text, re.sub(r",(\s*[\]\}])", r"\1", text)):
+        try:
+            return _loads(candidate)
+        except json.JSONDecodeError as e:
+            last_err = e
+            continue
+    try:
+        from json_repair import repair_json
+
+        repaired = repair_json(text)
+        if not isinstance(repaired, str):
+            repaired = str(repaired)
+        return _loads(repaired)
+    except ImportError:
+        pass
+    except Exception as e:
+        last_err = e
+    i, j = text.find("{"), text.rfind("}")
+    if i >= 0 and j > i:
+        inner = text[i : j + 1]
+        for candidate in (inner, re.sub(r",(\s*[\]\}])", r"\1", inner)):
+            try:
+                return _loads(candidate)
+            except json.JSONDecodeError as e:
+                last_err = e
+    msg = f"invalid LLM JSON ({last_err})" if last_err else "invalid LLM JSON"
+    raise ValueError(msg)
+
+
+_MERGE_PROMPT_DROP_KEYS = frozenset({"related_keywords", "subcategory"})
+
+
+def merge_prompt_filtered_snapshot(filtered_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Smaller merge prompt: omit related_keywords and subcategory from embedded JSON."""
+    out: List[Dict[str, Any]] = []
+    for fr in filtered_results:
+        if not isinstance(fr, dict):
+            continue
+        base = {k: v for k, v in fr.items() if k != "consolidated_results"}
+        crs = fr.get("consolidated_results") or []
+        slim: List[Dict[str, Any]] = []
+        for ob in crs:
+            if isinstance(ob, dict):
+                slim.append({k: v for k, v in ob.items() if k not in _MERGE_PROMPT_DROP_KEYS})
+        out.append({**base, "consolidated_results": slim})
+    return out
+
+
+def _merge_docs_with_obligations_count(merge_in: List[Dict[str, Any]]) -> int:
+    return sum(1 for r in merge_in if r.get("consolidated_results"))
+
+
+def build_rank_response_without_llm_merge(
+    user_query: str,
+    filtered_results: List[Dict[str, Any]],
+    *,
+    documents_searched_count: Optional[int] = None,
+    merge_fallback: bool = False,
+) -> Dict[str, Any]:
+    """Assemble ranked-shaped response without calling the merge LLM (single-doc fast path or parse fallback)."""
+    rows: List[Dict[str, Any]] = []
+    for fr in filtered_results:
+        if not isinstance(fr, dict):
+            continue
+        doc_name = (fr.get("document_name") or "").strip()
+        for ob in fr.get("consolidated_results") or []:
+            if not isinstance(ob, dict):
+                continue
+            row = json.loads(json.dumps(ob))
+            cit = row.get("Citation")
+            if isinstance(cit, str) and doc_name and "Document:" not in cit:
+                row["Citation"] = f"Document: {doc_name} | {cit}"
+            rows.append(row)
+    doc_count = documents_searched_count if documents_searched_count is not None else len(filtered_results)
+    out: Dict[str, Any] = {
+        "query": user_query,
+        "total_documents_searched": doc_count,
+        "total_obligations_found": len(rows),
+        "results": rows,
+        "processed_at": datetime.now().isoformat(),
+    }
+    if merge_fallback:
+        out["merge_fallback"] = True
+        out["merge_note"] = "Merge LLM output was invalid or truncated; returned unmerged retrieval results."
+    convert_result_citations_to_structured(out, filtered_results)
+    return out
+
+
+def merge_rank_fallback_payload(
+    user_query: str,
+    filtered_results: List[Dict[str, Any]],
+    *,
+    documents_searched_count: Optional[int] = None,
+) -> Dict[str, Any]:
+    """If merge LLM fails, return unmerged obligations (still structured citations + category)."""
+    return build_rank_response_without_llm_merge(
+        user_query,
+        filtered_results,
+        documents_searched_count=documents_searched_count,
+        merge_fallback=True,
+    )
 
 
 def deduplicate_and_merge_citations(obligations: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -359,10 +631,22 @@ class ObligationQuerySystem:
         """Call configured LLM (Azure OpenAI or Gemini) via llm_client."""
         return llm_generate_content(prompt, model=self.model, temperature=temperature, response_mime_type=response_mime_type)
     
-    async def _generate_content_async(self, prompt: str, temperature: float = 0.1, response_mime_type: str = "application/json"):
-        """Async wrapper for LLM API calls (Azure OpenAI or Gemini)."""
+    async def _generate_content_async(
+        self,
+        prompt: str,
+        temperature: float = 0.1,
+        response_mime_type: str = "application/json",
+        max_output_tokens: Optional[int] = None,
+    ):
+        """Async wrapper for LLM API calls (Azure OpenAI, Bedrock, or Gemini)."""
         from llm_client import generate_content_async
-        return await generate_content_async(prompt, model=self.model, temperature=temperature, response_mime_type=response_mime_type)
+        return await generate_content_async(
+            prompt,
+            model=self.model,
+            temperature=temperature,
+            response_mime_type=response_mime_type,
+            max_output_tokens=max_output_tokens,
+        )
     
     def load_consolidated_jsons(self) -> List[Dict[str, Any]]:
         """Load *_consolidated.json first, then *_consolidated.md, then *_pagewise.json. Prefers JSON.
@@ -478,6 +762,33 @@ class ObligationQuerySystem:
                 reasoning = [reasoning_str]
         return {"Owner Responsibility": owner_resp, "Reasoning": reasoning}
 
+    @staticmethod
+    def _document_id_allowset(document_ids: Optional[List[str]]) -> Optional[set]:
+        """Normalized filename / basename keys for document_ids filter; None means no filter."""
+        if not document_ids:
+            return None
+        normalized_allowed = set()
+        for doc_id in document_ids:
+            d = (doc_id or "").strip()
+            if not d:
+                continue
+            name = Path(d).name or d
+            normalized_allowed.add(name.lower().strip())
+            base = name.rsplit(".", 1)[0] if "." in name else name
+            if base:
+                normalized_allowed.add(base.lower())
+        return normalized_allowed
+
+    @staticmethod
+    def _doc_matches_allowset(doc_name: str, allowed: Optional[set]) -> bool:
+        if allowed is None:
+            return True
+        if not allowed:
+            return False
+        doc_norm = doc_name.lower().strip()
+        doc_base = doc_norm.rsplit(".", 1)[0] if "." in doc_norm else doc_norm
+        return doc_norm in allowed or doc_base in allowed
+
     def _query_vector_store(
         self,
         user_query: str,
@@ -485,30 +796,29 @@ class ObligationQuerySystem:
         document_ids: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
         """
-        Query ChromaDB by semantic similarity; only results with distance <= VECTOR_MAX_DISTANCE.
-        Auto-detects party in query (tenant/landlord) and filters by Responsible_Party metadata.
-        Returns the top n_results most similar obligation chunks; full obligations
-        are resolved from consolidated JSON (document_name + chunk_index).
-        Returns list of obligation dicts (DutyType, Responsible Party, Owner Responsibility, Reasoning, Citation)
-        with Citation prefixed by "Document: {document_name} | ".
+        Primary retrieval: embed the user query and run semantic search in Chroma against each
+        obligation's embedded related_keywords (see vector_store.obligation_to_keyword_chunk_text).
+        Hits with distance <= VECTOR_MAX_DISTANCE; optional Responsible_Party filter when the query
+        mentions tenant/landlord. Resolves full rows from consolidated JSON (document_name +
+        chunk_index), then merge_and_rank (LLM). Returns [] if Chroma is missing, errors, or finds
+        no hits — the pipeline then uses per-document LLM filter + merge.
         """
+        query_lower = user_query.lower()
+        detected_party = None
+        if "tenant" in query_lower:
+            detected_party = "Tenant"
+            self.logger.info("Detected 'tenant' in query → filtering by Responsible_Party=Tenant")
+        elif "landlord" in query_lower:
+            detected_party = "Landlord"
+            self.logger.info("Detected 'landlord' in query → filtering by Responsible_Party=Landlord")
+
         try:
             from vector_store import query_obligations
             chroma_path = str(Path(self.local_output_folder) / "chroma_db")
             if not Path(chroma_path).exists():
-                self.logger.info("Vector store path does not exist; skipping vector query")
+                self.logger.info("Vector store path does not exist; skipping semantic retrieval (index after processing)")
                 return []
-            
-            # Auto-detect party in query for filtering
-            query_lower = user_query.lower()
-            detected_party = None
-            if "tenant" in query_lower:
-                detected_party = "Tenant"
-                self.logger.info("Detected 'tenant' in query → filtering by Responsible_Party=Tenant")
-            elif "landlord" in query_lower:
-                detected_party = "Landlord"
-                self.logger.info("Detected 'landlord' in query → filtering by Responsible_Party=Landlord")
-            
+
             # Distance threshold: only results with distance <= VECTOR_MAX_DISTANCE (default 1.4)
             max_dist_str = os.getenv("VECTOR_MAX_DISTANCE", "1.4").strip()
             try:
@@ -524,27 +834,20 @@ class ObligationQuerySystem:
                 max_distance=max_distance,
                 responsible_party=detected_party,
             )
-            if not raw:
-                return []
-            if document_ids:
-                normalized_allowed = set()
-                for doc_id in document_ids:
-                    d = (doc_id or "").strip()
-                    if not d:
-                        continue
-                    name = Path(d).name or d
-                    normalized_allowed.add(name.lower().strip())
-                    base = name.rsplit(".", 1)[0] if "." in name else name
-                    if base:
-                        normalized_allowed.add(base.lower())
+            allowed = self._document_id_allowset(document_ids)
+            if document_ids and allowed is not None:
                 filtered = []
                 for r in raw:
                     doc_name = (r.get("document_name") or "").strip()
-                    doc_norm = doc_name.lower()
-                    doc_base = doc_norm.rsplit(".", 1)[0] if "." in doc_norm else doc_norm
-                    if doc_norm in normalized_allowed or doc_base in normalized_allowed:
+                    if self._doc_matches_allowset(doc_name, allowed):
                         filtered.append(r)
                 raw = filtered
+            if not raw:
+                self.logger.info(
+                    "Vector store returned no obligations (re-index output/chroma_db after processing, "
+                    "or relax VECTOR_MAX_DISTANCE)."
+                )
+                return []
             # Load consolidated JSONs to resolve full obligation by document_name + chunk_index
             loaded = self.load_consolidated_jsons()
             doc_to_results: Dict[str, List[Dict[str, Any]]] = {}
@@ -556,6 +859,8 @@ class ObligationQuerySystem:
                     doc_to_results[doc_name] = results
             obligations = []
             for r in raw:
+                if len(obligations) >= n_results:
+                    break
                 doc_name = (r.get("document_name") or "").strip()
                 try:
                     idx = int(r.get("chunk_index") or 0)
@@ -569,12 +874,14 @@ class ObligationQuerySystem:
                         citation = "; ".join(str(c) for c in citation)
                     if doc_name:
                         citation = f"Document: {doc_name} | {citation}"
+                    cat = full_ob.get("category")
                     obligations.append({
                         "DutyType": full_ob.get("DutyType") or "",
                         "Responsible Party": full_ob.get("Responsible Party") or "",
                         "Owner Responsibility": full_ob.get("Owner Responsibility") if isinstance(full_ob.get("Owner Responsibility"), list) else [str(full_ob.get("Owner Responsibility") or "")],
                         "Reasoning": full_ob.get("Reasoning") if isinstance(full_ob.get("Reasoning"), list) else [str(full_ob.get("Reasoning") or "")],
                         "Citation": citation,
+                        "category": "" if cat is None else str(cat).strip(),
                     })
                 else:
                     # Fallback: build from metadata when consolidated lookup fails
@@ -587,10 +894,11 @@ class ObligationQuerySystem:
                         "Owner Responsibility": [r.get("document") or ""] if r.get("document") else [],
                         "Reasoning": [],
                         "Citation": citation,
+                        "category": "",
                     })
             return obligations
         except Exception as e:
-            self.logger.warning(f"Vector store query failed, will use JSON path: {e}")
+            self.logger.warning(f"Vector store query failed; pipeline will use LLM filter if needed: {e}")
             return []
 
     async def filter_obligations_by_query(self, user_query: str, consolidated_data: Dict[str, Any],
@@ -685,7 +993,7 @@ CRITICAL GUARDRAILS:
 - Use the EXACT same JSON structure as provided - do not modify, add, or remove any fields
 - Do not alter the content of any obligation - return them exactly as given
 - If NO obligations are relevant to the query, return an empty array: {{"consolidated_results": []}}
-- Preserve all fields: "DutyType", "Responsible Party", "Owner Responsibility", "Reasoning", "Citation"
+- Preserve all fields from each source obligation when copying into consolidated_results (including category)
 - Do not add commentary, explanations, or any text outside the JSON structure
 - Output ONLY valid JSON
 - Be inclusive rather than exclusive - if unsure, include the obligation (better to have false positives than miss relevant obligations)
@@ -842,36 +1150,28 @@ Output the filtered JSON:"""
     def _build_merge_rank_prompt(self, user_query: str, filtered_results: List[Dict[str, Any]]) -> str:
         """Build the merge-and-rank LLM prompt. Shared by /query, /query/stream, and /query/stream/raw so results are consistent."""
         non_empty_results = [r for r in filtered_results if r.get("consolidated_results")]
+        prompt_payload = merge_prompt_filtered_snapshot(non_empty_results)
         return f"""You are a legal document analyst. You have been provided with filtered financial obligations from multiple legal documents, all relevant to a user's query.
 
-FILTERING (apply before merging): Include only obligations clearly related to the user's query. The most similar obligations to the query MUST be included in the result set — never exclude them. If the full query word appears exactly in an obligation's related_keywords, always include that obligation. Include obligations that are semantically similar to the query. Exclude only vaguely or tangentially related obligations. When the query has clear legal meaning and the connection is ambiguous but plausible, include; if the query is nonsensical, gibberish, or off-topic, return results: [] (zero obligations).
+RETRIEVAL CONTEXT: Obligations were retrieved via vector similarity on keywords (and/or per-document filter). Prefer keeping these candidates; exclude from the final JSON only obligations clearly unrelated to the query.
 
-Your task is to merge these results into a single JSON and order them by:
-1. SIMILARITY TO THE USER QUERY: The most similar obligations to the user query MUST appear in the result set and MUST be ranked first (highest similarity at the top). Do not omit highly similar obligations; include them and place them at the top.
-2. RELEVANCE: Then by overall relevance to the query.
-3. MONETARY VALUE: Then by highest amounts first.
+FILTERING: Include only obligations clearly related to the query; the most similar MUST appear and be ranked first. Off-topic queries: return results: [].
 
-MERGE SIMILAR OBLIGATIONS FROM DIFFERENT DOCUMENTS (STRICTLY FOLLOW):
-- Merge two or more obligations from different documents into ONE row ONLY if they are semantically similar: same or equivalent meaning (e.g. same duty in substance, same responsible party, and equivalent scope or obligation). Do NOT merge based only on same DutyType and Responsible Party if the actual obligation (Owner Responsibility, scope, or meaning) differs.
-- If obligations are only superficially similar (e.g. same duty type but different scope, amount, or condition), keep them as separate rows. When in doubt, do not merge.
-- For each group of semantically similar obligations (from one or more documents), output exactly ONE row. In the "Citation" field you MUST list every source document that contributed to that obligation. Use this format with " ; " (space-semicolon-space) between documents: "Document: [filename1] | [citation1] ; Document: [filename2] | [citation2]". Include every document; never omit any.
-- When you merge two or more such obligations, combine "Owner Responsibility" and "Reasoning" from every contributing obligation efficiently: pull only material, non-redundant information from each source row in the consolidated JSON; drop near-duplicate lines; keep distinct facts, amounts, conditions, or scope from each document so the merged row still reflects what each document said. Prefer short bullet-style strings in those arrays over pasting duplicate prose.
-- If an obligation appears in only one document, output one row with one document in Citation.
-- Result: one row per distinct obligation; when semantically the same obligation appears in multiple documents, that single row MUST have Citation listing all of those documents. This is mandatory.
+Order the final "results" array by: (1) similarity to the query, (2) relevance, (3) monetary value (highest first).
 
-CRITICAL INSTRUCTIONS:
-1. Combine all obligations from all documents into a single array. Merge into one row ONLY when obligations are semantically similar (see above). For each merged row, Citation MUST list every source document; strictly include all documents.
-2. Order by similarity to the user query first (most similar obligations at the top and included in the result set), then by relevance, then by monetary value (highest amounts first).
-3. For rows you do not merge (single-document or kept separate), preserve "Owner Responsibility", "Reasoning", and other fields exactly as given. For rows merged across documents per the rules above, intelligently combine "Owner Responsibility" and "Reasoning" from each contributing obligation as described — do not discard unique substance from any source document.
-4. Citation: Every obligation must have "Citation" with the source document filename. For one document: "Document: [filename] | [original citation]". For merged (semantically similar) obligations from multiple documents: "Document: [file1] | [citation1] ; Document: [file2] | [citation2]" — you MUST include every source document; do not omit any. Strictly follow. Example: "Document: Commercial Lease Agreement - Buyer Triple Net.pdf | Page 2, Section 'Rent' ; Document: MTNNN.pdf | Page 3, Section 'RENT'".
-5. Keep all fields: "DutyType", "Responsible Party", "Owner Responsibility", "Reasoning", "Citation"
-6. Do not add, remove, or modify any other fields
-7. Output ONLY valid JSON, no commentary
+MERGE ACROSS DOCUMENTS ONLY WHEN: same duty in substance, same Responsible Party, equivalent scope, AND identical `category` string. If category differs or is missing on any candidate, do NOT merge across documents. When in doubt, separate rows. Each merged row's Citation must list every source: "Document: [file1] | [cit1] ; Document: [file2] | [cit2]".
+
+When merging, combine Owner Responsibility and Reasoning compactly (dedupe near-duplicates; keep distinct facts). Set `category` to the shared value for cross-doc merges.
+
+CRITICAL:
+1. Each result object MUST have exactly these keys: "DutyType", "Responsible Party", "Owner Responsibility", "Reasoning", "Citation", "category". Use string "category" ("" if unknown). Do NOT include "subcategory".
+2. Citation string format as above for single or merged sources.
+3. Valid JSON only; escape quotes inside strings; no trailing commas.
 
 User Query: "{user_query}"
 
 Filtered results from multiple documents:
-{json.dumps(non_empty_results, indent=2)}
+{json.dumps(prompt_payload, indent=2)}
 
 Return a JSON object with this structure:
 {{
@@ -879,7 +1179,7 @@ Return a JSON object with this structure:
   "total_documents_searched": {len(filtered_results)},
   "total_obligations_found": <count of obligations>,
   "results": [
-    // One row per obligation. Merged cross-doc rows: combined Owner Responsibility + Reasoning from each source (deduped, material facts only); Citation lists every document with " ; ". Order: similarity to query, relevance, monetary value.
+    // One row per obligation: DutyType, Responsible Party, Owner Responsibility, Reasoning, Citation (string), category only.
   ]
 }}
 
@@ -905,8 +1205,39 @@ Output the merged and ranked JSON:"""
                     }
                 }
                 return
-            
-            merge_prompt = self._build_merge_rank_prompt(user_query, filtered_results)
+
+            merge_in, merge_orig = cap_merge_filtered_results(non_empty_results, _merge_max_input_obligations())
+            if merge_orig > _count_obligations_in_filtered(merge_in):
+                self.logger.info(
+                    "[STREAM] Merge input capped: %d -> %d obligations",
+                    merge_orig,
+                    _count_obligations_in_filtered(merge_in),
+                )
+
+            if _merge_docs_with_obligations_count(merge_in) <= 1:
+                self.logger.info("[STREAM] Single-document fast path (skip merge LLM)")
+                assembled = build_rank_response_without_llm_merge(
+                    user_query,
+                    merge_in,
+                    documents_searched_count=len(filtered_results),
+                    merge_fallback=False,
+                )
+                obligation_count = 0
+                for ob in assembled.get("results", []):
+                    obligation_count += 1
+                    yield {"type": "obligation", "data": ob}
+                yield {
+                    "type": "metadata",
+                    "data": {
+                        "query": user_query,
+                        "total_documents_searched": len(filtered_results),
+                        "total_obligations_found": obligation_count,
+                        "processed_at": datetime.now().isoformat(),
+                    },
+                }
+                return
+
+            merge_prompt = self._build_merge_rank_prompt(user_query, merge_in)
             self.logger.info("[STREAM] Merge/rank LLM call - streaming response from LLM")
             from streaming_json_parser import parse_obligations_stream
 
@@ -915,11 +1246,15 @@ Output the merged and ranked JSON:"""
                 model=self.model,
                 temperature=0.1,
                 response_mime_type="application/json",
+                max_output_tokens=_merge_rank_max_output_tokens(),
             )
             # Parse the streamed JSON and yield each obligation; same result as merge/rank, streamed to client.
             obligation_count = 0
             async for obligation in parse_obligations_stream(token_stream):
                 obligation["Citation"] = citation_string_to_structured(obligation.get("Citation"))
+                backfill_obligation_categories_from_filter_sources([obligation], merge_in)
+                _ensure_obligation_category_fields(obligation)
+                strip_subcategory_from_api_results([obligation])
                 obligation_count += 1
                 yield {
                     "type": "obligation",
@@ -976,10 +1311,32 @@ Output the merged and ranked JSON:"""
                     "results": [],
                     "processed_at": datetime.now().isoformat(),
                 }
+
+            merge_in, merge_orig = cap_merge_filtered_results(non_empty_results, _merge_max_input_obligations())
+            if merge_orig > _count_obligations_in_filtered(merge_in):
+                self.logger.info(
+                    "[TIMING] merge_and_rank: cap_merge_input %d -> %d obligations",
+                    merge_orig,
+                    _count_obligations_in_filtered(merge_in),
+                )
+
+            if _merge_docs_with_obligations_count(merge_in) <= 1:
+                self.logger.info("[TIMING] merge_and_rank: single-document fast path (skip merge LLM)")
+                final_result = build_rank_response_without_llm_merge(
+                    user_query,
+                    merge_in,
+                    documents_searched_count=len(filtered_results),
+                    merge_fallback=False,
+                )
+                elapsed = time.perf_counter() - t0
+                self.logger.info(
+                    f"[TIMING] merge_and_rank: total - {elapsed:.3f}s fast path ({final_result.get('total_obligations_found', 0)} obligations)"
+                )
+                return final_result
             
             # 2. Build full merge+rank+filter prompt (no code merge; LLM does filtering, merging, ranking)
             t_step = time.perf_counter()
-            merge_prompt = self._build_merge_rank_prompt(user_query, filtered_results)
+            merge_prompt = self._build_merge_rank_prompt(user_query, merge_in)
             self.logger.info(f"[TIMING] merge_and_rank: 2. build_prompt - {time.perf_counter() - t_step:.3f}s")
             self.logger.info(f"Merge and rank (LLM) for query: '{user_query}'")
             
@@ -988,32 +1345,39 @@ Output the merged and ranked JSON:"""
             response = await self._generate_content_async(
                 prompt=merge_prompt,
                 temperature=0.1,
-                response_mime_type="application/json"
+                response_mime_type="application/json",
+                max_output_tokens=_merge_rank_max_output_tokens(),
             )
             self.logger.info(f"[TIMING] merge_and_rank: 3. llm_api_call - {time.perf_counter() - t_step:.3f}s")
             
-            # 4. Parse JSON response (strip, strip markdown, json.loads)
+            # 4. Parse JSON (tolerant) or return unmerged fallback
             t_step = time.perf_counter()
             result_text = response.text.strip()
-            if result_text.startswith("```json"):
-                result_text = result_text[7:]
-            if result_text.startswith("```"):
-                result_text = result_text[3:]
-            if result_text.endswith("```"):
-                result_text = result_text[:-3]
-            result_text = result_text.strip()
-            final_result = json.loads(result_text)
+            try:
+                final_result = parse_llm_json_object(result_text)
+            except ValueError as e:
+                self.logger.warning(
+                    "merge/rank JSON parse failed (%s); using unmerged fallback. Response tail: %r",
+                    e,
+                    result_text[-500:],
+                )
+                final_result = merge_rank_fallback_payload(
+                    user_query,
+                    merge_in,
+                    documents_searched_count=len(filtered_results),
+                )
             self.logger.info(f"[TIMING] merge_and_rank: 4. parse_response - {time.perf_counter() - t_step:.3f}s")
             
             # 5. Convert citations to structured format (in case LLM returned string)
             t_step = time.perf_counter()
-            convert_result_citations_to_structured(final_result)
+            convert_result_citations_to_structured(final_result, merge_in)
             self.logger.info(f"[TIMING] merge_and_rank: 5. citation_to_structured - {time.perf_counter() - t_step:.3f}s")
             
             # 6. Fix count and finish
             t_step = time.perf_counter()
             num_results = len(final_result.get("results", []))
             final_result["total_obligations_found"] = num_results
+            final_result["total_documents_searched"] = len(filtered_results)
             self.logger.info(f"[TIMING] merge_and_rank: 6. fix_count - {time.perf_counter() - t_step:.3f}s")
             
             elapsed = time.perf_counter() - t0
@@ -1462,7 +1826,8 @@ class QueryResponse(BaseModel):
                                 "pageNumbers": [5, 22],
                                 "section": ["1d", "1b"]
                             }
-                        ]
+                        ],
+                        "category": "Financial_Payments"
                     }
                 ]
             }
@@ -1665,6 +2030,9 @@ async def query_obligations_stream_raw(request: Optional[QueryRequest] = Body(de
             _echo("[STEP 2] Filtering complete\n")
             yield "[STEP 2] Filtering complete\n"
             
+            non_empty_fr = [r for r in filtered_results if r.get("consolidated_results")]
+            merge_in, _ = cap_merge_filtered_results(non_empty_fr, _merge_max_input_obligations())
+            
             _echo("[STEP 3] Merging and ranking (streaming LLM tokens)...\n")
             yield "[STEP 3] Merging and ranking (streaming LLM tokens)...\n"
             _echo("="*80 + "\n")
@@ -1675,7 +2043,7 @@ async def query_obligations_stream_raw(request: Optional[QueryRequest] = Body(de
             yield "="*80 + "\n"
             
             # Same merge/rank prompt as /query and /query/stream so results are consistent
-            merge_prompt = qs._build_merge_rank_prompt(user_query, filtered_results)
+            merge_prompt = qs._build_merge_rank_prompt(user_query, merge_in)
             
             # Stream raw tokens (and echo to terminal so you see stream when using Postman)
             token_count = 0
@@ -1683,7 +2051,8 @@ async def query_obligations_stream_raw(request: Optional[QueryRequest] = Body(de
                 prompt=merge_prompt,
                 model=qs.model,
                 temperature=0.1,
-                response_mime_type="application/json"
+                response_mime_type="application/json",
+                max_output_tokens=_merge_rank_max_output_tokens(),
             ):
                 token_count += 1
                 sys.stdout.write(token)

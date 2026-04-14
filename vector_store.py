@@ -1,6 +1,8 @@
 """
 Vector store for legal obligation chunks using ChromaDB.
-Each obligation is one chunk: text is embedded and metadata (document_name, DutyType, Party, etc.) is stored for filtering.
+Primary retrieval surface: one chunk per obligation whose document text is related_keywords (joined),
+so the user query embedding is compared semantically to those keywords. Metadata holds document_name,
+DutyType, party, chunk_index for resolving full obligations from consolidated JSON.
 """
 
 import hashlib
@@ -60,15 +62,21 @@ def obligation_to_chunk_text(obligation: Dict[str, Any]) -> str:
 
 def obligation_to_keyword_chunk_text(obligation: Dict[str, Any]) -> str:
     """
-    Text used for embedding in Chroma: Responsible Party + related_keywords, so search by party
-    (e.g. "tenant") or topic both match. Fallback: party + DutyType + start of Owner Responsibility.
+    Text embedded in Chroma for semantic search.
+
+    When related_keywords is present: embed **only** those phrases (space-joined), so the query
+    embedding matches the same vocabulary as the obligation's search terms. Responsible Party is
+    not mixed into this text — use metadata filtering (e.g. query mentions Tenant/Landlord) in the
+    query path instead.
+
+    Fallback when related_keywords is missing: party + DutyType + start of Owner Responsibility.
     """
-    party = _flatten_field(obligation.get("Responsible Party")).strip()
     keywords = obligation.get("related_keywords")
     if isinstance(keywords, list) and keywords:
         keyword_str = " ".join(str(k).strip() for k in keywords if k).strip()
-        return (party + " " + keyword_str).strip() if (party or keyword_str) else "obligation"
-    # Fallback when related_keywords not present
+        if keyword_str:
+            return keyword_str
+    party = _flatten_field(obligation.get("Responsible Party")).strip()
     duty = _flatten_field(obligation.get("DutyType"))
     owner_resp = _flatten_field(obligation.get("Owner Responsibility"))[:200]
     base = (duty + " " + owner_resp).strip() or "obligation"
@@ -188,11 +196,14 @@ def index_obligations(
     collection_name: str = DEFAULT_COLLECTION_NAME,
 ) -> int:
     """
-    Convert each obligation into a chunk and add to ChromaDB.
+    Convert each obligation into a chunk and add to ChromaDB only (no Qdrant; chatbot RAG uses a separate store).
     Removes any existing chunks for this document first, then upserts the new set.
     Returns the number of chunks indexed.
     List order must match obligation_categories.flatten_obligations_from_category_buckets when the
     on-disk JSON is category-only (chunk_index resolution in the query path).
+
+    Chunk text is obligation_to_keyword_chunk_text (related_keywords only when present). Re-run
+    indexing after changing embedding strategy so Chroma matches consolidated JSON.
     """
     if not consolidated_results:
         logger.warning("No obligations to index")
@@ -276,6 +287,16 @@ def query_obligations(
                     "document": doc,
                 })
         return out
+    except KeyError as e:
+        if e.args and e.args[0] == "_type":
+            logger.error(
+                "ChromaDB cannot read this persistent store (metadata schema mismatch — often after upgrading "
+                "chromadb). Delete the folder (e.g. output/chroma_db) and re-run document processing to "
+                "re-index obligations, or install a chromadb version matching the DB."
+            )
+        else:
+            logger.error(f"Vector query error: {e}", exc_info=True)
+        return []
     except Exception as e:
         logger.error(f"Vector query error: {e}", exc_info=True)
         return []

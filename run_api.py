@@ -61,13 +61,14 @@ def main():
     print("=" * 80)
     print("\nPress CTRL+C to stop the server\n")
     
-    # Start the server
+    # Start the server (exclude chroma/output writes from reload so /process does not kill in-flight /query)
     uvicorn.run(
         "query_system:app",
         host=host,
         port=port,
         reload=reload,
-        log_level="info"
+        reload_excludes=["**/chroma_db/**", "**/output/*.sqlite3"],
+        log_level="info",
     )
 
 

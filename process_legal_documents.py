@@ -1370,8 +1370,9 @@ class LegalDocumentProcessor:
             with open(consolidated_json_path, "w", encoding="utf-8") as f:
                 json.dump(consolidated_data, f, indent=2, ensure_ascii=False)
             self.logger.info(f"Consolidated JSON saved to: {consolidated_json_path}")
-            # Vector store: one chunk per consolidated (deduplicated) obligation in ChromaDB
-            # index_obligations deletes this document's old chunks first, then re-indexes (no orphans)
+            # Obligation vectors: ChromaDB only (out_dir / "chroma_db"). Do not index these chunks into
+            # Qdrant or output/qdrant_rag — that store is reserved for the chatbot on another branch.
+            # index_obligations deletes this document's old Chroma chunks first, then re-indexes (no orphans).
             try:
                 from vector_store import index_obligations
                 chroma_path = str(out_dir / "chroma_db")
