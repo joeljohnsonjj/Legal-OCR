@@ -30,7 +30,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
 
 from api_security import (
-    LegalOCRSecurityMiddleware,
     http_safe_exception_detail,
     sanitize_chat_message,
     sanitize_query_text,
@@ -1612,9 +1611,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-# Optional API key + rate limits on /chat, /query*, /process, DELETE /rag/index/… (see api_security.py)
-app.add_middleware(LegalOCRSecurityMiddleware)
-
 # Global query system instance (initialized on startup)
 query_system_instance: Optional[ObligationQuerySystem] = None
 
@@ -1701,6 +1697,51 @@ async def chat_rag_post(request: ChatRequest = Body(...)):
             block_count=out["block_count"],
             context_was_empty=out["context_was_empty"],
         )
+
+
+@app.post("/chat/stream", tags=["Query"])
+async def chat_rag_stream(request: ChatRequest = Body(...)):
+    """
+    Stream chat answer tokens as plain text.
+
+    Returns a text/plain stream where chunks arrive as the LLM generates them.
+    """
+    from llm_client import generate_content_stream, get_default_model
+    from legal_rag.pipeline import run_chat_retrieval
+    from legal_rag.retrieval import CHAT_SYSTEM_PROMPT
+
+    msg = request.message.strip()
+    _route, assembled, _blocks, _hits = run_chat_retrieval(
+        msg,
+        top_k=request.top_k,
+        document_id=(request.document_id or "").strip() or None,
+        router_model=None,
+    )
+
+    context_was_empty = not (assembled or "").strip()
+    if context_was_empty:
+        assembled = (
+            "(No matching passages were retrieved. Index the document into Qdrant: "
+            "set RAG_INDEX_QDRANT=true when processing PDFs, or call "
+            "legal_rag.qdrant_store.upsert_document_pages_and_obligations.)"
+        )
+
+    prompt = (
+        f"{CHAT_SYSTEM_PROMPT}\n\n---\nContext:\n{assembled}\n---\n\n"
+        f"User question:\n{msg}"
+    )
+
+    async def token_generator():
+        async for token in generate_content_stream(
+            prompt,
+            model=get_default_model(),
+            temperature=0.2,
+            response_mime_type="text/plain",
+            max_output_tokens=int(os.getenv("RAG_CHAT_MAX_OUTPUT_TOKENS", "4096")),
+        ):
+            yield token
+
+    return StreamingResponse(token_generator(), media_type="text/plain")
     except HTTPException:
         raise
     except Exception as e:

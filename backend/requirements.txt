@@ -47,10 +47,13 @@ chromadb>=0.4.0
 qdrant-client>=1.9.0
 sentence-transformers>=2.2.0
 openai>=1.0.0
+
+# AWS Parameter Store (optional)
 boto3==1.34.34
-python-dotenv==1.0.0
 
 # GCS Emulator (optional, for local development)
 # Install from local directory: pip install -e ./gcp-storage-emulator-main
 # Or install from PyPI: pip install gcp-storage-emulator
+fs>=2.4.0
+google-crc32c>=1.5.0
 # gcp-storage-emulator>=0.0.0

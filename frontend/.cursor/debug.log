@@ -1,0 +1,295 @@
+{"location":"App.tsx:1275","message":"handleGlobalSearch called","data":{"query":"T","queryLength":1},"timestamp":1768909319328,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"App.tsx:1358","message":"Query too short, clearing snippets","data":{"queryLength":1},"timestamp":1768909319330,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"App.tsx:1275","message":"handleGlobalSearch called","data":{"query":"Te","queryLength":2},"timestamp":1768909321697,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"App.tsx:1358","message":"Query too short, clearing snippets","data":{"queryLength":2},"timestamp":1768909321699,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"App.tsx:1275","message":"handleGlobalSearch called","data":{"query":"T","queryLength":1},"timestamp":1768909337352,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"App.tsx:1358","message":"Query too short, clearing snippets","data":{"queryLength":1},"timestamp":1768909337355,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"App.tsx:1275","message":"handleGlobalSearch called","data":{"query":"","queryLength":0},"timestamp":1768909352040,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"App.tsx:1358","message":"Query too short, clearing snippets","data":{"queryLength":0},"timestamp":1768909352041,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"App.tsx:1275","message":"handleGlobalSearch called","data":{"query":"Landlord HVAC Hazardous Materials","queryLength":33},"timestamp":1768909354040,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"App.tsx:1282","message":"Query length check passed, calling API","data":{"query":"Landlord HVAC Hazardous Materials"},"timestamp":1768909354041,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"apiService.ts:33","message":"queryObligations called","data":{"query":"Landlord HVAC Hazardous Materials","apiBaseUrl":"http://localhost:8000"},"timestamp":1768909354043,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"apiService.ts:36","message":"Making fetch request","data":{"url":"http://localhost:8000/query?q=Landlord%20HVAC%20Hazardous%20Materials"},"timestamp":1768909354045,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"apiService.ts:38","message":"Fetch response received","data":{"status":200,"ok":true,"statusText":"OK"},"timestamp":1768909386733,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"App.tsx:1285","message":"Backend API response received","data":{"resultsCount":4,"totalObligations":4,"query":"Landlord HVAC Hazardous Materials"},"timestamp":1768909386737,"sessionId":"debug-session","hypothesisId":"H2"}
+{"location":"apiService.ts:42","message":"JSON parsed successfully","data":{"resultsCount":4,"totalObligations":4,"query":"Landlord HVAC Hazardous Materials"},"timestamp":1768909386735,"sessionId":"debug-session","hypothesisId":"H2"}
+{"location":"App.tsx:1288","message":"Snippets transformed","data":{"transformedCount":4,"firstSnippetTitle":"Hazardous Materials Remediation"},"timestamp":1768909386739,"sessionId":"debug-session","hypothesisId":"H3"}
+{"location":"App.tsx:1304","message":"Setting snippets state with backend data","data":{"snippetsCount":4,"firstSnippetId":"backend-0"},"timestamp":1768909386740,"sessionId":"debug-session","hypothesisId":"H5"}
+{"location":"App.tsx:1358","message":"Query too short, clearing snippets","data":{"queryLength":1},"timestamp":1768909773101,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"App.tsx:1275","message":"handleGlobalSearch called","data":{"query":"t","queryLength":1},"timestamp":1768909773099,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"App.tsx:1275","message":"handleGlobalSearch called","data":{"query":"te","queryLength":2},"timestamp":1768909773291,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"App.tsx:1358","message":"Query too short, clearing snippets","data":{"queryLength":2},"timestamp":1768909773294,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"App.tsx:1275","message":"handleGlobalSearch called","data":{"query":"ten","queryLength":3},"timestamp":1768909773482,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"App.tsx:1282","message":"Query length check passed, calling API","data":{"query":"ten"},"timestamp":1768909773483,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"apiService.ts:33","message":"queryObligations called","data":{"query":"ten","apiBaseUrl":"http://localhost:8000"},"timestamp":1768909773486,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"apiService.ts:36","message":"Making fetch request","data":{"url":"http://localhost:8000/query?q=ten"},"timestamp":1768909773487,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"App.tsx:1275","message":"handleGlobalSearch called","data":{"query":"tena","queryLength":4},"timestamp":1768909773558,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"App.tsx:1282","message":"Query length check passed, calling API","data":{"query":"tena"},"timestamp":1768909773560,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"apiService.ts:33","message":"queryObligations called","data":{"query":"tena","apiBaseUrl":"http://localhost:8000"},"timestamp":1768909773562,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"apiService.ts:36","message":"Making fetch request","data":{"url":"http://localhost:8000/query?q=tena"},"timestamp":1768909773564,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"App.tsx:1275","message":"handleGlobalSearch called","data":{"query":"tenan","queryLength":5},"timestamp":1768909773631,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"App.tsx:1282","message":"Query length check passed, calling API","data":{"query":"tenan"},"timestamp":1768909773632,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"apiService.ts:33","message":"queryObligations called","data":{"query":"tenan","apiBaseUrl":"http://localhost:8000"},"timestamp":1768909773633,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"apiService.ts:36","message":"Making fetch request","data":{"url":"http://localhost:8000/query?q=tenan"},"timestamp":1768909773636,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"App.tsx:1275","message":"handleGlobalSearch called","data":{"query":"tenant","queryLength":6},"timestamp":1768909773882,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"App.tsx:1282","message":"Query length check passed, calling API","data":{"query":"tenant"},"timestamp":1768909773886,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"apiService.ts:33","message":"queryObligations called","data":{"query":"tenant","apiBaseUrl":"http://localhost:8000"},"timestamp":1768909773890,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"apiService.ts:36","message":"Making fetch request","data":{"url":"http://localhost:8000/query?q=tenant"},"timestamp":1768909773894,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"App.tsx:1275","message":"handleGlobalSearch called","data":{"query":"tenanty","queryLength":7},"timestamp":1768909773911,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"App.tsx:1282","message":"Query length check passed, calling API","data":{"query":"tenanty"},"timestamp":1768909773917,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"apiService.ts:33","message":"queryObligations called","data":{"query":"tenanty","apiBaseUrl":"http://localhost:8000"},"timestamp":1768909773921,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"apiService.ts:36","message":"Making fetch request","data":{"url":"http://localhost:8000/query?q=tenanty"},"timestamp":1768909773924,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"App.tsx:1275","message":"handleGlobalSearch called","data":{"query":"tenant","queryLength":6},"timestamp":1768909774827,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"App.tsx:1282","message":"Query length check passed, calling API","data":{"query":"tenant"},"timestamp":1768909774832,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"apiService.ts:33","message":"queryObligations called","data":{"query":"tenant","apiBaseUrl":"http://localhost:8000"},"timestamp":1768909774837,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"apiService.ts:36","message":"Making fetch request","data":{"url":"http://localhost:8000/query?q=tenant"},"timestamp":1768909774842,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"apiService.ts:44","message":"queryObligations error caught","data":{"error":"Failed to fetch","errorName":"TypeError"},"timestamp":1768909830718,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"apiService.ts:44","message":"queryObligations error caught","data":{"error":"Failed to fetch","errorName":"TypeError"},"timestamp":1768909830725,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"apiService.ts:44","message":"queryObligations error caught","data":{"error":"Failed to fetch","errorName":"TypeError"},"timestamp":1768909830721,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"apiService.ts:44","message":"queryObligations error caught","data":{"error":"Failed to fetch","errorName":"TypeError"},"timestamp":1768909830728,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"apiService.ts:44","message":"queryObligations error caught","data":{"error":"Failed to fetch","errorName":"TypeError"},"timestamp":1768909830730,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"apiService.ts:44","message":"queryObligations error caught","data":{"error":"Failed to fetch","errorName":"TypeError"},"timestamp":1768909830732,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"App.tsx:1308","message":"API call failed, falling back to mock data","data":{"error":"Failed to fetch","errorType":"TypeError"},"timestamp":1768909830735,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"App.tsx:1275","message":"handleGlobalSearch called","data":{"query":"tenant","queryLength":6},"timestamp":1768909839341,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"App.tsx:1282","message":"Query length check passed, calling API","data":{"query":"tenant"},"timestamp":1768909839343,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"apiService.ts:33","message":"queryObligations called","data":{"query":"tenant","apiBaseUrl":"http://localhost:8000"},"timestamp":1768909839346,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"apiService.ts:36","message":"Making fetch request","data":{"url":"http://localhost:8000/query?q=tenant"},"timestamp":1768909839347,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"App.tsx:1275","message":"handleGlobalSearch called","data":{"query":"tenant","queryLength":6},"timestamp":1768909984574,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"apiService.ts:33","message":"queryObligations called","data":{"query":"tenant","apiBaseUrl":"http://localhost:8000"},"timestamp":1768909984577,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"App.tsx:1282","message":"Query length check passed, calling API","data":{"query":"tenant"},"timestamp":1768909984576,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"apiService.ts:36","message":"Making fetch request","data":{"url":"http://localhost:8000/query?q=tenant"},"timestamp":1768909984578,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"apiService.ts:38","message":"Fetch response received","data":{"status":200,"ok":true,"statusText":"OK"},"timestamp":1768910061070,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"App.tsx:1285","message":"Backend API response received","data":{"resultsCount":29,"totalObligations":29,"query":"tenant"},"timestamp":1768910061074,"sessionId":"debug-session","hypothesisId":"H2"}
+{"location":"App.tsx:1288","message":"Snippets transformed","data":{"transformedCount":29,"firstSnippetTitle":"Purchase Price Payment"},"timestamp":1768910061076,"sessionId":"debug-session","hypothesisId":"H3"}
+{"location":"apiService.ts:42","message":"JSON parsed successfully","data":{"resultsCount":29,"totalObligations":29,"query":"tenant"},"timestamp":1768910061073,"sessionId":"debug-session","hypothesisId":"H2"}
+{"location":"App.tsx:1304","message":"Setting snippets state with backend data","data":{"snippetsCount":29,"firstSnippetId":"backend-0"},"timestamp":1768910061076,"sessionId":"debug-session","hypothesisId":"H5"}
+{"location":"App.tsx:1275","message":"handleGlobalSearch called","data":{"query":"s","queryLength":1},"timestamp":1769074555766,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"App.tsx:1358","message":"Query too short, clearing snippets","data":{"queryLength":1},"timestamp":1769074555767,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"App.tsx:1275","message":"handleGlobalSearch called","data":{"query":"sh","queryLength":2},"timestamp":1769074555898,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"App.tsx:1358","message":"Query too short, clearing snippets","data":{"queryLength":2},"timestamp":1769074555899,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"App.tsx:1275","message":"handleGlobalSearch called","data":{"query":"sha","queryLength":3},"timestamp":1769074556022,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"App.tsx:1282","message":"Query length check passed, calling API","data":{"query":"sha"},"timestamp":1769074556022,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"apiService.ts:33","message":"queryObligations called","data":{"query":"sha","apiBaseUrl":"http://localhost:8000"},"timestamp":1769074556024,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"apiService.ts:36","message":"Making fetch request","data":{"url":"http://localhost:8000/query?q=sha"},"timestamp":1769074556024,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"App.tsx:1275","message":"handleGlobalSearch called","data":{"query":"shae","queryLength":4},"timestamp":1769074556320,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"App.tsx:1282","message":"Query length check passed, calling API","data":{"query":"shae"},"timestamp":1769074556321,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"apiService.ts:33","message":"queryObligations called","data":{"query":"shae","apiBaseUrl":"http://localhost:8000"},"timestamp":1769074556322,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"apiService.ts:36","message":"Making fetch request","data":{"url":"http://localhost:8000/query?q=shae"},"timestamp":1769074556322,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"App.tsx:1275","message":"handleGlobalSearch called","data":{"query":"shaew","queryLength":5},"timestamp":1769074556665,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"apiService.ts:33","message":"queryObligations called","data":{"query":"shaew","apiBaseUrl":"http://localhost:8000"},"timestamp":1769074556667,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"App.tsx:1282","message":"Query length check passed, calling API","data":{"query":"shaew"},"timestamp":1769074556667,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"apiService.ts:36","message":"Making fetch request","data":{"url":"http://localhost:8000/query?q=shaew"},"timestamp":1769074556668,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"App.tsx:1275","message":"handleGlobalSearch called","data":{"query":"shae","queryLength":4},"timestamp":1769074557401,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"App.tsx:1282","message":"Query length check passed, calling API","data":{"query":"shae"},"timestamp":1769074557402,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"apiService.ts:33","message":"queryObligations called","data":{"query":"shae","apiBaseUrl":"http://localhost:8000"},"timestamp":1769074557403,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"apiService.ts:36","message":"Making fetch request","data":{"url":"http://localhost:8000/query?q=shae"},"timestamp":1769074557404,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"App.tsx:1275","message":"handleGlobalSearch called","data":{"query":"sha","queryLength":3},"timestamp":1769074558434,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"App.tsx:1282","message":"Query length check passed, calling API","data":{"query":"sha"},"timestamp":1769074558435,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"apiService.ts:33","message":"queryObligations called","data":{"query":"sha","apiBaseUrl":"http://localhost:8000"},"timestamp":1769074558436,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"apiService.ts:36","message":"Making fetch request","data":{"url":"http://localhost:8000/query?q=sha"},"timestamp":1769074558436,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"App.tsx:1275","message":"handleGlobalSearch called","data":{"query":"shar","queryLength":4},"timestamp":1769074558855,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"apiService.ts:33","message":"queryObligations called","data":{"query":"shar","apiBaseUrl":"http://localhost:8000"},"timestamp":1769074558856,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"App.tsx:1282","message":"Query length check passed, calling API","data":{"query":"shar"},"timestamp":1769074558856,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"apiService.ts:36","message":"Making fetch request","data":{"url":"http://localhost:8000/query?q=shar"},"timestamp":1769074558857,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"App.tsx:1275","message":"handleGlobalSearch called","data":{"query":"share","queryLength":5},"timestamp":1769074558976,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"App.tsx:1282","message":"Query length check passed, calling API","data":{"query":"share"},"timestamp":1769074558977,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"apiService.ts:33","message":"queryObligations called","data":{"query":"share","apiBaseUrl":"http://localhost:8000"},"timestamp":1769074558977,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"apiService.ts:36","message":"Making fetch request","data":{"url":"http://localhost:8000/query?q=share"},"timestamp":1769074558978,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"App.tsx:1275","message":"handleGlobalSearch called","data":{"query":"shared","queryLength":6},"timestamp":1769074559170,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"App.tsx:1282","message":"Query length check passed, calling API","data":{"query":"shared"},"timestamp":1769074559171,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"apiService.ts:33","message":"queryObligations called","data":{"query":"shared","apiBaseUrl":"http://localhost:8000"},"timestamp":1769074559172,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"apiService.ts:36","message":"Making fetch request","data":{"url":"http://localhost:8000/query?q=shared"},"timestamp":1769074559173,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"App.tsx:1275","message":"handleGlobalSearch called","data":{"query":"shared ","queryLength":6},"timestamp":1769074559380,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"apiService.ts:33","message":"queryObligations called","data":{"query":"shared ","apiBaseUrl":"http://localhost:8000"},"timestamp":1769074559382,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"apiService.ts:36","message":"Making fetch request","data":{"url":"http://localhost:8000/query?q=shared%20"},"timestamp":1769074559383,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"App.tsx:1282","message":"Query length check passed, calling API","data":{"query":"shared "},"timestamp":1769074559381,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"App.tsx:1275","message":"handleGlobalSearch called","data":{"query":"shared","queryLength":6},"timestamp":1769074564720,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"App.tsx:1282","message":"Query length check passed, calling API","data":{"query":"shared"},"timestamp":1769074564721,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"apiService.ts:36","message":"Making fetch request","data":{"url":"http://localhost:8000/query?q=shared"},"timestamp":1769074564722,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"apiService.ts:33","message":"queryObligations called","data":{"query":"shared","apiBaseUrl":"http://localhost:8000"},"timestamp":1769074564722,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"App.tsx:1275","message":"handleGlobalSearch called","data":{"query":"share","queryLength":5},"timestamp":1769074564899,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"apiService.ts:33","message":"queryObligations called","data":{"query":"share","apiBaseUrl":"http://localhost:8000"},"timestamp":1769074564900,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"apiService.ts:36","message":"Making fetch request","data":{"url":"http://localhost:8000/query?q=share"},"timestamp":1769074564901,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"App.tsx:1282","message":"Query length check passed, calling API","data":{"query":"share"},"timestamp":1769074564899,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"App.tsx:1282","message":"Query length check passed, calling API","data":{"query":"shar"},"timestamp":1769074565049,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"App.tsx:1275","message":"handleGlobalSearch called","data":{"query":"shar","queryLength":4},"timestamp":1769074565048,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"apiService.ts:33","message":"queryObligations called","data":{"query":"shar","apiBaseUrl":"http://localhost:8000"},"timestamp":1769074565049,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"apiService.ts:36","message":"Making fetch request","data":{"url":"http://localhost:8000/query?q=shar"},"timestamp":1769074565049,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"App.tsx:1275","message":"handleGlobalSearch called","data":{"query":"sha","queryLength":3},"timestamp":1769074565199,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"App.tsx:1282","message":"Query length check passed, calling API","data":{"query":"sha"},"timestamp":1769074565199,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"apiService.ts:33","message":"queryObligations called","data":{"query":"sha","apiBaseUrl":"http://localhost:8000"},"timestamp":1769074565200,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"apiService.ts:36","message":"Making fetch request","data":{"url":"http://localhost:8000/query?q=sha"},"timestamp":1769074565201,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"App.tsx:1275","message":"handleGlobalSearch called","data":{"query":"sh","queryLength":2},"timestamp":1769074565348,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"App.tsx:1358","message":"Query too short, clearing snippets","data":{"queryLength":2},"timestamp":1769074565349,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"App.tsx:1275","message":"handleGlobalSearch called","data":{"query":"s","queryLength":1},"timestamp":1769074565499,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"App.tsx:1358","message":"Query too short, clearing snippets","data":{"queryLength":1},"timestamp":1769074565500,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"App.tsx:1275","message":"handleGlobalSearch called","data":{"query":"","queryLength":0},"timestamp":1769074565650,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"App.tsx:1358","message":"Query too short, clearing snippets","data":{"queryLength":0},"timestamp":1769074565650,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"App.tsx:1275","message":"handleGlobalSearch called","data":{"query":"t","queryLength":1},"timestamp":1769074600168,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"App.tsx:1358","message":"Query too short, clearing snippets","data":{"queryLength":1},"timestamp":1769074600169,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"App.tsx:1275","message":"handleGlobalSearch called","data":{"query":"te","queryLength":2},"timestamp":1769074600332,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"App.tsx:1358","message":"Query too short, clearing snippets","data":{"queryLength":2},"timestamp":1769074600333,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"App.tsx:1282","message":"Query length check passed, calling API","data":{"query":"ten"},"timestamp":1769074600511,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"App.tsx:1275","message":"handleGlobalSearch called","data":{"query":"ten","queryLength":3},"timestamp":1769074600510,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"apiService.ts:33","message":"queryObligations called","data":{"query":"ten","apiBaseUrl":"http://localhost:8000"},"timestamp":1769074600511,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"apiService.ts:36","message":"Making fetch request","data":{"url":"http://localhost:8000/query?q=ten"},"timestamp":1769074600512,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"App.tsx:1275","message":"handleGlobalSearch called","data":{"query":"tena","queryLength":4},"timestamp":1769074600615,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"apiService.ts:33","message":"queryObligations called","data":{"query":"tena","apiBaseUrl":"http://localhost:8000"},"timestamp":1769074600617,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"apiService.ts:36","message":"Making fetch request","data":{"url":"http://localhost:8000/query?q=tena"},"timestamp":1769074600617,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"App.tsx:1282","message":"Query length check passed, calling API","data":{"query":"tena"},"timestamp":1769074600616,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"App.tsx:1275","message":"handleGlobalSearch called","data":{"query":"tenan","queryLength":5},"timestamp":1769074600675,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"apiService.ts:33","message":"queryObligations called","data":{"query":"tenan","apiBaseUrl":"http://localhost:8000"},"timestamp":1769074600676,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"App.tsx:1282","message":"Query length check passed, calling API","data":{"query":"tenan"},"timestamp":1769074600676,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"apiService.ts:36","message":"Making fetch request","data":{"url":"http://localhost:8000/query?q=tenan"},"timestamp":1769074600677,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"App.tsx:1275","message":"handleGlobalSearch called","data":{"query":"tenant","queryLength":6},"timestamp":1769074601409,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"apiService.ts:33","message":"queryObligations called","data":{"query":"tenant","apiBaseUrl":"http://localhost:8000"},"timestamp":1769074601411,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"apiService.ts:36","message":"Making fetch request","data":{"url":"http://localhost:8000/query?q=tenant"},"timestamp":1769074601412,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"App.tsx:1282","message":"Query length check passed, calling API","data":{"query":"tenant"},"timestamp":1769074601410,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"apiService.ts:36","message":"Making fetch request","data":{"url":"http://localhost:8000/query?q=tenan"},"timestamp":1769074604596,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"App.tsx:1275","message":"handleGlobalSearch called","data":{"query":"tenan","queryLength":5},"timestamp":1769074604593,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"App.tsx:1282","message":"Query length check passed, calling API","data":{"query":"tenan"},"timestamp":1769074604594,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"apiService.ts:33","message":"queryObligations called","data":{"query":"tenan","apiBaseUrl":"http://localhost:8000"},"timestamp":1769074604595,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"App.tsx:1275","message":"handleGlobalSearch called","data":{"query":"tena","queryLength":4},"timestamp":1769074604787,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"apiService.ts:33","message":"queryObligations called","data":{"query":"tena","apiBaseUrl":"http://localhost:8000"},"timestamp":1769074604788,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"apiService.ts:36","message":"Making fetch request","data":{"url":"http://localhost:8000/query?q=tena"},"timestamp":1769074604789,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"App.tsx:1282","message":"Query length check passed, calling API","data":{"query":"tena"},"timestamp":1769074604788,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"App.tsx:1275","message":"handleGlobalSearch called","data":{"query":"ten","queryLength":3},"timestamp":1769074604952,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"apiService.ts:33","message":"queryObligations called","data":{"query":"ten","apiBaseUrl":"http://localhost:8000"},"timestamp":1769074604954,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"apiService.ts:36","message":"Making fetch request","data":{"url":"http://localhost:8000/query?q=ten"},"timestamp":1769074604955,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"App.tsx:1282","message":"Query length check passed, calling API","data":{"query":"ten"},"timestamp":1769074604953,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"App.tsx:1275","message":"handleGlobalSearch called","data":{"query":"te","queryLength":2},"timestamp":1769074605101,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"App.tsx:1358","message":"Query too short, clearing snippets","data":{"queryLength":2},"timestamp":1769074605102,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"App.tsx:1358","message":"Query too short, clearing snippets","data":{"queryLength":1},"timestamp":1769074605251,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"App.tsx:1275","message":"handleGlobalSearch called","data":{"query":"t","queryLength":1},"timestamp":1769074605250,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"App.tsx:1275","message":"handleGlobalSearch called","data":{"query":"","queryLength":0},"timestamp":1769074605403,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"App.tsx:1358","message":"Query too short, clearing snippets","data":{"queryLength":0},"timestamp":1769074605404,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"App.tsx:1275","message":"handleGlobalSearch called","data":{"query":"t","queryLength":1},"timestamp":1769074606405,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"App.tsx:1358","message":"Query too short, clearing snippets","data":{"queryLength":1},"timestamp":1769074606406,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"App.tsx:1275","message":"handleGlobalSearch called","data":{"query":"te","queryLength":2},"timestamp":1769074607592,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"App.tsx:1358","message":"Query too short, clearing snippets","data":{"queryLength":2},"timestamp":1769074607593,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"App.tsx:1275","message":"handleGlobalSearch called","data":{"query":"ten","queryLength":3},"timestamp":1769074608837,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"App.tsx:1282","message":"Query length check passed, calling API","data":{"query":"ten"},"timestamp":1769074608838,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"apiService.ts:33","message":"queryObligations called","data":{"query":"ten","apiBaseUrl":"http://localhost:8000"},"timestamp":1769074608838,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"apiService.ts:36","message":"Making fetch request","data":{"url":"http://localhost:8000/query?q=ten"},"timestamp":1769074608839,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"App.tsx:1275","message":"handleGlobalSearch called","data":{"query":"te","queryLength":2},"timestamp":1769074611235,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"App.tsx:1358","message":"Query too short, clearing snippets","data":{"queryLength":2},"timestamp":1769074611236,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"App.tsx:1275","message":"handleGlobalSearch called","data":{"query":"t","queryLength":1},"timestamp":1769074611340,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"App.tsx:1358","message":"Query too short, clearing snippets","data":{"queryLength":1},"timestamp":1769074611341,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"App.tsx:1275","message":"handleGlobalSearch called","data":{"query":"","queryLength":0},"timestamp":1769074611611,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"App.tsx:1358","message":"Query too short, clearing snippets","data":{"queryLength":0},"timestamp":1769074611612,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"apiService.ts:38","message":"Fetch response received","data":{"status":200,"ok":true,"statusText":"OK"},"timestamp":1769074666182,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"apiService.ts:42","message":"JSON parsed successfully","data":{"resultsCount":21,"totalObligations":21,"query":"sha"},"timestamp":1769074666187,"sessionId":"debug-session","hypothesisId":"H2"}
+{"location":"App.tsx:1285","message":"Backend API response received","data":{"resultsCount":21,"totalObligations":21,"query":"sha"},"timestamp":1769074666191,"sessionId":"debug-session","hypothesisId":"H2"}
+{"location":"App.tsx:1288","message":"Snippets transformed","data":{"transformedCount":21,"firstSnippetTitle":"Compliance Work Cost Sharing"},"timestamp":1769074666197,"sessionId":"debug-session","hypothesisId":"H3"}
+{"location":"App.tsx:1304","message":"Setting snippets state with backend data","data":{"snippetsCount":21,"firstSnippetId":"backend-0"},"timestamp":1769074666200,"sessionId":"debug-session","hypothesisId":"H5"}
+{"location":"apiService.ts:38","message":"Fetch response received","data":{"status":200,"ok":true,"statusText":"OK"},"timestamp":1769074736115,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"apiService.ts:42","message":"JSON parsed successfully","data":{"resultsCount":23,"totalObligations":23,"query":"shae"},"timestamp":1769074736120,"sessionId":"debug-session","hypothesisId":"H2"}
+{"location":"App.tsx:1285","message":"Backend API response received","data":{"resultsCount":23,"totalObligations":23,"query":"shae"},"timestamp":1769074736124,"sessionId":"debug-session","hypothesisId":"H2"}
+{"location":"App.tsx:1288","message":"Snippets transformed","data":{"transformedCount":23,"firstSnippetTitle":"Hazardous Materials Remediation Cost Sharing"},"timestamp":1769074736126,"sessionId":"debug-session","hypothesisId":"H3"}
+{"location":"App.tsx:1304","message":"Setting snippets state with backend data","data":{"snippetsCount":23,"firstSnippetId":"backend-0"},"timestamp":1769074736129,"sessionId":"debug-session","hypothesisId":"H5"}
+{"location":"apiService.ts:38","message":"Fetch response received","data":{"status":200,"ok":true,"statusText":"OK"},"timestamp":1769074845738,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"apiService.ts:42","message":"JSON parsed successfully","data":{"resultsCount":23,"totalObligations":23,"query":"shaew"},"timestamp":1769074845746,"sessionId":"debug-session","hypothesisId":"H2"}
+{"location":"App.tsx:1285","message":"Backend API response received","data":{"resultsCount":23,"totalObligations":23,"query":"shaew"},"timestamp":1769074845752,"sessionId":"debug-session","hypothesisId":"H2"}
+{"location":"App.tsx:1288","message":"Snippets transformed","data":{"transformedCount":23,"firstSnippetTitle":"Shared Expenses, Real Estate Taxes, and Property Insurance Payment"},"timestamp":1769074845756,"sessionId":"debug-session","hypothesisId":"H3"}
+{"location":"App.tsx:1304","message":"Setting snippets state with backend data","data":{"snippetsCount":23,"firstSnippetId":"backend-0"},"timestamp":1769074845759,"sessionId":"debug-session","hypothesisId":"H5"}
+{"location":"apiService.ts:38","message":"Fetch response received","data":{"status":200,"ok":true,"statusText":"OK"},"timestamp":1769074925088,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"apiService.ts:42","message":"JSON parsed successfully","data":{"resultsCount":23,"totalObligations":23,"query":"shar"},"timestamp":1769074991398,"sessionId":"debug-session","hypothesisId":"H2"}
+{"location":"App.tsx:1288","message":"Snippets transformed","data":{"transformedCount":23,"firstSnippetTitle":"Compliance Work Cost Sharing"},"timestamp":1769074991403,"sessionId":"debug-session","hypothesisId":"H3"}
+{"location":"App.tsx:1285","message":"Backend API response received","data":{"resultsCount":23,"totalObligations":23,"query":"shar"},"timestamp":1769074991399,"sessionId":"debug-session","hypothesisId":"H2"}
+{"location":"App.tsx:1304","message":"Setting snippets state with backend data","data":{"snippetsCount":23,"firstSnippetId":"backend-0"},"timestamp":1769074991408,"sessionId":"debug-session","hypothesisId":"H5"}
+{"location":"apiService.ts:38","message":"Fetch response received","data":{"status":200,"ok":true,"statusText":"OK"},"timestamp":1769074991416,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"apiService.ts:38","message":"Fetch response received","data":{"status":200,"ok":true,"statusText":"OK"},"timestamp":1769075070424,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"App.tsx:1285","message":"Backend API response received","data":{"resultsCount":26,"totalObligations":26,"query":"shared "},"timestamp":1769075070428,"sessionId":"debug-session","hypothesisId":"H2"}
+{"location":"apiService.ts:42","message":"JSON parsed successfully","data":{"resultsCount":26,"totalObligations":26,"query":"shared "},"timestamp":1769075070426,"sessionId":"debug-session","hypothesisId":"H2"}
+{"location":"App.tsx:1288","message":"Snippets transformed","data":{"transformedCount":26,"firstSnippetTitle":"Closing Costs (Buyer)"},"timestamp":1769075070429,"sessionId":"debug-session","hypothesisId":"H3"}
+{"location":"App.tsx:1304","message":"Setting snippets state with backend data","data":{"snippetsCount":26,"firstSnippetId":"backend-0"},"timestamp":1769075070430,"sessionId":"debug-session","hypothesisId":"H5"}
+{"location":"apiService.ts:38","message":"Fetch response received","data":{"status":200,"ok":true,"statusText":"OK"},"timestamp":1769075116200,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"apiService.ts:42","message":"JSON parsed successfully","data":{"resultsCount":28,"totalObligations":28,"query":"share"},"timestamp":1769075116203,"sessionId":"debug-session","hypothesisId":"H2"}
+{"location":"App.tsx:1288","message":"Snippets transformed","data":{"transformedCount":28,"firstSnippetTitle":"Hazardous Materials Remediation Cost Sharing"},"timestamp":1769075116205,"sessionId":"debug-session","hypothesisId":"H3"}
+{"location":"App.tsx:1285","message":"Backend API response received","data":{"resultsCount":28,"totalObligations":28,"query":"share"},"timestamp":1769075116204,"sessionId":"debug-session","hypothesisId":"H2"}
+{"location":"App.tsx:1304","message":"Setting snippets state with backend data","data":{"snippetsCount":28,"firstSnippetId":"backend-0"},"timestamp":1769075116205,"sessionId":"debug-session","hypothesisId":"H5"}
+{"location":"App.tsx:1275","message":"handleGlobalSearch called","data":{"query":"tenant","queryLength":6},"timestamp":1769075126500,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"apiService.ts:33","message":"queryObligations called","data":{"query":"tenant","apiBaseUrl":"http://localhost:8000"},"timestamp":1769075126502,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"apiService.ts:36","message":"Making fetch request","data":{"url":"http://localhost:8000/query?q=tenant"},"timestamp":1769075126502,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"App.tsx:1282","message":"Query length check passed, calling API","data":{"query":"tenant"},"timestamp":1769075126501,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"apiService.ts:42","message":"JSON parsed successfully","data":{"resultsCount":19,"totalObligations":19,"query":"shae"},"timestamp":1769075184823,"sessionId":"debug-session","hypothesisId":"H2"}
+{"location":"App.tsx:1288","message":"Snippets transformed","data":{"transformedCount":19,"firstSnippetTitle":"Shared Expenses, Real Estate Taxes, and Property Insurance Payment"},"timestamp":1769075184824,"sessionId":"debug-session","hypothesisId":"H3"}
+{"location":"App.tsx:1285","message":"Backend API response received","data":{"resultsCount":19,"totalObligations":19,"query":"shae"},"timestamp":1769075184824,"sessionId":"debug-session","hypothesisId":"H2"}
+{"location":"App.tsx:1304","message":"Setting snippets state with backend data","data":{"snippetsCount":19,"firstSnippetId":"backend-0"},"timestamp":1769075184825,"sessionId":"debug-session","hypothesisId":"H5"}
+{"location":"apiService.ts:38","message":"Fetch response received","data":{"status":200,"ok":true,"statusText":"OK"},"timestamp":1769075184827,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"apiService.ts:38","message":"Fetch response received","data":{"status":200,"ok":true,"statusText":"OK"},"timestamp":1769075270629,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"apiService.ts:42","message":"JSON parsed successfully","data":{"resultsCount":25,"totalObligations":25,"query":"shared"},"timestamp":1769075270632,"sessionId":"debug-session","hypothesisId":"H2"}
+{"location":"App.tsx:1285","message":"Backend API response received","data":{"resultsCount":25,"totalObligations":25,"query":"shared"},"timestamp":1769075270635,"sessionId":"debug-session","hypothesisId":"H2"}
+{"location":"App.tsx:1288","message":"Snippets transformed","data":{"transformedCount":25,"firstSnippetTitle":"Hazardous Materials Remediation Cost Sharing"},"timestamp":1769075270636,"sessionId":"debug-session","hypothesisId":"H3"}
+{"location":"App.tsx:1304","message":"Setting snippets state with backend data","data":{"snippetsCount":25,"firstSnippetId":"backend-0"},"timestamp":1769075270638,"sessionId":"debug-session","hypothesisId":"H5"}
+{"location":"apiService.ts:42","message":"JSON parsed successfully","data":{"resultsCount":21,"totalObligations":21,"query":"sha"},"timestamp":1769075270640,"sessionId":"debug-session","hypothesisId":"H2"}
+{"location":"App.tsx:1285","message":"Backend API response received","data":{"resultsCount":21,"totalObligations":21,"query":"sha"},"timestamp":1769075270642,"sessionId":"debug-session","hypothesisId":"H2"}
+{"location":"App.tsx:1288","message":"Snippets transformed","data":{"transformedCount":21,"firstSnippetTitle":"Hazardous Materials Remediation Cost Sharing"},"timestamp":1769075270643,"sessionId":"debug-session","hypothesisId":"H3"}
+{"location":"App.tsx:1304","message":"Setting snippets state with backend data","data":{"snippetsCount":21,"firstSnippetId":"backend-0"},"timestamp":1769075270645,"sessionId":"debug-session","hypothesisId":"H5"}
+{"location":"apiService.ts:38","message":"Fetch response received","data":{"status":200,"ok":true,"statusText":"OK"},"timestamp":1769075365755,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"apiService.ts:42","message":"JSON parsed successfully","data":{"resultsCount":27,"totalObligations":27,"query":"share"},"timestamp":1769075365760,"sessionId":"debug-session","hypothesisId":"H2"}
+{"location":"App.tsx:1285","message":"Backend API response received","data":{"resultsCount":27,"totalObligations":27,"query":"share"},"timestamp":1769075365764,"sessionId":"debug-session","hypothesisId":"H2"}
+{"location":"App.tsx:1288","message":"Snippets transformed","data":{"transformedCount":27,"firstSnippetTitle":"Shared Expenses, Real Estate Taxes, and Property Insurance Payment"},"timestamp":1769075365765,"sessionId":"debug-session","hypothesisId":"H3"}
+{"location":"App.tsx:1304","message":"Setting snippets state with backend data","data":{"snippetsCount":27,"firstSnippetId":"backend-0"},"timestamp":1769075365769,"sessionId":"debug-session","hypothesisId":"H5"}
+{"location":"apiService.ts:38","message":"Fetch response received","data":{"status":200,"ok":true,"statusText":"OK"},"timestamp":1769075467286,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"apiService.ts:42","message":"JSON parsed successfully","data":{"resultsCount":21,"totalObligations":21,"query":"sha"},"timestamp":1769075467289,"sessionId":"debug-session","hypothesisId":"H2"}
+{"location":"App.tsx:1285","message":"Backend API response received","data":{"resultsCount":21,"totalObligations":21,"query":"sha"},"timestamp":1769075467293,"sessionId":"debug-session","hypothesisId":"H2"}
+{"location":"App.tsx:1288","message":"Snippets transformed","data":{"transformedCount":21,"firstSnippetTitle":"Insurance Deductible and Uninsured Portion Cost Sharing"},"timestamp":1769075467295,"sessionId":"debug-session","hypothesisId":"H3"}
+{"location":"App.tsx:1304","message":"Setting snippets state with backend data","data":{"snippetsCount":21,"firstSnippetId":"backend-0"},"timestamp":1769075467297,"sessionId":"debug-session","hypothesisId":"H5"}
+{"location":"apiService.ts:38","message":"Fetch response received","data":{"status":200,"ok":true,"statusText":"OK"},"timestamp":1769075537683,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"apiService.ts:42","message":"JSON parsed successfully","data":{"resultsCount":21,"totalObligations":21,"query":"ten"},"timestamp":1769075537686,"sessionId":"debug-session","hypothesisId":"H2"}
+{"location":"App.tsx:1285","message":"Backend API response received","data":{"resultsCount":21,"totalObligations":21,"query":"ten"},"timestamp":1769075537689,"sessionId":"debug-session","hypothesisId":"H2"}
+{"location":"App.tsx:1288","message":"Snippets transformed","data":{"transformedCount":21,"firstSnippetTitle":"Purchase Price Payment"},"timestamp":1769075537691,"sessionId":"debug-session","hypothesisId":"H3"}
+{"location":"App.tsx:1304","message":"Setting snippets state with backend data","data":{"snippetsCount":21,"firstSnippetId":"backend-0"},"timestamp":1769075537693,"sessionId":"debug-session","hypothesisId":"H5"}
+{"location":"apiService.ts:38","message":"Fetch response received","data":{"status":200,"ok":true,"statusText":"OK"},"timestamp":1769075714957,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"apiService.ts:42","message":"JSON parsed successfully","data":{"resultsCount":59,"totalObligations":49,"query":"tenant"},"timestamp":1769075857960,"sessionId":"debug-session","hypothesisId":"H2"}
+{"location":"App.tsx:1285","message":"Backend API response received","data":{"resultsCount":59,"totalObligations":49,"query":"tenant"},"timestamp":1769075857965,"sessionId":"debug-session","hypothesisId":"H2"}
+{"location":"App.tsx:1288","message":"Snippets transformed","data":{"transformedCount":59,"firstSnippetTitle":"Purchase Price Payment"},"timestamp":1769075857968,"sessionId":"debug-session","hypothesisId":"H3"}
+{"location":"App.tsx:1304","message":"Setting snippets state with backend data","data":{"snippetsCount":59,"firstSnippetId":"backend-0"},"timestamp":1769075857972,"sessionId":"debug-session","hypothesisId":"H5"}
+{"location":"apiService.ts:38","message":"Fetch response received","data":{"status":200,"ok":true,"statusText":"OK"},"timestamp":1769075857978,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"App.tsx:1275","message":"handleGlobalSearch called","data":{"query":"tenant","queryLength":6},"timestamp":1769075909857,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"App.tsx:1282","message":"Query length check passed, calling API","data":{"query":"tenant"},"timestamp":1769075909858,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"apiService.ts:33","message":"queryObligations called","data":{"query":"tenant","apiBaseUrl":"http://localhost:8000"},"timestamp":1769075909858,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"apiService.ts:36","message":"Making fetch request","data":{"url":"http://localhost:8000/query?q=tenant"},"timestamp":1769075909859,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"apiService.ts:38","message":"Fetch response received","data":{"status":200,"ok":true,"statusText":"OK"},"timestamp":1769076010639,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"apiService.ts:42","message":"JSON parsed successfully","data":{"resultsCount":57,"totalObligations":55,"query":"tenan"},"timestamp":1769076010643,"sessionId":"debug-session","hypothesisId":"H2"}
+{"location":"App.tsx:1285","message":"Backend API response received","data":{"resultsCount":57,"totalObligations":55,"query":"tenan"},"timestamp":1769076010648,"sessionId":"debug-session","hypothesisId":"H2"}
+{"location":"App.tsx:1288","message":"Snippets transformed","data":{"transformedCount":57,"firstSnippetTitle":"Purchase Price Payment"},"timestamp":1769076010652,"sessionId":"debug-session","hypothesisId":"H3"}
+{"location":"App.tsx:1304","message":"Setting snippets state with backend data","data":{"snippetsCount":57,"firstSnippetId":"backend-0"},"timestamp":1769076010656,"sessionId":"debug-session","hypothesisId":"H5"}
+{"location":"apiService.ts:38","message":"Fetch response received","data":{"status":200,"ok":true,"statusText":"OK"},"timestamp":1769076145345,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"apiService.ts:42","message":"JSON parsed successfully","data":{"resultsCount":51,"totalObligations":51,"query":"tena"},"timestamp":1769076145364,"sessionId":"debug-session","hypothesisId":"H2"}
+{"location":"App.tsx:1285","message":"Backend API response received","data":{"resultsCount":51,"totalObligations":51,"query":"tena"},"timestamp":1769076145386,"sessionId":"debug-session","hypothesisId":"H2"}
+{"location":"App.tsx:1288","message":"Snippets transformed","data":{"transformedCount":51,"firstSnippetTitle":"Insurance Premium Payment"},"timestamp":1769076145395,"sessionId":"debug-session","hypothesisId":"H3"}
+{"location":"App.tsx:1304","message":"Setting snippets state with backend data","data":{"snippetsCount":51,"firstSnippetId":"backend-0"},"timestamp":1769076145404,"sessionId":"debug-session","hypothesisId":"H5"}
+{"location":"apiService.ts:38","message":"Fetch response received","data":{"status":200,"ok":true,"statusText":"OK"},"timestamp":1769076234124,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"apiService.ts:42","message":"JSON parsed successfully","data":{"resultsCount":58,"totalObligations":58,"query":"tenan"},"timestamp":1769076234127,"sessionId":"debug-session","hypothesisId":"H2"}
+{"location":"App.tsx:1285","message":"Backend API response received","data":{"resultsCount":58,"totalObligations":58,"query":"tenan"},"timestamp":1769076234132,"sessionId":"debug-session","hypothesisId":"H2"}
+{"location":"App.tsx:1288","message":"Snippets transformed","data":{"transformedCount":58,"firstSnippetTitle":"Purchase Price Payment"},"timestamp":1769076234136,"sessionId":"debug-session","hypothesisId":"H3"}
+{"location":"App.tsx:1304","message":"Setting snippets state with backend data","data":{"snippetsCount":58,"firstSnippetId":"backend-0"},"timestamp":1769076234139,"sessionId":"debug-session","hypothesisId":"H5"}
+{"location":"apiService.ts:38","message":"Fetch response received","data":{"status":200,"ok":true,"statusText":"OK"},"timestamp":1769076297141,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"apiService.ts:42","message":"JSON parsed successfully","data":{"resultsCount":21,"totalObligations":21,"query":"ten"},"timestamp":1769076297149,"sessionId":"debug-session","hypothesisId":"H2"}
+{"location":"App.tsx:1285","message":"Backend API response received","data":{"resultsCount":21,"totalObligations":21,"query":"ten"},"timestamp":1769076297153,"sessionId":"debug-session","hypothesisId":"H2"}
+{"location":"App.tsx:1288","message":"Snippets transformed","data":{"transformedCount":21,"firstSnippetTitle":"Purchase Price Payment"},"timestamp":1769076297156,"sessionId":"debug-session","hypothesisId":"H3"}
+{"location":"App.tsx:1304","message":"Setting snippets state with backend data","data":{"snippetsCount":21,"firstSnippetId":"backend-0"},"timestamp":1769076297158,"sessionId":"debug-session","hypothesisId":"H5"}
+{"location":"apiService.ts:38","message":"Fetch response received","data":{"status":200,"ok":true,"statusText":"OK"},"timestamp":1769076447714,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"apiService.ts:42","message":"JSON parsed successfully","data":{"resultsCount":59,"totalObligations":59,"query":"tenant"},"timestamp":1769076447718,"sessionId":"debug-session","hypothesisId":"H2"}
+{"location":"App.tsx:1285","message":"Backend API response received","data":{"resultsCount":59,"totalObligations":59,"query":"tenant"},"timestamp":1769076447722,"sessionId":"debug-session","hypothesisId":"H2"}
+{"location":"App.tsx:1288","message":"Snippets transformed","data":{"transformedCount":59,"firstSnippetTitle":"Purchase Price Payment"},"timestamp":1769076447727,"sessionId":"debug-session","hypothesisId":"H3"}
+{"location":"App.tsx:1304","message":"Setting snippets state with backend data","data":{"snippetsCount":59,"firstSnippetId":"backend-0"},"timestamp":1769076447731,"sessionId":"debug-session","hypothesisId":"H5"}
+{"location":"apiService.ts:42","message":"JSON parsed successfully","data":{"resultsCount":20,"totalObligations":20,"query":"ten"},"timestamp":1769076447733,"sessionId":"debug-session","hypothesisId":"H2"}
+{"location":"App.tsx:1285","message":"Backend API response received","data":{"resultsCount":20,"totalObligations":20,"query":"ten"},"timestamp":1769076447739,"sessionId":"debug-session","hypothesisId":"H2"}
+{"location":"App.tsx:1288","message":"Snippets transformed","data":{"transformedCount":20,"firstSnippetTitle":"Purchase Price Payment"},"timestamp":1769076447742,"sessionId":"debug-session","hypothesisId":"H3"}
+{"location":"App.tsx:1304","message":"Setting snippets state with backend data","data":{"snippetsCount":20,"firstSnippetId":"backend-0"},"timestamp":1769076447745,"sessionId":"debug-session","hypothesisId":"H5"}
+{"location":"apiService.ts:38","message":"Fetch response received","data":{"status":200,"ok":true,"statusText":"OK"},"timestamp":1769076543335,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"apiService.ts:42","message":"JSON parsed successfully","data":{"resultsCount":25,"totalObligations":25,"query":"shar"},"timestamp":1769076543338,"sessionId":"debug-session","hypothesisId":"H2"}
+{"location":"App.tsx:1285","message":"Backend API response received","data":{"resultsCount":25,"totalObligations":25,"query":"shar"},"timestamp":1769076543343,"sessionId":"debug-session","hypothesisId":"H2"}
+{"location":"App.tsx:1288","message":"Snippets transformed","data":{"transformedCount":25,"firstSnippetTitle":"Operating Expenses Payment"},"timestamp":1769076543346,"sessionId":"debug-session","hypothesisId":"H3"}
+{"location":"App.tsx:1304","message":"Setting snippets state with backend data","data":{"snippetsCount":25,"firstSnippetId":"backend-0"},"timestamp":1769076543349,"sessionId":"debug-session","hypothesisId":"H5"}
+{"location":"apiService.ts:44","message":"queryObligations error caught","data":{"error":"Failed to fetch","errorName":"TypeError"},"timestamp":1769076705008,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"apiService.ts:44","message":"queryObligations error caught","data":{"error":"Failed to fetch","errorName":"TypeError"},"timestamp":1769076705009,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"App.tsx:1275","message":"handleGlobalSearch called","data":{"query":"tenant","queryLength":6},"timestamp":1769076904785,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"App.tsx:1282","message":"Query length check passed, calling API","data":{"query":"tenant"},"timestamp":1769076904787,"sessionId":"debug-session","hypothesisId":"H4"}
+{"location":"apiService.ts:33","message":"queryObligations called","data":{"query":"tenant","apiBaseUrl":"http://localhost:8000"},"timestamp":1769076904789,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"apiService.ts:36","message":"Making fetch request","data":{"url":"http://localhost:8000/query?q=tenant"},"timestamp":1769076904790,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"apiService.ts:44","message":"queryObligations error caught","data":{"error":"Failed to fetch","errorName":"TypeError"},"timestamp":1769076985865,"sessionId":"debug-session","hypothesisId":"H1"}
+{"location":"App.tsx:1308","message":"API call failed, falling back to mock data","data":{"error":"Failed to fetch","errorType":"TypeError"},"timestamp":1769076985881,"sessionId":"debug-session","hypothesisId":"H1"}
