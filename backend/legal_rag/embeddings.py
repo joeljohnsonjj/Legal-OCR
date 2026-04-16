@@ -22,7 +22,10 @@ def embed_texts(texts: List[str], model: Optional[str] = None) -> List[List[floa
     """
     if not texts:
         return []
+    use_local = os.getenv("USE_LOCAL_EMBEDDING", "").strip().lower() in ("true", "1", "yes")
     use_openai = bool(os.getenv("OPENAI_API_KEY", "").strip())
+    if use_local:
+        use_openai = False
     if use_openai:
         from openai import OpenAI
 
@@ -50,7 +53,8 @@ def embed_text(text: str) -> List[float]:
 
 def warm_sentence_transformer() -> None:
     """Preload sentence-transformers model at startup to avoid first-request latency."""
-    if os.getenv("OPENAI_API_KEY", "").strip():
+    use_local = os.getenv("USE_LOCAL_EMBEDDING", "").strip().lower() in ("true", "1", "yes")
+    if not use_local and os.getenv("OPENAI_API_KEY", "").strip():
         return
     model_name = os.getenv("RAG_SENTENCE_TRANSFORMER_MODEL", "all-MiniLM-L6-v2").strip()
     model_st = _get_sentence_transformer(model_name)

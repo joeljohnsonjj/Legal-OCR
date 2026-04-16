@@ -1626,7 +1626,9 @@ async def startup_event():
         try:
             from legal_rag.embeddings import warm_sentence_transformer
 
+            logging.info("Warming sentence-transformer embedding model...")
             warm_sentence_transformer()
+            logging.info("Sentence-transformer warmup complete.")
         except Exception as e:
             logging.warning("Sentence-transformer warmup failed: %s", e)
         warmup_enabled = os.getenv("CHAT_WARMUP_ENABLED", "true").strip().lower() in (

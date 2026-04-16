@@ -508,12 +508,12 @@ export function ChatSidebar({
               >
               <div
                 ref={listRef}
-                className="flex flex-1 flex-col overflow-y-auto overflow-x-hidden px-3 py-3"
+                className="flex flex-1 flex-col overflow-y-auto overflow-x-hidden px-4 py-4"
                 style={{
                   flex: '1 1 0%',
                   minHeight: 0,
                   overscrollBehavior: 'contain',
-                  backgroundColor: CHAT_AREA_BG,
+                  background: 'linear-gradient(180deg, #f8f9fb 0%, #f2f4f7 100%)',
                 }}
                 role="log"
                 aria-live="polite"
@@ -529,16 +529,41 @@ export function ChatSidebar({
                         className="flex w-full min-w-0 flex-col gap-1"
                         style={{ alignItems: isUser ? 'flex-end' : 'flex-start' }}
                       >
-                        <span
-                          className="w-full min-w-0 text-xs font-bold"
+                        <div
+                          className="flex w-full min-w-0 items-center gap-2 text-xs font-semibold"
                           style={{
                             lineHeight: '16px',
                             color: CHAT_TEXT_SECONDARY,
                             textAlign: isUser ? 'right' : 'left',
+                            textTransform: 'uppercase',
+                            letterSpacing: '0.04em',
+                            justifyContent: isUser ? 'flex-end' : 'flex-start',
                           }}
                         >
-                          {isUser ? 'You' : 'Assistant'}
-                        </span>
+                          {!isUser && (
+                            <span
+                              style={{
+                                width: 6,
+                                height: 6,
+                                borderRadius: 999,
+                                backgroundColor: HEB_RED,
+                                boxShadow: '0 0 0 2px rgba(220, 38, 38, 0.15)',
+                              }}
+                            />
+                          )}
+                          <span>{isUser ? 'You' : 'Assistant'}</span>
+                          {isUser && (
+                            <span
+                              style={{
+                                width: 6,
+                                height: 6,
+                                borderRadius: 999,
+                                backgroundColor: CHAT_USER_BUBBLE_BG,
+                                boxShadow: '0 0 0 2px rgba(0, 119, 204, 0.15)',
+                              }}
+                            />
+                          )}
+                        </div>
                         <div
                           className="text-sm leading-relaxed"
                           style={{
@@ -548,34 +573,40 @@ export function ChatSidebar({
                             minWidth: 0,
                             overflowWrap: 'break-word',
                             wordBreak: 'break-word',
-                            padding: '14px 16px',
+                            padding: '16px 18px',
                             borderRadius: BUBBLE_RADIUS,
                             border: isUser
-                              ? '1px solid rgba(0,0,0,0.1)'
+                              ? 'none'
                               : `1px solid ${CHAT_BORDER}`,
-                            backgroundColor: isUser ? CHAT_USER_BUBBLE_BG : '#FFFFFF',
+                            background: isUser 
+                              ? `linear-gradient(135deg, ${CHAT_USER_BUBBLE_BG} 0%, #005aa3 100%)` 
+                              : 'linear-gradient(180deg, #ffffff 0%, #f8fafc 100%)',
                             boxShadow: isUser
-                              ? '0 2px 10px rgba(238, 40, 36, 0.22)'
-                              : '0 1px 4px rgba(0,0,0,0.08)',
+                              ? '0 10px 24px rgba(0, 119, 204, 0.28), 0 4px 10px rgba(0, 119, 204, 0.16)'
+                              : '0 10px 24px rgba(15, 23, 42, 0.08), 0 4px 10px rgba(15, 23, 42, 0.05)',
                             color: isUser ? '#FFFFFF' : CHAT_TEXT_PRIMARY,
                             textAlign: 'left',
-                            transition: 'box-shadow 0.2s ease',
+                            transition: 'all 0.2s ease',
+                            transform: 'translateY(0)',
                           }}
                         >
                           {showThinking ? (
                             <span className="flex items-center gap-2">
                               <svg
-                                className="h-4 w-4 animate-spin text-gray-400"
+                                className="h-4 w-4 animate-spin"
+                                style={{ color: HEB_RED }}
                                 viewBox="0 0 24 24"
                                 aria-hidden="true"
                               >
                                 <path
-                                  className="opacity-80"
+                                  className="opacity-75"
                                   fill="currentColor"
                                   d="M12 2a10 10 0 0 1 10 10h-3a7 7 0 0 0-7-7V2z"
                                 />
                               </svg>
-                              <span className="text-sm text-gray-500">Thinking…</span>
+                              <span className="text-sm font-medium" style={{ color: HEB_RED }}>
+                                Thinking…
+                              </span>
                             </span>
                           ) : (
                             formatMessageBody(m.content, `m-${i}`, isUser ? 'user' : 'assistant')
@@ -589,12 +620,26 @@ export function ChatSidebar({
                       className="flex w-full min-w-0 flex-col gap-1"
                       style={{ alignItems: 'flex-start' }}
                     >
-                      <span
-                        className="w-full min-w-0 text-left text-xs font-bold"
-                        style={{ lineHeight: '16px', color: CHAT_TEXT_SECONDARY }}
+                      <div
+                        className="flex w-full min-w-0 items-center gap-2 text-xs font-semibold"
+                        style={{
+                          lineHeight: '16px',
+                          color: CHAT_TEXT_SECONDARY,
+                          textTransform: 'uppercase',
+                          letterSpacing: '0.04em',
+                        }}
                       >
-                        Assistant
-                      </span>
+                        <span
+                          style={{
+                            width: 6,
+                            height: 6,
+                            borderRadius: 999,
+                            backgroundColor: HEB_RED,
+                            boxShadow: '0 0 0 2px rgba(220, 38, 38, 0.15)',
+                          }}
+                        />
+                        <span>Assistant</span>
+                      </div>
                       <div
                         className="text-sm leading-relaxed"
                         style={{
@@ -607,9 +652,9 @@ export function ChatSidebar({
                           padding: '14px 16px',
                           borderRadius: BUBBLE_RADIUS,
                           border: `1px solid ${CHAT_BORDER}`,
-                          backgroundColor: '#FFFFFF',
+                          background: 'linear-gradient(180deg, #ffffff 0%, #f8fafc 100%)',
                           color: CHAT_TEXT_SECONDARY,
-                          boxShadow: '0 1px 4px rgba(0,0,0,0.06)',
+                          boxShadow: '0 6px 18px rgba(15, 23, 42, 0.08), 0 2px 6px rgba(15, 23, 42, 0.05)',
                         }}
                       >
                         Thinking…
@@ -622,20 +667,30 @@ export function ChatSidebar({
 
               {error && (
                 <div
-                  className="flex-shrink-0 border-t px-3 py-2 text-xs"
+                  className="flex-shrink-0 border-t px-4 py-3 text-xs rounded-b-lg"
                   style={{
-                    borderColor: 'rgba(238, 40, 36, 0.25)',
-                    backgroundColor: 'rgba(238, 40, 36, 0.08)',
+                    borderColor: 'rgba(238, 40, 36, 0.2)',
+                    background: 'linear-gradient(135deg, rgba(238, 40, 36, 0.06) 0%, rgba(238, 40, 36, 0.12) 100%)',
                     color: '#7A1816',
+                    backdropFilter: 'blur(8px)',
                   }}
                 >
-                  {error}
+                  <div className="flex items-center gap-2">
+                    <svg className="h-3 w-3 text-red-500" viewBox="0 0 24 24" fill="currentColor">
+                      <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/>
+                    </svg>
+                    {error}
+                  </div>
                 </div>
               )}
 
               <form
-                className="flex w-full min-w-0 flex-shrink-0 gap-2 border-t bg-white px-3 py-3"
-                style={{ borderColor: CHAT_BORDER, minWidth: 0 }}
+                className="flex w-full min-w-0 flex-shrink-0 gap-3 border-t bg-white px-4 py-4"
+                style={{ 
+                  borderColor: CHAT_BORDER, 
+                  minWidth: 0,
+                  background: 'linear-gradient(to bottom, #ffffff 0%, #fafafa 100%)'
+                }}
                 onSubmit={(e) => {
                   e.preventDefault();
                   void send();
@@ -645,26 +700,28 @@ export function ChatSidebar({
                   type="text"
                   value={input}
                   onChange={(e) => setInput(e.target.value)}
-                  placeholder="Type a message…"
-                  className="min-w-0 flex-1 border bg-white px-3 text-sm outline-none transition-colors"
+                  placeholder="Ask me anything about the legal documents…"
+                  className="min-w-0 flex-1 border bg-white px-4 text-sm outline-none transition-all duration-200"
                   style={{
                     width: 0,
                     minWidth: 0,
-                    height: 40,
-                    borderRadius: 12,
-                    borderWidth: 1,
+                    height: 44,
+                    borderRadius: 22,
+                    borderWidth: 1.5,
                     borderStyle: 'solid',
                     borderColor: CHAT_BORDER,
                     color: CHAT_TEXT_PRIMARY,
-                    transitionDuration: '0.2s',
+                    boxShadow: '0 1px 3px rgba(0, 0, 0, 0.05)',
                   }}
                   onFocus={(e) => {
                     e.currentTarget.style.borderColor = HEB_RED;
-                    e.currentTarget.style.boxShadow = '0 0 0 2px rgba(238, 40, 36, 0.2)';
+                    e.currentTarget.style.boxShadow = `0 0 0 3px rgba(220, 38, 38, 0.12), 0 2px 8px rgba(0, 0, 0, 0.1)`;
+                    e.currentTarget.style.transform = 'translateY(-1px)';
                   }}
                   onBlur={(e) => {
                     e.currentTarget.style.borderColor = CHAT_BORDER;
-                    e.currentTarget.style.boxShadow = 'none';
+                    e.currentTarget.style.boxShadow = '0 1px 3px rgba(0, 0, 0, 0.05)';
+                    e.currentTarget.style.transform = 'translateY(0)';
                   }}
                   disabled={loading}
                   aria-label="Message"
@@ -674,18 +731,22 @@ export function ChatSidebar({
                   disabled={loading || !input.trim()}
                   onMouseEnter={() => setSendHovered(true)}
                   onMouseLeave={() => setSendHovered(false)}
-                  className="flex flex-shrink-0 cursor-pointer items-center justify-center rounded-lg text-white disabled:cursor-not-allowed disabled:opacity-50"
+                  className="flex flex-shrink-0 cursor-pointer items-center justify-center rounded-full text-white disabled:cursor-not-allowed disabled:opacity-50"
                   style={{
-                    width: 40,
-                    height: 40,
-                    backgroundColor:
-                      loading || !input.trim()
-                        ? CHAT_USER_BUBBLE_BG
-                        : sendHovered
-                          ? HEB_RED_HOVER
-                          : CHAT_USER_BUBBLE_BG,
-                    borderRadius: 12,
-                    transition: 'background-color 0.2s ease',
+                    width: 44,
+                    height: 44,
+                    background: loading || !input.trim()
+                      ? 'linear-gradient(135deg, #9ca3af 0%, #6b7280 100%)'
+                      : sendHovered
+                        ? `linear-gradient(135deg, ${HEB_RED_HOVER} 0%, #b91c1c 100%)`
+                        : `linear-gradient(135deg, ${HEB_RED} 0%, #b91c1c 100%)`,
+                    boxShadow: loading || !input.trim()
+                      ? 'none'
+                      : sendHovered
+                        ? '0 6px 20px rgba(220, 38, 38, 0.4), 0 2px 8px rgba(220, 38, 38, 0.2)'
+                        : '0 4px 16px rgba(220, 38, 38, 0.3), 0 2px 8px rgba(220, 38, 38, 0.1)',
+                    transition: 'all 0.2s ease',
+                    transform: sendHovered && !loading && input.trim() ? 'translateY(-1px) scale(1.05)' : 'translateY(0) scale(1)',
                   }}
                   aria-label="Send"
                 >
