@@ -46,3 +46,13 @@ def _get_sentence_transformer(model_name: str):
 
 def embed_text(text: str) -> List[float]:
     return embed_texts([text])[0]
+
+
+def warm_sentence_transformer() -> None:
+    """Preload sentence-transformers model at startup to avoid first-request latency."""
+    if os.getenv("OPENAI_API_KEY", "").strip():
+        return
+    model_name = os.getenv("RAG_SENTENCE_TRANSFORMER_MODEL", "all-MiniLM-L6-v2").strip()
+    model_st = _get_sentence_transformer(model_name)
+    # Trigger model load and ensure weights are cached.
+    model_st.encode(["warmup"], convert_to_numpy=True)

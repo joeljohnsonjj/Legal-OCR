@@ -330,8 +330,7 @@ export function ChatSidebar({
         setMessages((prev) =>
           prev.map((msg) => {
             if (msg.id !== assistantId) return msg;
-            const nextContent = normalizeAssistantAnswer(msg.content + chunk);
-            return { ...msg, content: nextContent };
+            return { ...msg, content: msg.content + chunk };
           })
         );
       });
@@ -522,6 +521,8 @@ export function ChatSidebar({
                 <div className="flex w-full min-w-0 flex-col gap-4">
                   {messages.map((m, i) => {
                     const isUser = m.role === 'user';
+                    const isStreaming = m.id === streamingMessageId;
+                    const showThinking = !isUser && isStreaming && !m.content.trim();
                     return (
                       <div
                         key={m.id}
@@ -561,7 +562,24 @@ export function ChatSidebar({
                             transition: 'box-shadow 0.2s ease',
                           }}
                         >
-                          {formatMessageBody(m.content, `m-${i}`, isUser ? 'user' : 'assistant')}
+                          {showThinking ? (
+                            <span className="flex items-center gap-2">
+                              <svg
+                                className="h-4 w-4 animate-spin text-gray-400"
+                                viewBox="0 0 24 24"
+                                aria-hidden="true"
+                              >
+                                <path
+                                  className="opacity-80"
+                                  fill="currentColor"
+                                  d="M12 2a10 10 0 0 1 10 10h-3a7 7 0 0 0-7-7V2z"
+                                />
+                              </svg>
+                              <span className="text-sm text-gray-500">Thinking…</span>
+                            </span>
+                          ) : (
+                            formatMessageBody(m.content, `m-${i}`, isUser ? 'user' : 'assistant')
+                          )}
                         </div>
                       </div>
                     );

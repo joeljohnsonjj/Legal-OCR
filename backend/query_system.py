@@ -1623,6 +1623,31 @@ async def startup_event():
         local_out = os.getenv("OUTPUT_FOLDER", "output")
         model = get_default_model()
         query_system_instance = ObligationQuerySystem(local_output_folder=local_out, model=model)
+        try:
+            from legal_rag.embeddings import warm_sentence_transformer
+
+            warm_sentence_transformer()
+        except Exception as e:
+            logging.warning("Sentence-transformer warmup failed: %s", e)
+        warmup_enabled = os.getenv("CHAT_WARMUP_ENABLED", "true").strip().lower() in (
+            "true",
+            "1",
+            "yes",
+        )
+        if warmup_enabled:
+            try:
+                # Warm the LLM provider to reduce first-response latency.
+                from llm_client import generate_content_async
+
+                await generate_content_async(
+                    "Warmup ping.",
+                    model=model,
+                    temperature=0.0,
+                    response_mime_type="text/plain",
+                    max_output_tokens=8,
+                )
+            except Exception as e:
+                logging.warning("LLM warmup failed: %s", e)
         logging.info(f"Query system initialized (output: {local_out}, model: {model})")
     except Exception as e:
         logging.error(f"Failed to initialize query system: {e}")
@@ -1697,6 +1722,12 @@ async def chat_rag_post(request: ChatRequest = Body(...)):
             block_count=out["block_count"],
             context_was_empty=out["context_was_empty"],
         )
+    except HTTPException:
+        raise
+    except Exception as e:
+        client_msg, log_msg = http_safe_exception_detail(e)
+        logging.error("Error in /chat: %s", log_msg, exc_info=True)
+        raise HTTPException(status_code=500, detail=client_msg) from e
 
 
 @app.post("/chat/stream", tags=["Query"])
@@ -1711,12 +1742,14 @@ async def chat_rag_stream(request: ChatRequest = Body(...)):
     from legal_rag.retrieval import CHAT_SYSTEM_PROMPT
 
     msg = request.message.strip()
+    t_retrieval = time.perf_counter()
     _route, assembled, _blocks, _hits = run_chat_retrieval(
         msg,
         top_k=request.top_k,
         document_id=(request.document_id or "").strip() or None,
         router_model=None,
     )
+    retrieval_elapsed = time.perf_counter() - t_retrieval
 
     context_was_empty = not (assembled or "").strip()
     if context_was_empty:
@@ -1732,6 +1765,9 @@ async def chat_rag_stream(request: ChatRequest = Body(...)):
     )
 
     async def token_generator():
+        token_count = 0
+        first_token_ms = None
+        t_stream = time.perf_counter()
         async for token in generate_content_stream(
             prompt,
             model=get_default_model(),
@@ -1739,15 +1775,20 @@ async def chat_rag_stream(request: ChatRequest = Body(...)):
             response_mime_type="text/plain",
             max_output_tokens=int(os.getenv("RAG_CHAT_MAX_OUTPUT_TOKENS", "4096")),
         ):
+            token_count += 1
+            if first_token_ms is None:
+                first_token_ms = (time.perf_counter() - t_stream) * 1000
             yield token
+        total_stream = time.perf_counter() - t_stream
+        logging.info(
+            "[chat_stream_timing] retrieval=%.3fs, first_token=%.0fms, stream=%.3fs, tokens=%s",
+            retrieval_elapsed,
+            first_token_ms or 0.0,
+            total_stream,
+            token_count,
+        )
 
     return StreamingResponse(token_generator(), media_type="text/plain")
-    except HTTPException:
-        raise
-    except Exception as e:
-        client_msg, log_msg = http_safe_exception_detail(e)
-        logging.error("Error in /chat: %s", log_msg, exc_info=True)
-        raise HTTPException(status_code=500, detail=client_msg) from e
 
 
 @app.delete("/rag/index/{document_name:path}", tags=["Documents"])

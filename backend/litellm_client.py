@@ -221,6 +221,6 @@ async def generate_content_stream(
             continue
         c0 = chunk.choices[0]
         delta = getattr(c0, "delta", None) or (c0.get("delta") if isinstance(c0, dict) else None) or {}
-        content = (getattr(delta, "content", None) or (delta.get("content") if isinstance(delta, dict) else None) or "").strip()
+        content = (getattr(delta, "content", None) or (delta.get("content") if isinstance(delta, dict) else None) or "")
         if content:
             yield content

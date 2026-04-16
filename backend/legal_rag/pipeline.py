@@ -7,6 +7,8 @@ Wire this to your FastAPI chat endpoint; keep legacy /query keyword path separat
 from __future__ import annotations
 
 import os
+import time
+import logging
 from typing import Any, Dict, List, Optional, Tuple
 
 from legal_rag.embeddings import embed_text
@@ -72,12 +74,14 @@ async def run_chat_turn(
 
     from legal_rag.retrieval import CHAT_SYSTEM_PROMPT
 
+    t0 = time.perf_counter()
     route, assembled, blocks, hits = run_chat_retrieval(
         user_message,
         top_k=top_k,
         document_id=document_id,
         router_model=router_model,
     )
+    t_retrieval = time.perf_counter() - t0
 
     context_was_empty = not (assembled or "").strip()
     if context_was_empty:
@@ -93,12 +97,21 @@ async def run_chat_turn(
     )
 
     model = answer_model or get_default_model()
+    t_llm = time.perf_counter()
     resp = await generate_content_async(
         prompt,
         model=model,
         temperature=0.2,
         response_mime_type="text/plain",
         max_output_tokens=int(os.getenv("RAG_CHAT_MAX_OUTPUT_TOKENS", "4096")),
+    )
+    t_llm_elapsed = time.perf_counter() - t_llm
+    logging.info(
+        "[chat_timing] retrieval=%.3fs, llm=%.3fs, hits=%s, blocks=%s",
+        t_retrieval,
+        t_llm_elapsed,
+        len(hits),
+        len(blocks),
     )
 
     return {
