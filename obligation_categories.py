@@ -16,10 +16,12 @@ into the seven Tier-1 labels.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import json
 import logging
 import os
 import re
+import time
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
@@ -759,20 +761,46 @@ def assign_financial_categories(consolidated: List[Dict[str, Any]], *, model: Op
     conc = max(1, min(conc, 16))
 
     llm_ok = True
+    t_cat0 = time.perf_counter()
     try:
         use_parallel = parallel and len(chunk_specs) > 1
+        loop_running = False
         if use_parallel:
             try:
                 asyncio.get_running_loop()
-                use_parallel = False
+                loop_running = True
             except RuntimeError:
-                pass
+                loop_running = False
         if use_parallel:
-            outcomes = asyncio.run(
-                _classify_chunks_parallel(
-                    chunk_specs, model=model, max_output_tokens=max_out, concurrency=conc
+            # asyncio.run() cannot be used from a running loop (e.g. FastAPI). Previously we fell
+            # back to sequential chunk calls (very slow). Run the parallel coroutine in a worker
+            # thread that has no loop so asyncio.run() is valid.
+            if loop_running:
+                logger.info(
+                    "Category LLM: %d chunk(s), concurrency=%d — running parallel batches in a "
+                    "background thread (caller has an active asyncio event loop)",
+                    len(chunk_specs),
+                    conc,
                 )
-            )
+
+                def _run_parallel_classify() -> List[Tuple[int, int, List[Tuple[int, str, str]]]]:
+                    return asyncio.run(
+                        _classify_chunks_parallel(
+                            chunk_specs,
+                            model=model,
+                            max_output_tokens=max_out,
+                            concurrency=conc,
+                        )
+                    )
+
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                    outcomes = pool.submit(_run_parallel_classify).result()
+            else:
+                outcomes = asyncio.run(
+                    _classify_chunks_parallel(
+                        chunk_specs, model=model, max_output_tokens=max_out, concurrency=conc
+                    )
+                )
             for start, n_items, results in sorted(outcomes, key=lambda x: x[0]):
                 if len(results) < n_items:
                     logger.warning(
@@ -786,6 +814,11 @@ def assign_financial_categories(consolidated: List[Dict[str, Any]], *, model: Op
                     llm_ok = False
                     break
         else:
+            if len(chunk_specs) > 1:
+                logger.info(
+                    "Category LLM: %d chunk(s) sequential (LEGAL_OCR_CATEGORY_LLM_PARALLEL=false or only one chunk)",
+                    len(chunk_specs),
+                )
             for start, items in chunk_specs:
                 try:
                     results = _classify_chunk_llm(items, model=model, max_output_tokens=max_out)
@@ -814,6 +847,13 @@ def assign_financial_categories(consolidated: List[Dict[str, Any]], *, model: Op
             e,
         )
         llm_ok = False
+
+    logger.info(
+        "Category assignment wall time: %.2fs (%d obligations, LLM_ok=%s)",
+        time.perf_counter() - t_cat0,
+        len(consolidated),
+        llm_ok,
+    )
 
     if llm_ok:
         for ob in consolidated:

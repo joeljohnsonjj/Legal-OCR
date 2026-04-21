@@ -49,6 +49,361 @@ from gcs_document_versioning import (
 )
 
 
+# Post-merge: keep only Owner Responsibility lines that match the user's topic (substring + light stemming).
+_QUERY_SCOPE_STOPWORDS = frozenset(
+    {
+        "the",
+        "a",
+        "an",
+        "and",
+        "or",
+        "but",
+        "in",
+        "on",
+        "at",
+        "to",
+        "for",
+        "of",
+        "as",
+        "by",
+        "with",
+        "from",
+        "is",
+        "are",
+        "was",
+        "were",
+        "be",
+        "been",
+        "being",
+        "has",
+        "have",
+        "had",
+        "do",
+        "does",
+        "did",
+        "will",
+        "would",
+        "shall",
+        "should",
+        "may",
+        "might",
+        "must",
+        "can",
+        "could",
+        "this",
+        "that",
+        "these",
+        "those",
+        "any",
+        "all",
+        "each",
+        "such",
+        "what",
+        "which",
+        "who",
+        "how",
+        "when",
+        "where",
+        "why",
+        "about",
+        "under",
+        "over",
+        "into",
+        "onto",
+        "per",
+        "via",
+        "than",
+        "then",
+        "not",
+        "no",
+        "also",
+        "only",
+        "just",
+        "both",
+        "either",
+        "some",
+        "including",
+        "related",
+        "other",
+        "etc",
+    }
+)
+# Broad multi-keyword queries (e.g. default utilities string): skip automated line filtering.
+_QUERY_SCOPE_MAX_SIGNIFICANT_TERMS = 9
+# Optional alias tokens for substring match (lowercased).
+_QUERY_TOPIC_ALIASES: Dict[str, frozenset[str]] = {
+    "plumbing": frozenset(
+        {
+            "plumbing",
+            "plumber",
+            "plumb",
+            "pipe",
+            "pipes",
+            "piping",
+            "drain",
+            "drains",
+            "sewer",
+            "toilet",
+            "urinals",
+            "urinal",
+            "washbowl",
+            "washroom",
+            "stoppage",
+            "faucet",
+            "fixtures",
+            "wastewater",
+            "supply lines",
+        }
+    ),
+}
+
+
+def _significant_query_terms_for_scope(user_query: str) -> List[str]:
+    q = (user_query or "").lower()
+    words = re.findall(r"[a-z][a-z0-9'-]*", q)
+    out: List[str] = []
+    for w in words:
+        w = w.strip("'")
+        if len(w) < 3 or w in _QUERY_SCOPE_STOPWORDS:
+            continue
+        out.append(w)
+    return out
+
+
+def _match_tokens_for_query_scope(terms: List[str]) -> List[str]:
+    toks: set[str] = set()
+    for t in terms:
+        toks.add(t)
+        if t in _QUERY_TOPIC_ALIASES:
+            for a in _QUERY_TOPIC_ALIASES[t]:
+                if len(a) >= 3:
+                    toks.add(a)
+    return sorted(toks, key=len, reverse=True)
+
+
+def _line_matches_query_scope(line: str, match_tokens: List[str]) -> bool:
+    low = line.lower()
+    for tok in match_tokens:
+        if len(tok) < 3:
+            continue
+        if tok in low:
+            return True
+        if len(tok) >= 5 and tok.endswith("ing"):
+            root = tok[:-3]
+            if len(root) >= 4 and root in low:
+                return True
+    return False
+
+
+def _split_owner_responsibility_clauses(s: str) -> List[str]:
+    s = (s or "").strip()
+    if not s:
+        return []
+    parts = re.split(r"\s*;\s*|\n+", s)
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _join_owner_clauses(parts: List[str]) -> str:
+    return "; ".join(parts)
+
+
+def trim_obligation_owner_responsibility_to_query(user_query: str, ob: Dict[str, Any]) -> bool:
+    """
+    Restrict Owner Responsibility to clauses that match the query topic (substring / aliases).
+    Returns False if nothing remains (caller should drop the obligation from API results).
+    """
+    terms = _significant_query_terms_for_scope(user_query)
+    if not terms or len(terms) > _QUERY_SCOPE_MAX_SIGNIFICANT_TERMS:
+        return True
+    match_set = _match_tokens_for_query_scope(terms)
+    or_field = ob.get("Owner Responsibility")
+    kept: List[str] = []
+    if isinstance(or_field, list):
+        for item in or_field:
+            s = str(item).strip()
+            if s and _line_matches_query_scope(s, match_set):
+                kept.append(str(item))
+    elif isinstance(or_field, str) and or_field.strip():
+        clauses = _split_owner_responsibility_clauses(or_field)
+        if len(clauses) <= 1:
+            if _line_matches_query_scope(or_field, match_set):
+                kept = [or_field.strip()]
+        else:
+            for c in clauses:
+                if _line_matches_query_scope(c, match_set):
+                    kept.append(c)
+    if not kept:
+        return False
+    if isinstance(or_field, list):
+        ob["Owner Responsibility"] = kept
+    else:
+        ob["Owner Responsibility"] = _join_owner_clauses(kept) if len(kept) > 1 else kept[0]
+    return True
+
+
+def apply_query_scope_trim_to_results(user_query: str, payload: Dict[str, Any]) -> None:
+    """Drop non-matching Owner Responsibility lines; remove obligations with none left."""
+    results = payload.get("results")
+    if not isinstance(results, list) or not results:
+        return
+    kept: List[Dict[str, Any]] = []
+    for ob in results:
+        if not isinstance(ob, dict):
+            continue
+        if trim_obligation_owner_responsibility_to_query(user_query, ob):
+            kept.append(ob)
+    payload["results"] = kept
+    payload["total_obligations_found"] = len(kept)
+
+
+# Full-query coherence: specific topic words must appear in sources and in final output (not only generic lease terms).
+_GENERIC_LEASE_QUERY_TERMS = frozenset(
+    {
+        "tenant",
+        "tenants",
+        "landlord",
+        "landlords",
+        "lessee",
+        "lessor",
+        "rent",
+        "lease",
+        "obligation",
+        "obligations",
+        "duty",
+        "duties",
+        "payment",
+        "payments",
+        "pay",
+        "paid",
+        "paying",
+        "additional",
+        "supplemental",
+        "extra",
+        "fees",
+        "fee",
+        "charges",
+        "charge",
+        "cost",
+        "costs",
+        "financial",
+        "monetary",
+        "money",
+        "party",
+        "parties",
+        "responsible",
+        "responsibility",
+        "agreement",
+        "contract",
+        "premises",
+        "building",
+        "property",
+        "due",
+        "payable",
+        "amount",
+        "amounts",
+        "monthly",
+        "annual",
+        "base",
+        "triple",
+        "nnn",
+        "net",
+        "gross",
+        "commercial",
+        "total",
+        "sum",
+        "sums",
+    }
+)
+
+
+def _content_terms_for_coherence(user_query: str) -> List[str]:
+    """Words that must be reflected in the corpus/output; excludes stopwords and generic lease phrasing."""
+    sig = _significant_query_terms_for_scope(user_query)
+    if not sig or len(sig) > _QUERY_SCOPE_MAX_SIGNIFICANT_TERMS:
+        return []
+    return [t for t in sig if t not in _GENERIC_LEASE_QUERY_TERMS]
+
+
+def _collect_obligation_text_for_coherence(ob: Dict[str, Any]) -> str:
+    parts: List[str] = []
+    for key in ("DutyType", "Owner Responsibility", "Reasoning"):
+        v = ob.get(key)
+        if isinstance(v, list):
+            parts.extend(str(x) for x in v if x is not None)
+        elif v is not None:
+            parts.append(str(v))
+    rk = ob.get("related_keywords")
+    if isinstance(rk, list):
+        parts.extend(str(x) for x in rk if x is not None)
+    return " ".join(parts).lower()
+
+
+def _sources_blob_from_merge_input(merge_input: List[Dict[str, Any]]) -> str:
+    chunks: List[str] = []
+    for fr in merge_input:
+        for ob in fr.get("consolidated_results") or []:
+            if isinstance(ob, dict):
+                chunks.append(_collect_obligation_text_for_coherence(ob))
+    return " ".join(chunks)
+
+
+def _term_in_coherence_blob(term: str, blob: str) -> bool:
+    """Whether term (or its plumbing-style alias family) appears in blob."""
+    blob = blob or ""
+    if term in _QUERY_TOPIC_ALIASES:
+        for a in sorted(_QUERY_TOPIC_ALIASES[term], key=len, reverse=True):
+            if len(a) >= 3 and a in blob:
+                return True
+    t = term.lower()
+    if len(t) <= 4:
+        return re.search(rf"\b{re.escape(t)}\b", blob) is not None
+    if t in blob:
+        return True
+    if len(t) >= 5 and t.endswith("ing"):
+        root = t[:-3]
+        if len(root) >= 4 and root in blob:
+            return True
+    return False
+
+
+def coherence_query_unsupported_by_sources(user_query: str, merge_input: List[Dict[str, Any]]) -> bool:
+    """
+    True if the query contains a specific topic word that never appears in merge input obligations.
+    In that case the full query is not supported by retrieved text — return no answers.
+    """
+    terms = _content_terms_for_coherence(user_query)
+    if not terms:
+        return False
+    blob = _sources_blob_from_merge_input(merge_input)
+    return any(not _term_in_coherence_blob(t, blob) for t in terms)
+
+
+def coherence_output_missing_content_terms(user_query: str, payload: Dict[str, Any]) -> bool:
+    """True if merged rows omit a required content term (LLM drift / keyword spam)."""
+    terms = _content_terms_for_coherence(user_query)
+    if not terms or not (payload.get("results") or []):
+        return False
+    parts: List[str] = []
+    for ob in payload.get("results") or []:
+        if not isinstance(ob, dict):
+            continue
+        parts.append(_collect_obligation_text_for_coherence(ob))
+        cit = ob.get("Citation")
+        if isinstance(cit, list):
+            parts.append(json.dumps(cit).lower())
+        elif cit:
+            parts.append(str(cit).lower())
+    blob = " ".join(parts)
+    return any(not _term_in_coherence_blob(t, blob) for t in terms)
+
+
+def apply_query_coherence_to_payload(user_query: str, payload: Dict[str, Any]) -> None:
+    """Clear results when required topic words are missing from merged output."""
+    if coherence_output_missing_content_terms(user_query, payload):
+        payload["results"] = []
+        payload["total_obligations_found"] = 0
+
+
 def _normalize_ob_key(ob: Dict[str, Any]) -> tuple:
     """Build a key for deduplication: (duty, party, first 80 chars of key obligation)."""
     duty = (ob.get("DutyType") or "")
@@ -391,10 +746,6 @@ def merge_prompt_filtered_snapshot(filtered_results: List[Dict[str, Any]]) -> Li
     return out
 
 
-def _merge_docs_with_obligations_count(merge_in: List[Dict[str, Any]]) -> int:
-    return sum(1 for r in merge_in if r.get("consolidated_results"))
-
-
 def build_rank_response_without_llm_merge(
     user_query: str,
     filtered_results: List[Dict[str, Any]],
@@ -402,7 +753,7 @@ def build_rank_response_without_llm_merge(
     documents_searched_count: Optional[int] = None,
     merge_fallback: bool = False,
 ) -> Dict[str, Any]:
-    """Assemble ranked-shaped response without calling the merge LLM (single-doc fast path or parse fallback)."""
+    """Assemble ranked-shaped response without calling the merge LLM (parse fallback after failed merge)."""
     rows: List[Dict[str, Any]] = []
     for fr in filtered_results:
         if not isinstance(fr, dict):
@@ -428,6 +779,8 @@ def build_rank_response_without_llm_merge(
         out["merge_fallback"] = True
         out["merge_note"] = "Merge LLM output was invalid or truncated; returned unmerged retrieval results."
     convert_result_citations_to_structured(out, filtered_results)
+    apply_query_scope_trim_to_results(user_query, out)
+    apply_query_coherence_to_payload(user_query, out)
     return out
 
 
@@ -798,19 +1151,30 @@ class ObligationQuerySystem:
         """
         Primary retrieval: embed the user query and run semantic search in Chroma against each
         obligation's embedded related_keywords (see vector_store.obligation_to_keyword_chunk_text).
-        Hits with distance <= VECTOR_MAX_DISTANCE; optional Responsible_Party filter when the query
-        mentions tenant/landlord. Resolves full rows from consolidated JSON (document_name +
+        Hits with distance <= VECTOR_MAX_DISTANCE; optional Responsible_Party filter for short
+        queries that mention tenant/landlord (skipped for 3+ words so topic queries stay semantic).
+        Resolves full rows from consolidated JSON (document_name +
         chunk_index), then merge_and_rank (LLM). Returns [] if Chroma is missing, errors, or finds
         no hits — the pipeline then uses per-document LLM filter + merge.
         """
         query_lower = user_query.lower()
         detected_party = None
-        if "tenant" in query_lower:
-            detected_party = "Tenant"
-            self.logger.info("Detected 'tenant' in query → filtering by Responsible_Party=Tenant")
-        elif "landlord" in query_lower:
-            detected_party = "Landlord"
-            self.logger.info("Detected 'landlord' in query → filtering by Responsible_Party=Landlord")
+        word_count = len(query_lower.split())
+        # Short queries: "tenant", "landlord HVAC" — optional party metadata filter in Chroma.
+        # Longer queries: "tenant catering obligation" — do not force Tenant-only rows; that
+        # floods retrieval with unrelated tenant duties when the topic is narrow.
+        if word_count < 3:
+            if "tenant" in query_lower:
+                detected_party = "Tenant"
+                self.logger.info("Detected 'tenant' in query → filtering by Responsible_Party=Tenant")
+            elif "landlord" in query_lower:
+                detected_party = "Landlord"
+                self.logger.info("Detected 'landlord' in query → filtering by Responsible_Party=Landlord")
+        elif "tenant" in query_lower or "landlord" in query_lower:
+            self.logger.info(
+                f"Query has {word_count} words; skipping automatic Responsible_Party filter "
+                f"(party keywords still in embedding for semantic retrieval)"
+            )
 
         try:
             from vector_store import query_obligations
@@ -1151,39 +1515,53 @@ Output the filtered JSON:"""
         """Build the merge-and-rank LLM prompt. Shared by /query, /query/stream, and /query/stream/raw so results are consistent."""
         non_empty_results = [r for r in filtered_results if r.get("consolidated_results")]
         prompt_payload = merge_prompt_filtered_snapshot(non_empty_results)
-        return f"""You are a legal document analyst. You have been provided with filtered financial obligations from multiple legal documents, all relevant to a user's query.
+        uq = json.dumps(user_query, ensure_ascii=False)
+        ndocs = len(filtered_results)
+        return f"""You are a merge-and-rank editor for pre-extracted lease obligations. Your job is ONLY to filter, reorder, optionally merge duplicate rows, and tighten wording. You are NOT a legal analyst and must NOT add information.
 
-RETRIEVAL CONTEXT: Obligations were retrieved via vector similarity on keywords (and/or per-document filter). Prefer keeping these candidates; exclude from the final JSON only obligations clearly unrelated to the query.
+CLOSED-WORLD RULE (anti-hallucination):
+- The JSON block below titled FILTERED_INPUT is the ONLY source of obligations. Every output row MUST be justified by one or more objects from consolidated_results inside that JSON (same DutyType / party / duty text lineage). If you cannot point a row to specific input objects, do not output that row.
+- Do NOT invent duties, parties, dollar amounts, clauses, page numbers, section labels, or document names that do not already appear in the input objects you used for that row.
+- Do NOT use general legal knowledge, "typical NNN lease", or industry defaults to fill gaps. If the input does not state a fact, omit it from Owner Responsibility and Reasoning.
+- Owner Responsibility and Reasoning must be short paraphrases or direct combinations ONLY of text that appears in those fields (or in DutyType) on the merged input rows. Do not infer unstated consequences.
 
-FILTERING: Include only obligations clearly related to the query; the most similar MUST appear and be ranked first. Off-topic queries: return results: [].
+FILTERING:
+- Drop rows clearly unrelated to the user query. If nothing matches, return "results": [].
+- Among rows you keep, put the clearest match to the query first, then weaker matches. Only consider "monetary value" ordering when explicit amounts appear in the input rows you are emitting; never invent amounts.
+- Full-query coherence: the query may mix generic lease words (rent, tenant, payment, obligation, etc.) with one or more specific topic words (e.g. industries, trades, named risks). Every specific topic word that appears in the user query must also appear somewhere in FILTERED_INPUT text for that query to be answerable from this corpus. If any such topic word is absent from ALL input rows, return "results": [] and do not substitute unrelated duties that only match the generic words.
 
-Order the final "results" array by: (1) similarity to the query, (2) relevance, (3) monetary value (highest first).
+QUERY-SCOPED OWNER RESPONSIBILITY:
+- For every row you keep, Owner Responsibility must list ONLY duty lines from FILTERED_INPUT that substantively relate to the user query (same topic). Do not paste an entire consolidated bullet list from a broad duty (e.g. operating expenses) unless each line is on-topic for the query. Prefer a short list of verbatim-style lines from the source.
 
-MERGE ACROSS DOCUMENTS ONLY WHEN: same duty in substance, same Responsible Party, equivalent scope, AND identical `category` string. If category differs or is missing on any candidate, do NOT merge across documents. When in doubt, separate rows. Each merged row's Citation must list every source: "Document: [file1] | [cit1] ; Document: [file2] | [cit2]".
+MERGE ACROSS DOCUMENTS ONLY WHEN:
+- Same duty in substance, same Responsible Party, equivalent scope, AND identical category string on every row being merged. If category differs or is missing on any candidate, keep separate rows. When in doubt, do not merge.
+- For a merged row: DutyType and Responsible Party and category must match the merged group. Owner Responsibility / Reasoning = compact union of wording from those inputs only (dedupe near-identical lines), still respecting QUERY-SCOPED OWNER RESPONSIBILITY above. Citation must concatenate ONLY citation material from the merged inputs, using the format below—no new pages or sections.
 
-When merging, combine Owner Responsibility and Reasoning compactly (dedupe near-duplicates; keep distinct facts). Set `category` to the shared value for cross-doc merges.
+CITATION STRING (required shape):
+- Single source: "Document: <exact document_name from input> | <paste or minimally join citation fragment from that row's Citation field>"
+- Merged multi-doc: "Document: <name1> | <cit1> ; Document: <name2> | <cit2>" using only names and fragments present on the merged source rows.
 
-CRITICAL:
-1. Each result object MUST have exactly these keys: "DutyType", "Responsible Party", "Owner Responsibility", "Reasoning", "Citation", "category". Use string "category" ("" if unknown). Do NOT include "subcategory".
-2. Citation string format as above for single or merged sources.
-3. Valid JSON only; escape quotes inside strings; no trailing commas.
+OUTPUT SCHEMA:
+- Each element of "results" MUST have exactly these keys: "DutyType", "Responsible Party", "Owner Responsibility", "Reasoning", "Citation", "category". Citation is a single STRING (not an array). category is a string (use "" only if missing on all merged sources). Do NOT output "subcategory" or "related_keywords".
+- total_obligations_found MUST equal the length of "results".
+- Valid JSON only; escape double quotes inside strings; no trailing commas; no comments inside JSON.
 
-User Query: "{user_query}"
+User query: {uq}
 
-Filtered results from multiple documents:
+FILTERED_INPUT (sole source of truth):
 {json.dumps(prompt_payload, indent=2)}
 
-Return a JSON object with this structure:
+Return a single JSON object with this shape:
 {{
-  "query": "{user_query}",
-  "total_documents_searched": {len(filtered_results)},
-  "total_obligations_found": <count of obligations>,
+  "query": {uq},
+  "total_documents_searched": {ndocs},
+  "total_obligations_found": <integer, must match len(results)>,
   "results": [
-    // One row per obligation: DutyType, Responsible Party, Owner Responsibility, Reasoning, Citation (string), category only.
+    {{ "DutyType": "...", "Responsible Party": "...", "Owner Responsibility": "...", "Reasoning": "...", "Citation": "Document: ... | ...", "category": "..." }}
   ]
 }}
 
-Output the merged and ranked JSON:"""
+Output only the merged and ranked JSON object, nothing else:"""
 
     async def merge_and_rank_results_stream(self, user_query: str, filtered_results: List[Dict[str, Any]], 
                               document_name_to_id: Optional[Dict[str, str]] = None) -> AsyncIterator[Dict[str, Any]]:
@@ -1214,24 +1592,13 @@ Output the merged and ranked JSON:"""
                     _count_obligations_in_filtered(merge_in),
                 )
 
-            if _merge_docs_with_obligations_count(merge_in) <= 1:
-                self.logger.info("[STREAM] Single-document fast path (skip merge LLM)")
-                assembled = build_rank_response_without_llm_merge(
-                    user_query,
-                    merge_in,
-                    documents_searched_count=len(filtered_results),
-                    merge_fallback=False,
-                )
-                obligation_count = 0
-                for ob in assembled.get("results", []):
-                    obligation_count += 1
-                    yield {"type": "obligation", "data": ob}
+            if coherence_query_unsupported_by_sources(user_query, merge_in):
                 yield {
                     "type": "metadata",
                     "data": {
                         "query": user_query,
                         "total_documents_searched": len(filtered_results),
-                        "total_obligations_found": obligation_count,
+                        "total_obligations_found": 0,
                         "processed_at": datetime.now().isoformat(),
                     },
                 }
@@ -1248,19 +1615,27 @@ Output the merged and ranked JSON:"""
                 response_mime_type="application/json",
                 max_output_tokens=_merge_rank_max_output_tokens(),
             )
-            # Parse the streamed JSON and yield each obligation; same result as merge/rank, streamed to client.
-            obligation_count = 0
+            # Buffer obligations so full-query coherence can match across rows (same as non-stream merge).
+            streamed: List[Dict[str, Any]] = []
             async for obligation in parse_obligations_stream(token_stream):
                 obligation["Citation"] = citation_string_to_structured(obligation.get("Citation"))
                 backfill_obligation_categories_from_filter_sources([obligation], merge_in)
                 _ensure_obligation_category_fields(obligation)
                 strip_subcategory_from_api_results([obligation])
+                if not trim_obligation_owner_responsibility_to_query(user_query, obligation):
+                    continue
+                streamed.append(obligation)
+
+            payload_stream: Dict[str, Any] = {"results": streamed}
+            apply_query_coherence_to_payload(user_query, payload_stream)
+            obligation_count = 0
+            for obligation in payload_stream.get("results") or []:
                 obligation_count += 1
                 yield {
                     "type": "obligation",
-                    "data": obligation
+                    "data": obligation,
                 }
-            
+
             # Final metadata
             yield {
                 "type": "metadata",
@@ -1320,20 +1695,18 @@ Output the merged and ranked JSON:"""
                     _count_obligations_in_filtered(merge_in),
                 )
 
-            if _merge_docs_with_obligations_count(merge_in) <= 1:
-                self.logger.info("[TIMING] merge_and_rank: single-document fast path (skip merge LLM)")
-                final_result = build_rank_response_without_llm_merge(
-                    user_query,
-                    merge_in,
-                    documents_searched_count=len(filtered_results),
-                    merge_fallback=False,
-                )
-                elapsed = time.perf_counter() - t0
+            if coherence_query_unsupported_by_sources(user_query, merge_in):
                 self.logger.info(
-                    f"[TIMING] merge_and_rank: total - {elapsed:.3f}s fast path ({final_result.get('total_obligations_found', 0)} obligations)"
+                    "merge_and_rank: coherence — query topic not found in merge input; skipping LLM merge"
                 )
-                return final_result
-            
+                return {
+                    "query": user_query,
+                    "total_documents_searched": len(filtered_results),
+                    "total_obligations_found": 0,
+                    "results": [],
+                    "processed_at": datetime.now().isoformat(),
+                }
+
             # 2. Build full merge+rank+filter prompt (no code merge; LLM does filtering, merging, ranking)
             t_step = time.perf_counter()
             merge_prompt = self._build_merge_rank_prompt(user_query, merge_in)
@@ -1372,6 +1745,9 @@ Output the merged and ranked JSON:"""
             t_step = time.perf_counter()
             convert_result_citations_to_structured(final_result, merge_in)
             self.logger.info(f"[TIMING] merge_and_rank: 5. citation_to_structured - {time.perf_counter() - t_step:.3f}s")
+            
+            apply_query_scope_trim_to_results(user_query, final_result)
+            apply_query_coherence_to_payload(user_query, final_result)
             
             # 6. Fix count and finish
             t_step = time.perf_counter()

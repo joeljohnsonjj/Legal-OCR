@@ -179,6 +179,25 @@ def _consolidation_use_llm() -> bool:
     return v not in ("false", "0", "no", "off")
 
 
+def _consolidation_min_output_ratio() -> float:
+    """If LLM consolidation returns fewer than (input * ratio) rows for large inputs, use programmatic dedup instead."""
+    raw = os.getenv("LEGAL_OCR_CONSOLIDATION_MIN_OUTPUT_RATIO", "0.35").strip()
+    try:
+        r = float(raw)
+    except ValueError:
+        r = 0.35
+    return max(0.05, min(r, 0.95))
+
+
+def _consolidation_min_input_for_ratio_check() -> int:
+    raw = os.getenv("LEGAL_OCR_CONSOLIDATION_MIN_INPUT_FOR_RATIO_CHECK", "20").strip()
+    try:
+        n = int(raw)
+    except ValueError:
+        n = 20
+    return max(5, min(n, 500))
+
+
 def _consolidation_llm_max_obligations() -> Optional[int]:
     """
     Optional soft cap: if set and count exceeds it, logs a warning but the LLM merge still runs (LLM-only path).
@@ -985,19 +1004,26 @@ CRITICAL — OUTPUT FORMAT: Respond with a single JSON object that has exactly o
         num_input = len(batch)
         if num_input == 0:
             return []
-        consolidation_prompt = f"""You are a legal analyst. You have been provided with financial obligations extracted from multiple pages of a legal document.
+        consolidation_prompt = f"""You are a legal analyst. You have been provided with obligations extracted from a lease (monetary and non-monetary): rent and payments, taxes, CAM/opex, insurance, indemnity, maintenance and repairs, alterations, compliance, use restrictions, default, notices, and similar topics.
 
-Your task is to consolidate these obligations into a single, deduplicated JSON array. Follow these rules:
+Your task is to output ONE JSON array that removes ONLY true duplicates — rows that repeat the same single duty in different words with the same Responsible Party and overlapping Citation. Do NOT summarize the whole lease into a few broad rows.
 
-1. Merge duplicate or highly similar obligations
-2. Preserve all unique obligations
-3. Keep the same JSON structure with fields: "DutyType", "Responsible Party", "Owner Responsibility" (array of strings), "Reasoning" (array of strings), "Citation", and "related_keywords" (array of strings)
-4. The "DutyType" field must be a short, precise label describing the specific monetary obligation (e.g., "Rent Payment", "Security Deposit", "Property Tax Payment", etc.)
-5. The "Responsible Party" field must be used as is.
-6. When merging, combine citations (e.g., "Page 3, Section A; Page 7, Section B")
-7. "related_keywords": for each obligation, add 8–20 search keywords/phrases. Include the DutyType (and normalised variations, e.g. "Rent Payment" → "rent payment", "rent") plus synonyms and related concepts so semantic search can find the obligation.
-8. Maintain legal accuracy and precision
-9. Output ONLY a valid JSON array, no other text. The input contains {num_input} obligations; your output must be a non-empty deduplicated array (never return []).
+MERGE (strict — when in doubt, keep separate rows):
+- Merge only when two rows describe the **same narrow duty** (same party, same topic, same operative requirement) and differ only by redundant wording or overlapping page references.
+- Do NOT merge rows that differ in legal topic (e.g. Base Rent vs Property Tax vs HVAC maintenance vs Insurance vs Indemnity vs Assignment consent) even if the same party appears.
+- Do NOT merge rows with different primary Citation sections/pages unless they are clearly the same duplicated extraction.
+- Preserve **almost all** distinct duties from the input: the output row count should stay in the same order of magnitude as the input (typically at least a large fraction of {num_input} rows after removing only obvious duplicates). **Never** collapse the list to only rent/deposit summaries when the input contains insurance, maintenance, compliance, etc.
+
+FIELDS (each output object):
+- "DutyType": short label for THAT duty — financial OR non-financial (e.g. "Base Rent", "CAM Reimbursement", "Property Insurance Certificate", "HVAC Maintenance", "Indemnity — Third Party Claims", "Compliance With Laws").
+- "Responsible Party": copy from input as given.
+- "Owner Responsibility", "Reasoning": arrays of strings; keep substance from the merged inputs only.
+- "Citation": combine with "; " when merging duplicates only.
+- "related_keywords": 8–20 phrases including DutyType variants for search.
+
+STRUCTURE: Same JSON shape as input: "DutyType", "Responsible Party", "Owner Responsibility" (array), "Reasoning" (array), "Citation", "related_keywords" (array).
+
+Output ONLY a valid JSON array, no other text. The input contains {num_input} obligations; your output must be a non-empty array (never return []). Do not drop whole categories of obligations.
 {metadata_context}
 Here are the extracted obligations:
 
@@ -1085,14 +1111,34 @@ Provide the consolidated JSON array:"""
                     len(working),
                     max_tok,
                 )
+                t_llm_merge = time.perf_counter()
                 merged_llm = self._llm_merge_obligation_batch(
                     working,
                     metadata_context,
                     batch_desc=f"Full document ({len(working)} obligations)",
                     max_output_tokens=max_tok,
                 )
+                self.logger.info(
+                    "Consolidation LLM merge wall time: %.2fs (%d input obligations)",
+                    time.perf_counter() - t_llm_merge,
+                    len(working),
+                )
                 if merged_llm:
-                    consolidated = merged_llm
+                    min_in = _consolidation_min_input_for_ratio_check()
+                    ratio = _consolidation_min_output_ratio()
+                    floor_rows = max(int(len(working) * ratio), 1)
+                    if len(working) >= min_in and len(merged_llm) < floor_rows:
+                        self.logger.warning(
+                            "Consolidation LLM returned too few obligations (%d vs %d input; floor≈%d at ratio %.2f); "
+                            "using programmatic dedup instead of LLM merge output",
+                            len(merged_llm),
+                            len(working),
+                            floor_rows,
+                            ratio,
+                        )
+                        consolidated = _merge_duplicate_obligations(working)
+                    else:
+                        consolidated = merged_llm
                 else:
                     self.logger.warning(
                         "LLM consolidation returned no obligations; keeping %d raw extracted rows (no programmatic dedup)",
@@ -1139,7 +1185,13 @@ Provide the consolidated JSON array:"""
                 cit = ob.get("Citation")
                 if isinstance(cit, list) and cit and all(isinstance(x, dict) for x in cit):
                     ob["Citation"] = merge_structured_citations_by_doc_id(cit)
+            t_cat = time.perf_counter()
             assign_financial_categories(consolidated, model=self.model)
+            self.logger.info(
+                "Financial category assignment wall time: %.2fs (%d obligations)",
+                time.perf_counter() - t_cat,
+                len(consolidated),
+            )
             self.logger.info(f"Consolidated into JSON ({len(consolidated)} obligations)")
             return consolidated
         except Exception as e:
