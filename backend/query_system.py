@@ -4,6 +4,8 @@ Searches through consolidated JSON files and returns relevant obligations based 
 """
 
 import asyncio
+import shutil
+import sqlite3
 import os
 import sys
 import json
@@ -12,6 +14,7 @@ import re
 import time
 from pathlib import Path
 from typing import AsyncIterator, List, Dict, Any, Optional
+from uuid import uuid4
 from datetime import datetime
 from urllib.parse import unquote, urlparse
 
@@ -28,6 +31,7 @@ from fastapi import Body, FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
+from types import SimpleNamespace
 
 from api_security import (
     http_safe_exception_detail,
@@ -1486,6 +1490,8 @@ class ChatRequest(BaseModel):
     """RAG chat (Qdrant + legal_rag): router → vector search → context → answer LLM."""
 
     message: str = Field(..., min_length=1, max_length=16000, description="User message")
+    user_id: Optional[str] = Field(default=None, description="User identifier for session memory")
+    run_id: Optional[str] = Field(default=None, description="Conversation run identifier for session memory")
     document_id: Optional[str] = Field(
         default=None,
         description="Optional: restrict search to one indexed document (e.g. PDF filename as used at index time).",
@@ -1513,6 +1519,8 @@ class ChatResponse(BaseModel):
     """Response from POST /chat (dual-track RAG)."""
 
     answer: str
+    user_id: Optional[str] = None
+    run_id: Optional[str] = None
     route: Dict[str, Any]
     hit_count: int
     block_count: int
@@ -1613,6 +1621,145 @@ app.add_middleware(
 )
 # Global query system instance (initialized on startup)
 query_system_instance: Optional[ObligationQuerySystem] = None
+_memory_settings: Optional[Any] = None
+_default_user_id: Optional[str] = None
+_default_run_id: Optional[str] = None
+
+
+def _env_bool(value: Optional[str], default: bool) -> bool:
+    if value is None or (isinstance(value, str) and value.strip() == ""):
+        return default
+    v = str(value).strip().lower()
+    if v in ("true", "1", "yes"):
+        return True
+    if v in ("false", "0", "no", "none"):
+        return False
+    return default
+
+
+def _env_int(value: Optional[str], default: int) -> int:
+    if value is None or (isinstance(value, str) and value.strip() == ""):
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _reset_sqlite_session_store(db_path: str) -> None:
+    if not db_path:
+        return
+    db_file = Path(db_path)
+    if db_file.exists():
+        db_file.unlink()
+    db_file.parent.mkdir(parents=True, exist_ok=True)
+    schema_path = Path("memory_management/session_manager/setup_database_sqlite.sql")
+    sql = schema_path.read_text(encoding="utf-8")
+    conn = sqlite3.connect(db_file)
+    try:
+        conn.executescript(sql)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _reset_memory_store(settings: Any) -> None:
+    qdrant_path = getattr(settings, "memory_qdrant_path", None)
+    if qdrant_path:
+        qpath = Path(qdrant_path)
+        if qpath.exists():
+            shutil.rmtree(qpath, ignore_errors=True)
+
+
+def _resolve_request_ids(user_id: Optional[str], run_id: Optional[str]) -> tuple[str, str]:
+    global _default_user_id, _default_run_id
+    if not _default_user_id or not _default_run_id:
+        _default_user_id = str(uuid4())
+        _default_run_id = str(uuid4())
+    return user_id or _default_user_id, run_id or _default_run_id
+
+
+def _ensure_hf_reranker_cached() -> None:
+    cache_root = os.getenv("HF_HOME") or str(Path("output") / "hf_cache")
+    os.environ["HF_HOME"] = cache_root
+    os.environ["TRANSFORMERS_CACHE"] = cache_root
+    os.environ["SENTENCE_TRANSFORMERS_HOME"] = cache_root
+    try:
+        from huggingface_hub import snapshot_download
+
+        repo_id = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+        cached_hub = Path(cache_root) / "hub" / "models--cross-encoder--ms-marco-MiniLM-L-6-v2"
+        cached_root = Path(cache_root) / "models--cross-encoder--ms-marco-MiniLM-L-6-v2"
+        try:
+            snapshot_download(repo_id=repo_id, cache_dir=cache_root, local_files_only=True)
+            logging.info("HF reranker cache present: %s", repo_id)
+            os.environ["HF_HUB_OFFLINE"] = "1"
+            os.environ["HF_DATASETS_OFFLINE"] = "1"
+            return
+        except Exception:
+            pass
+        snapshot_download(repo_id=repo_id, cache_dir=cache_root)
+        logging.info("HF reranker cached: %s", repo_id)
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        os.environ["HF_DATASETS_OFFLINE"] = "1"
+    except Exception as e:
+        logging.warning("HF reranker cache check failed: %s", e)
+    if cached_hub.is_dir() or cached_root.is_dir():
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        os.environ["HF_DATASETS_OFFLINE"] = "1"
+
+
+def _memory_settings_from_env() -> Any:
+    llm_model = os.getenv("LLM_MODEL") or ""
+    return SimpleNamespace(
+        # Session config
+        session_enabled=_env_bool(os.getenv("SESSION_ENABLED"), True),
+        session_provider=(os.getenv("SESSION_PROVIDER") or "postgres").strip().lower(),
+        session_db_path=os.getenv("SESSION_DB_PATH"),
+        session_ttl_seconds=_env_int(os.getenv("SESSION_TTL_SECONDS"), 1800),
+        session_cleanup_interval_seconds=_env_int(os.getenv("SESSION_CLEANUP_INTERVAL_SECONDS"), 300),
+        # Compaction config
+        compaction_enabled=_env_bool(os.getenv("COMPACTION_ENABLED"), True),
+        compaction_turns_threshold=_env_int(os.getenv("COMPACTION_TURNS_THRESHOLD"), 10),
+        compaction_keep_last_n=_env_int(os.getenv("COMPACTION_KEEP_LAST_N"), 20),
+        compaction_max_turns=_env_int(os.getenv("COMPACTION_MAX_TURNS"), 10),
+        compaction_token_budget=_env_int(os.getenv("COMPACTION_TOKEN_BUDGET"), 0) or None,
+        compaction_use_llm=_env_bool(os.getenv("COMPACTION_USE_LLM"), True),
+        compaction_llm_model=os.getenv("COMPACTION_LLM_MODEL") or None,
+        # Memory config
+        memory_enabled=_env_bool(os.getenv("MEMORY_ENABLED"), True),
+        memory_provider=(os.getenv("MEMORY_PROVIDER") or "mem0").strip().lower(),
+        memory_vector_store=(os.getenv("MEMORY_VECTOR_STORE") or "qdrant").strip().lower(),
+        memory_qdrant_path=os.getenv("MEMORY_QDRANT_PATH"),
+        qdrant_host=os.getenv("QDRANT_HOST"),
+        qdrant_port=os.getenv("QDRANT_PORT"),
+        qdrant_url=os.getenv("QDRANT_URL"),
+        qdrant_api_key=os.getenv("QDRANT_API_KEY"),
+        mem0_qdrant_collection=os.getenv("MEM0_QDRANT_COLLECTION"),
+        mem0_default_collection=os.getenv("MEM0_DEFAULT_COLLECTION"),
+        mem0_default_rerank_model=os.getenv("MEM0_DEFAULT_RERANK_MODEL"),
+        mem0_patch_cross_encoder_reranker=_env_bool(os.getenv("MEM0_PATCH_CROSS_ENCODER_RERANKER"), True),
+        qdrant_on_disk=_env_bool(os.getenv("QDRANT_ON_DISK"), False),
+        memory_faiss_path=os.getenv("MEMORY_FAISS_PATH"),
+        memory_rerank_enabled=_env_bool(os.getenv("MEM0_RERANK_ENABLED"), True),
+        memory_rerank_model=os.getenv("MEM0_RERANK_MODEL"),
+        memory_rerank_device=os.getenv("MEM0_RERANK_DEVICE"),
+        memory_rerank_batch_size=_env_int(os.getenv("MEM0_RERANK_BATCH_SIZE"), 32),
+        memory_rerank_show_progress=_env_bool(os.getenv("MEM0_RERANK_SHOW_PROGRESS"), False),
+        memory_llm_provider=os.getenv("MEMORY_LLM_PROVIDER") or ("litellm" if llm_model else None),
+        memory_litellm_model=os.getenv("MEMORY_LITELLM_MODEL") or (llm_model or None),
+        llm_model=llm_model or None,
+        memory_infer=_env_bool(os.getenv("MEMORY_INFER"), False),
+        azure_openai_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
+        azure_openai_key=os.getenv("AZURE_OPENAI_KEY") or os.getenv("AZURE_OPENAI_API_KEY"),
+        azure_openai_deployment_name=os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME"),
+        azure_openai_api_version=os.getenv("AZURE_OPENAI_API_VERSION"),
+        aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+        aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
+        aws_default_region=os.getenv("AWS_DEFAULT_REGION"),
+        aws_bedrock_model=os.getenv("AWS_BEDROCK_MODEL"),
+        embedding_model_id=os.getenv("EMBEDDING_MODEL_ID"),
+    )
 
 
 @app.on_event("startup")
@@ -1623,14 +1770,6 @@ async def startup_event():
         local_out = os.getenv("OUTPUT_FOLDER", "output")
         model = get_default_model()
         query_system_instance = ObligationQuerySystem(local_output_folder=local_out, model=model)
-        try:
-            from legal_rag.embeddings import warm_sentence_transformer
-
-            logging.info("Warming sentence-transformer embedding model...")
-            warm_sentence_transformer()
-            logging.info("Sentence-transformer warmup complete.")
-        except Exception as e:
-            logging.warning("Sentence-transformer warmup failed: %s", e)
         warmup_enabled = os.getenv("CHAT_WARMUP_ENABLED", "true").strip().lower() in (
             "true",
             "1",
@@ -1650,6 +1789,43 @@ async def startup_event():
                 )
             except Exception as e:
                 logging.warning("LLM warmup failed: %s", e)
+        global _memory_settings, _default_user_id, _default_run_id
+        _memory_settings = _memory_settings_from_env()
+        _default_user_id = str(uuid4())
+        _default_run_id = str(uuid4())
+        _ensure_hf_reranker_cached()
+        if _memory_settings.session_provider == "sqlite":
+            _reset_sqlite_session_store(_memory_settings.session_db_path or "")
+        if _memory_settings.memory_enabled:
+            _reset_memory_store(_memory_settings)
+        try:
+            from memory_management import initialize as memory_initialize
+
+            def _unused_connection():
+                raise RuntimeError("Postgres connection requested while using SQLite session provider")
+
+            memory_initialize(_memory_settings, _unused_connection, start_cleanup_worker=True)
+            try:
+                from memory_management.memory.adapter import get_memory as _prime_mem0
+
+                _prime_mem0()
+                logging.info("Memory system warmed: Mem0 ready")
+                try:
+                    try:
+                        from mem0.utils.spacy_models import get_nlp_full, get_nlp_lemma
+                    except ImportError:
+                        from mem0ai.utils.spacy_models import get_nlp_full, get_nlp_lemma
+
+                    get_nlp_lemma()
+                    get_nlp_full()
+                    logging.info("Memory system warmed: spaCy models ready")
+                except Exception as e:
+                    logging.warning("Memory warmup (spaCy) failed: %s", e)
+            except Exception as e:
+                logging.warning("Memory warmup (Mem0) failed: %s", e)
+            logging.info("Memory system initialized")
+        except Exception as e:
+            logging.warning("Memory system initialization failed: %s", e)
         logging.info(f"Query system initialized (output: {local_out}, model: {model})")
     except Exception as e:
         logging.error(f"Failed to initialize query system: {e}")
@@ -1712,17 +1888,38 @@ async def chat_rag_post(request: ChatRequest = Body(...)):
         ) from e
 
     try:
-        out = await run_chat_turn(
+        from memory_management import process_turn_async
+
+        sidecar: Dict[str, Any] = {}
+
+        async def _generate_fn(question: str, session_context: str, user_background: str, **_kwargs: Any):
+            out = await run_chat_turn(
+                question,
+                document_id=(request.document_id or "").strip() or None,
+                top_k=request.top_k,
+                session_context=session_context,
+                user_background=user_background,
+            )
+            sidecar.update(out)
+            return out["answer"]
+
+        settings = _memory_settings or _memory_settings_from_env()
+        user_id_resolved, run_id_resolved = _resolve_request_ids(request.user_id, request.run_id)
+        result = await process_turn_async(
             msg,
-            document_id=(request.document_id or "").strip() or None,
-            top_k=request.top_k,
+            user_id_resolved,
+            run_id_resolved,
+            _generate_fn,
+            settings,
         )
         return ChatResponse(
-            answer=out["answer"],
-            route=out["route"],
-            hit_count=out["hit_count"],
-            block_count=out["block_count"],
-            context_was_empty=out["context_was_empty"],
+            answer=result.answer or "",
+            user_id=result.user_id,
+            run_id=result.run_id,
+            route=sidecar.get("route", {}),
+            hit_count=sidecar.get("hit_count", 0),
+            block_count=sidecar.get("block_count", 0),
+            context_was_empty=sidecar.get("context_was_empty", False),
         )
     except HTTPException:
         raise
@@ -1744,6 +1941,38 @@ async def chat_rag_stream(request: ChatRequest = Body(...)):
     from legal_rag.retrieval import CHAT_SYSTEM_PROMPT
 
     msg = request.message.strip()
+    settings = _memory_settings or _memory_settings_from_env()
+    from memory_management.orchestrator import build_full_context, finalize_session_turn_after_assistant
+    from memory_management.session_manager import session_config_from_settings, get_session_provider
+
+    user_id_resolved, run_id_resolved = _resolve_request_ids(request.user_id, request.run_id)
+    (
+        session_context,
+        user_background,
+        compaction_queued,
+        run_id_compact,
+        user_id_compact,
+        provider,
+        run_id_resolved,
+        _memory_search_count,
+    ) = build_full_context(
+        user_id_resolved,
+        run_id_resolved,
+        msg,
+        settings,
+        session_enabled=None,
+        memory_enabled=None,
+    )
+    if provider is None:
+        try:
+            provider = get_session_provider(config=session_config_from_settings(settings))
+        except Exception:
+            provider = None
+    if provider is not None and user_id_resolved:
+        try:
+            provider.append_user_event(run_id_resolved, msg, user_id=user_id_resolved)
+        except Exception:
+            pass
     t_retrieval = time.perf_counter()
     _route, assembled, _blocks, _hits = run_chat_retrieval(
         msg,
@@ -1762,7 +1991,10 @@ async def chat_rag_stream(request: ChatRequest = Body(...)):
         )
 
     prompt = (
-        f"{CHAT_SYSTEM_PROMPT}\n\n---\nContext:\n{assembled}\n---\n\n"
+        f"{CHAT_SYSTEM_PROMPT}\n\n"
+        f"---\nSession Context:\n{session_context}\n---\n"
+        f"User Background:\n{user_background}\n---\n"
+        f"Retrieved Legal Context:\n{assembled}\n---\n\n"
         f"User question:\n{msg}"
     )
 
@@ -1770,6 +2002,7 @@ async def chat_rag_stream(request: ChatRequest = Body(...)):
         token_count = 0
         first_token_ms = None
         t_stream = time.perf_counter()
+        parts: List[str] = []
         async for token in generate_content_stream(
             prompt,
             model=get_default_model(),
@@ -1780,8 +2013,22 @@ async def chat_rag_stream(request: ChatRequest = Body(...)):
             token_count += 1
             if first_token_ms is None:
                 first_token_ms = (time.perf_counter() - t_stream) * 1000
+            parts.append(token)
             yield token
         total_stream = time.perf_counter() - t_stream
+        answer_content = "".join(parts)
+        finalize_session_turn_after_assistant(
+            msg,
+            answer_content,
+            user_id_resolved,
+            run_id_resolved,
+            provider,
+            settings,
+            compaction_queued=compaction_queued,
+            run_id_compact=run_id_compact,
+            user_id_compact=user_id_compact,
+            memory_enabled=bool(getattr(settings, "memory_enabled", False)),
+        )
         logging.info(
             "[chat_stream_timing] retrieval=%.3fs, first_token=%.0fms, stream=%.3fs, tokens=%s",
             retrieval_elapsed,
@@ -1790,7 +2037,14 @@ async def chat_rag_stream(request: ChatRequest = Body(...)):
             token_count,
         )
 
-    return StreamingResponse(token_generator(), media_type="text/plain")
+    return StreamingResponse(
+        token_generator(),
+        media_type="text/plain",
+        headers={
+            "X-Run-Id": run_id_resolved,
+            "X-User-Id": user_id_resolved,
+        },
+    )
 
 
 @app.delete("/rag/index/{document_name:path}", tags=["Documents"])
@@ -2168,6 +2422,101 @@ async def process_document(request: ProcessRequest):
             error=str(e)
         )
 
+
+@app.post("/rag/index", response_model=ProcessResponse, tags=["Processing"])
+async def rag_index_documents(request: ProcessRequest):
+    """Rebuild Qdrant RAG index from existing PDFs and consolidated JSON outputs."""
+    try:
+        from process_legal_documents import PDFProcessor, _obligation_pages_for_rag
+        from legal_rag.qdrant_store import delete_document, upsert_document_pages_and_obligations
+
+        docs_folder = request.docs_folder or os.getenv("DOCS_FOLDER", "docs")
+        out_folder = request.output_folder or os.getenv("OUTPUT_FOLDER", "output")
+
+        output_root = Path(out_folder)
+        consolidated_files = sorted(output_root.rglob("*_consolidated.json"))
+        if not consolidated_files:
+            return ProcessResponse(
+                status="error",
+                message="No consolidated JSON files found for indexing",
+                total_documents=0,
+                successful=0,
+                failed=0,
+                results=[],
+                error="Missing *_consolidated.json under output folder",
+            )
+
+        pdf_root = Path(docs_folder)
+        pdf_paths = list(pdf_root.rglob("*.pdf"))
+        pdf_lookup = {p.name.lower(): p for p in pdf_paths}
+        pdf_stem_lookup = {p.stem.lower(): p for p in pdf_paths}
+
+        pdf_processor = PDFProcessor(
+            tesseract_cmd=os.getenv("TESSERACT_CMD"),
+            cache_folder=os.getenv("CACHE_FOLDER", "ocr_cache"),
+            poppler_path=os.getenv("POPPLER_PATH"),
+        )
+
+        results = []
+        ok = 0
+        failed = 0
+        for consolidated_path in consolidated_files:
+            try:
+                data = json.loads(consolidated_path.read_text(encoding="utf-8"))
+                doc_name = (data.get("document_name") or consolidated_path.stem).strip()
+                consolidated_results = data.get("consolidated_results") or []
+                pdf_path = pdf_lookup.get(doc_name.lower()) or pdf_stem_lookup.get(doc_name.lower())
+                if pdf_path is None:
+                    raise FileNotFoundError(f"PDF not found for document_name={doc_name}")
+                page_texts = pdf_processor.process_pdf(str(pdf_path))
+                if not page_texts:
+                    raise ValueError("No page text extracted for PDF")
+                delete_document(doc_name)
+                stats = upsert_document_pages_and_obligations(
+                    document_id=doc_name,
+                    page_texts=page_texts,
+                    consolidated_obligations=consolidated_results,
+                    page_for_obligation=_obligation_pages_for_rag(consolidated_results),
+                )
+                results.append(
+                    {
+                        "document_name": doc_name,
+                        "status": "success",
+                        "stats": stats,
+                        "pdf_path": str(pdf_path),
+                    }
+                )
+                ok += 1
+            except Exception as e:
+                results.append(
+                    {
+                        "document_name": consolidated_path.name,
+                        "status": "error",
+                        "error": str(e),
+                    }
+                )
+                failed += 1
+
+        return ProcessResponse(
+            status="success" if ok else "error",
+            message=f"Qdrant index updated: {ok} succeeded, {failed} failed",
+            total_documents=len(consolidated_files),
+            successful=ok,
+            failed=failed,
+            results=results,
+            error=None if ok else "All indexing attempts failed",
+        )
+    except Exception as e:
+        logging.error("Error rebuilding Qdrant index: %s", e, exc_info=True)
+        return ProcessResponse(
+            status="error",
+            message=str(e),
+            total_documents=0,
+            successful=0,
+            failed=0,
+            results=[],
+            error=str(e),
+        )
 
 @app.get("/documents", tags=["Documents"])
 async def list_documents():

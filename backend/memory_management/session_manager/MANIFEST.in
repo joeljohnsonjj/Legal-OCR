@@ -1,0 +1,8 @@
+include README.md
+include LICENSE
+include pyproject.toml
+recursive-include session_manager *.py
+recursive-include session_manager *.txt
+recursive-exclude session_manager __pycache__
+recursive-exclude session_manager *.pyc
+recursive-exclude session_manager *.pyo

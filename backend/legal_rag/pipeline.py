@@ -64,6 +64,8 @@ async def run_chat_turn(
     top_k: int = 8,
     answer_model: Optional[str] = None,
     router_model: Optional[str] = None,
+    session_context: str = "",
+    user_background: str = "",
 ) -> Dict[str, Any]:
     """
     Full chat: retrieval (router → Qdrant → context) then answer LLM.
@@ -92,7 +94,10 @@ async def run_chat_turn(
         )
 
     prompt = (
-        f"{CHAT_SYSTEM_PROMPT}\n\n---\nContext:\n{assembled}\n---\n\n"
+        f"{CHAT_SYSTEM_PROMPT}\n\n"
+        f"---\nSession Context:\n{session_context}\n---\n"
+        f"User Background:\n{user_background}\n---\n"
+        f"Retrieved Legal Context:\n{assembled}\n---\n\n"
         f"User question:\n{user_message}"
     )
 

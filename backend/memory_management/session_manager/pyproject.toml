@@ -1,0 +1,69 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "session-manager"
+version = "1.0.0"
+description = "Production-grade session management library with state tracking, compaction, and observability"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [
+    {name = "G10X Technology", email = "contact@g10x.com"}
+]
+keywords = ["session", "state-management", "conversation", "chatbot", "llm"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+
+dependencies = [
+    "psycopg2-binary>=2.9.0",
+    "pydantic>=2.0.0",
+]
+
+[project.optional-dependencies]
+# Optional tracing support with Opik
+tracing = [
+    "opik>=0.1.0",
+]
+# Development dependencies
+dev = [
+    "pytest>=7.4.0",
+    "black>=23.0.0",
+    "flake8>=6.0.0",
+    "mypy>=1.5.0",
+    "python-dotenv>=1.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/your-org/session-manager"
+Documentation = "https://github.com/your-org/session-manager#readme"
+Repository = "https://github.com/your-org/session-manager.git"
+Issues = "https://github.com/your-org/session-manager/issues"
+
+[tool.setuptools]
+packages = ["session_manager"]
+
+[tool.setuptools.package-data]
+session_manager = ["py.typed"]
+
+[tool.black]
+line-length = 120
+target-version = ['py38']
+
+[tool.mypy]
+python_version = "3.8"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false

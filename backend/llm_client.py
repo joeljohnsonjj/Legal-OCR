@@ -14,7 +14,7 @@ load_dotenv()
 
 def _use_litellm() -> bool:
     """True if LITELLM_MODEL is set (unified model switching via LiteLLM)."""
-    return bool((os.getenv("LITELLM_MODEL") or "").strip())
+    return bool((os.getenv("LITELLM_MODEL") or os.getenv("LLM_MODEL") or "").strip())
 
 
 def _use_azure_openai() -> bool:
@@ -25,7 +25,7 @@ def _use_azure_openai() -> bool:
 def get_default_model() -> str:
     """Return the default model/deployment name. Uses LITELLM_MODEL if set, else Azure or Gemini env vars."""
     if _use_litellm():
-        return (os.getenv("LITELLM_MODEL") or "").strip()
+        return (os.getenv("LITELLM_MODEL") or os.getenv("LLM_MODEL") or "").strip()
     if _use_azure_openai():
         return os.getenv("AZURE_OPENAI_DEPLOYMENT") or os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME") or os.getenv("OPENAI_DEPLOYMENT_NAME") or "gpt-4o"
     return os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
@@ -36,15 +36,20 @@ def validate_llm_environment() -> None:
     Raise ValueError if required credentials for the active llm_client routing are missing.
     Matches generate_content: LiteLLM (LITELLM_MODEL) first, else Azure, else Gemini.
     """
-    _litellm = (os.getenv("LITELLM_MODEL") or "").strip()
+    _litellm = (os.getenv("LITELLM_MODEL") or os.getenv("LLM_MODEL") or "").strip()
     _use_azure = _use_azure_openai()
     if _litellm:
         lm = _litellm.lower()
         if lm.startswith("bedrock/"):
-            region = (os.getenv("AWS_REGION_NAME") or os.getenv("AWS_REGION") or "").strip()
+            region = (
+                os.getenv("AWS_REGION_NAME")
+                or os.getenv("AWS_REGION")
+                or os.getenv("AWS_DEFAULT_REGION")
+                or ""
+            ).strip()
             if not region:
                 raise ValueError(
-                    "LITELLM_MODEL is Bedrock (bedrock/...); set AWS_REGION or AWS_REGION_NAME in .env. "
+                    "LITELLM_MODEL (or LLM_MODEL) is Bedrock (bedrock/...); set AWS_REGION or AWS_REGION_NAME in .env. "
                     "Ensure AWS credentials can call bedrock:InvokeModel (fix SSM/init_llm_env IAM or use static keys / profile)."
                 )
         elif lm.startswith("azure/"):
@@ -52,12 +57,12 @@ def validate_llm_environment() -> None:
                 os.getenv("AZURE_OPENAI_API_KEY") or os.getenv("AZURE_OPENAI_KEY") or os.getenv("OPENAI_API_KEY")
             ):
                 raise ValueError(
-                    "LITELLM_MODEL is azure/...; set AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_API_KEY (or AZURE_OPENAI_KEY) in .env"
+                    "LITELLM_MODEL (or LLM_MODEL) is azure/...; set AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_API_KEY (or AZURE_OPENAI_KEY) in .env"
                 )
         elif lm.startswith("gemini/") or lm.startswith("vertex_ai/"):
             if not os.getenv("GEMINI_API_KEY") and not os.getenv("GOOGLE_API_KEY"):
                 raise ValueError(
-                    "LITELLM_MODEL is Gemini/Vertex; set GEMINI_API_KEY or GOOGLE_API_KEY in .env (https://aistudio.google.com/app/apikey)"
+                    "LITELLM_MODEL (or LLM_MODEL) is Gemini/Vertex; set GEMINI_API_KEY or GOOGLE_API_KEY in .env (https://aistudio.google.com/app/apikey)"
                 )
     elif _use_azure:
         if not os.getenv("AZURE_OPENAI_ENDPOINT") or not (

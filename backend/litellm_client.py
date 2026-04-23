@@ -1,11 +1,12 @@
 """
 LiteLLM wrapper: same interface as llm_client (generate_content, generate_content_async, generate_content_stream).
-Use when LITELLM_MODEL is set in .env to switch providers without code changes.
+Use when LITELLM_MODEL (or LLM_MODEL) is set in .env to switch providers without code changes.
 
 Examples:
   LITELLM_MODEL=gemini/gemini-2.5-flash-lite
   LITELLM_MODEL=azure/gpt-4o-mini
   LITELLM_MODEL=bedrock/anthropic.claude-3-5-sonnet-20240620-v1:0
+  # Or set LLM_MODEL with the same values
 
 - Azure: set AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_KEY, AZURE_OPENAI_API_VERSION; model = azure/<deployment_name>.
 - Gemini: set GEMINI_API_KEY or GOOGLE_API_KEY.
@@ -28,7 +29,7 @@ class LiteLLMResponse:
 
 
 def _litellm_model() -> Optional[str]:
-    return (os.getenv("LITELLM_MODEL") or "").strip() or None
+    return (os.getenv("LITELLM_MODEL") or os.getenv("LLM_MODEL") or "").strip() or None
 
 
 def _sanitize_header(s: str) -> str:
@@ -73,7 +74,9 @@ def _bedrock_kwargs(model: str):
     Values sanitized for headers."""
     if not (model or "").strip().lower().startswith("bedrock/"):
         return {}
-    region = _sanitize_header(os.getenv("AWS_REGION_NAME") or os.getenv("AWS_REGION") or "")
+    region = _sanitize_header(
+        os.getenv("AWS_REGION_NAME") or os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or ""
+    )
     out = {}
     if region:
         out["aws_region_name"] = region
@@ -114,7 +117,7 @@ def generate_content(
 
     model_name = model or _litellm_model()
     if not model_name:
-        raise ValueError("LITELLM_MODEL must be set in .env when using LiteLLM")
+        raise ValueError("LITELLM_MODEL or LLM_MODEL must be set in .env when using LiteLLM")
 
     kwargs = {
         "model": model_name,
@@ -156,7 +159,7 @@ async def generate_content_async(
 
     model_name = model or _litellm_model()
     if not model_name:
-        raise ValueError("LITELLM_MODEL must be set in .env when using LiteLLM")
+        raise ValueError("LITELLM_MODEL or LLM_MODEL must be set in .env when using LiteLLM")
 
     kwargs = {
         "model": model_name,
@@ -197,7 +200,7 @@ async def generate_content_stream(
 
     model_name = model or _litellm_model()
     if not model_name:
-        raise ValueError("LITELLM_MODEL must be set in .env when using LiteLLM")
+        raise ValueError("LITELLM_MODEL or LLM_MODEL must be set in .env when using LiteLLM")
 
     kwargs = {
         "model": model_name,

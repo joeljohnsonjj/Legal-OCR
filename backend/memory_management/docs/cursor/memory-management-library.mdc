@@ -1,0 +1,76 @@
+---
+description: Step-by-step integration for memory_management library (install, DB, env, LLMs, tracing).
+globs: memory_management/**/*.py,**/api.py,**/endpoints.py,**/settings.py
+alwaysApply: false
+---
+
+# memory_management — integration checklist (follow in order)
+
+## Step 1 — Install
+
+```bash
+pip install -r memory_management/requirements.txt
+pip install -e ./memory_management
+```
+
+## Step 2 — Database
+
+Run **`memory_management/session_manager/setup_database.sql`** once on the target Postgres (same DB the app will use for `get_connection`).
+
+## Step 3 — Environment file
+
+Copy **`memory_management/.env.example`** into the host project `.env` (merge keys). In app **startup**, call **`load_dotenv()`** before session code that reads **`os.environ`**.
+
+## Step 4 — Know the three LLM roles (do not mix them)
+
+1. **Chat/RAG** — Your **`generate_fn`** in `process_turn`; your env keys for your stack.
+2. **Compaction** — Library calls only **`llm_summarize(prompt)`** you pass to `initialize` / `process_turn`. Env **`COMPACTION_USE_LLM`**, thresholds — **`COMPACTION_LLM_MODEL` is read by the host app** to build a second Bedrock client if desired; the **library does not** instantiate from that env alone.
+3. **Mem0** — Configured via **`set_memory_config`** (`memory_*`, Azure or AWS keys). See **`memory_management/docs/GETTING_STARTED.md` §6**.
+
+## Step 5 — Startup code
+
+```python
+load_dotenv()
+from memory_management import initialize, process_turn
+initialize(settings, get_connection, llm_summarize=..., start_cleanup_worker=True)
+```
+
+`initialize` runs **`set_memory_config(settings)`**. `settings` must expose `memory_*`, `session_*`, `compaction_*`, `aws_*`, etc. (Pydantic or SimpleNamespace).
+
+## Step 6 — Request handler
+
+**`generate_fn(question, session_context, user_background, **kwargs)`** — pass both strings into your LLM as **separate labeled blocks** (see **`memory_management/docs/GETTING_STARTED.md` §6b** for the suggested system prompt addendum). **`result.full_context`** is the joined string for logging only.
+
+```python
+result = process_turn(..., generate_fn=..., settings=settings, llm_summarize=...)
+# Return result.run_id, result.user_id to the client
+```
+
+## Step 6b (optional) — LLM `WORKING_STATE_PATCH`
+
+`process_turn` does **not** parse or persist structured working-state lines from the chat model. If you need that, follow **`memory_management/docs/WORKING_STATE_LLM_PATCH.md`** after **`GETTING_STARTED.md` §10** (prompt, parse in `generate_fn`, merge + `update_working_state` after `process_turn`).
+
+## Step 7 — Session provider without explicit config
+
+**`get_session_provider()`** with **`config=None`** uses **`session_config_from_env()`** only — requires env vars loaded (Step 3).
+
+## Step 8 — Tracing
+
+There is **no** `TRACING_ENABLED` in the library. Use **`OPIK_TRACK_DISABLE=true`** to turn Opik off, or omit **`opik`**. Working-state file trace: **`WORKING_STATE_TRACE_FILE=0`** to disable.
+
+## Step 9 — Independence rules when editing `memory_management/`
+
+- Never **`from src.*`** or host app imports inside the library.
+- Config = **`set_memory_config`**, **`session_config_from_env`**, or parameters to **`initialize` / `process_turn`**.
+
+## Step 10 — Canonical docs (all under `memory_management/docs/`)
+
+| Doc | Path |
+|-----|------|
+| Main guide | **`memory_management/docs/GETTING_STARTED.md`** |
+| Env lookup | **`memory_management/docs/ENV_VARS.md`** |
+| Code map | **`memory_management/docs/STRUCTURE.md`** |
+| LLM working-state patch | **`memory_management/docs/WORKING_STATE_LLM_PATCH.md`** |
+| Strict coupling rules | This file + **`memory_management/docs/cursor/memory-management-integration.mdc`** |
+
+Copy the `.mdc` files from **`memory_management/docs/cursor/`** into the workspace **`.cursor/rules/`** so Cursor loads them when editing this repo.

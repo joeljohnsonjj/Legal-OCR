@@ -1,0 +1,84 @@
+Metadata-Version: 2.4
+Name: memory-management
+Version: 1.1.0
+Summary: Session management and Mem0 memory library for chatbots
+Author-email: G10X Technology <contact@g10x.com>
+License: MIT
+Project-URL: Homepage, https://github.com/your-org/memory-management
+Project-URL: Repository, https://github.com/your-org/memory-management.git
+Keywords: session,memory,mem0,chatbot,llm
+Classifier: Development Status :: 4 - Beta
+Classifier: Intended Audience :: Developers
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Operating System :: OS Independent
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.8
+Classifier: Programming Language :: Python :: 3.9
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Programming Language :: Python :: 3.12
+Requires-Python: >=3.8
+Description-Content-Type: text/markdown
+Requires-Dist: boto3>=1.34.0
+Requires-Dist: langchain-aws>=0.1.0
+Requires-Dist: mem0ai>=0.1.0
+Requires-Dist: opik>=0.1.0
+Requires-Dist: psycopg2-binary>=2.9.0
+Requires-Dist: pydantic>=2.0.0
+Requires-Dist: python-dotenv>=1.0.0
+Requires-Dist: qdrant-client>=1.9.0
+Requires-Dist: sentence-transformers>=3.0.0
+Provides-Extra: dev
+Requires-Dist: pytest>=7.4.0; extra == "dev"
+Requires-Dist: black>=23.0.0; extra == "dev"
+Requires-Dist: flake8>=6.0.0; extra == "dev"
+Requires-Dist: mypy>=1.5.0; extra == "dev"
+
+# memory-management
+
+Postgres **sessions** (context, compaction, cleanup) + **Mem0** long-term memory. No host-app imports inside the package code.
+
+## Documentation (single place)
+
+**→ [docs/README.md](docs/README.md)** — index of all guides.
+
+**Quick path:** [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md) (install → SQL → `.env` → LLMs → tracing). **LLM working-state patches:** [docs/WORKING_STATE_LLM_PATCH.md](docs/WORKING_STATE_LLM_PATCH.md).
+
+## Package root files
+
+| File | Purpose |
+|------|---------|
+| [requirements.txt](requirements.txt) | Pip dependencies |
+| [.env.example](.env.example) | Copy into your app’s `.env` |
+| [pyproject.toml](pyproject.toml) | Package metadata (`pip install -e ./memory_management`) |
+
+## Install
+
+```bash
+pip install -r memory_management/requirements.txt
+pip install -e ./memory_management
+```
+
+## Minimal API
+
+```python
+from memory_management import initialize, process_turn
+initialize(settings, get_connection, llm_summarize=..., start_cleanup_worker=True)
+result = process_turn(question, user_id, run_id, generate_fn=..., settings=settings, llm_summarize=...)
+```
+
+## Cursor rules
+
+Copy **`memory_management/docs/cursor/*.mdc`** into the workspace **`.cursor/rules/`** (see [docs/cursor/](docs/cursor/)).
+
+## Historical / planning docs
+
+Moved to **`docs/archive_memory_management/`** at the project root (outside this folder). See that folder’s `README.md`.
+
+## Smoke test
+
+```bash
+python memory_management/test_smoke.py
+```
+
+MIT License — see `pyproject.toml`.

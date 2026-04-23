@@ -1,0 +1,117 @@
+---
+description: Integrate memory_management (session + Mem0) into any chatbot. Follow when adding or wiring this library.
+globs: memory_management/**/*.py,api.py,**/endpoints.py,**/main.py,**/pipeline.py,**/bedrock_llm.py,**/super_rag.py,**/database/services.py
+alwaysApply: false
+---
+
+# memory_management: Integration Rules for Any Chatbot
+
+**Start with:** `memory_management/docs/GETTING_STARTED.md`. **Step-by-step rule:** `memory_management/docs/cursor/memory-management-library.mdc` (copy `.mdc` files into workspace `.cursor/rules/`).
+
+## Preferred: Unified Interface (2 calls)
+
+**Startup:**
+```python
+from memory_management import initialize
+initialize(settings, db_manager.get_connection, llm_summarize=lambda p: llm.generate_response(prompt=p) or "")
+```
+
+**Per request:**
+```python
+from memory_management import process_turn
+result = process_turn(
+    question, user_id, run_id,
+    generate_fn=lambda q, sc, ub: pipeline.generate_answer(q, session_context=sc, user_background=ub),
+    settings=settings,
+    llm_summarize=lambda p: llm.generate_response(prompt=p) or "",
+)
+# Return result.run_id, result.user_id to client; result.answer is the response content
+```
+
+**App responsibilities:** Provide **`generate_fn(question, session_context, user_background, **kwargs)`** that returns the answer (`str` or object with `.content`). Pass **`session_context`** and **`user_background`** into the chat model as **separate** labeled regions; see **`memory_management/docs/GETTING_STARTED.md` §6b**. Return **`result.run_id`** and **`result.user_id`** to the client. Maintain app DB (questions/answers) if needed.
+
+**Optional — LLM `WORKING_STATE_PATCH`:** `process_turn` does **not** persist structured working-state patches from the model. If you want the chat LLM to update `session_working_state.working_state`, follow **`memory_management/docs/WORKING_STATE_LLM_PATCH.md`** (prompt, parse in `generate_fn`, merge + `update_working_state` after `process_turn`).
+
+---
+
+## How This Rule Works (Context / Prompt)
+When you open files that match the rule (memory_management code, api.py, endpoints.py, main.py), Cursor adds this file’s content to the AI’s context. So the AI is reminded of the integration steps and will suggest code that follows them. You don’t have to paste the steps every time. For a longer plain-English guide, see `memory_management/docs/HOW_TO_USE_AS_LIBRARY.md`.
+
+## What This Library Is
+- **Session**: Postgres-backed sessions, context building, compaction, cleanup. Requires DB tables and a backend wired at startup.
+- **Memory**: Mem0 (add/search) with config via `set_memory_config(...)` once at startup. No app imports inside the library.
+
+## 1. Install
+- From repo root: `pip install -e ./memory_management` (or add to project deps).
+- Use this library as the single source for session + memory; do not mix with standalone `session_manager` or app `src.memory` for the same behavior.
+
+## 2. Config the App Must Provide
+- **Session**: DB connection (e.g. `DATABASE_URL`). Optional: `SESSION_TTL_SECONDS`, cleanup/compaction env if using `session_config_from_env()`.
+- **Memory**: Azure OpenAI or Bedrock keys; `memory_enabled`, `memory_faiss_path`; optionally `memory_provider`, `memory_llm_provider`, `memory_infer`. Same keys as existing app memory settings.
+- **`get_session_provider()` with no arguments** uses **`session_config_from_env()`** (reads `os.environ` only). Call `load_dotenv()` in the host app first, or pass **`get_session_provider(session_config_from_settings(settings))`** explicitly.
+
+## 3. Startup (Exactly Once) — Manual wiring (deprecated: prefer `initialize()`)
+Run before handling requests (e.g. FastAPI lifespan or `main()`):
+
+**Memory (Option A):**
+```python
+from memory_management.memory import set_memory_config
+set_memory_config(settings)  # or dict with memory_*, azure_*, aws_* keys
+```
+
+**Session backend:**
+- Run the library DB setup (e.g. `setup_database.sql`) so `session_registry`, `session_working_state`, `session_conversation_turns` exist.
+- Then:
+```python
+from memory_management.session_manager.storage.session_services import set_default_backend
+from memory_management.session_manager.storage.backend import SessionBackend
+from memory_management.session_manager.services import provider_factory
+
+backend = SessionBackend(get_connection)
+set_default_backend(backend)
+provider_factory._app_session_backend = backend
+```
+
+## 4. Usage in Code
+- **Session**: `from memory_management.session_manager import get_session_provider, build_session_context, create_session, append_session_event, ...` or `from memory_management import ...`.
+- **Memory**: `from memory_management.memory import get_memory_provider` then `provider.search(...)`, `provider.add(...)`, `provider.get_all(...)`.
+- Prefer either direct imports from `memory_management` or a thin app shim that re-exports and ensures startup steps ran. Do not mix multiple sources for the same concern.
+
+## 5. Rules When Editing the Library
+- No imports from the host app (no `src.*`, no app-specific settings). Config only via `set_memory_config(...)` and session backend injection.
+- Session subpackage: relative imports (e.g. `from .core import ...`). Memory: relative or `memory_management.memory.*`.
+- Keep public API stable: memory — `set_memory_config`, `get_memory_provider`, `get_memory`, `search`, `add`, `get_all`, `clear_memory_index`; session — as in `memory_management.session_manager` or root re-exports.
+
+## 6. Integration Checklist (App-Side) — Ensure All of These
+
+When integrating this library into a chatbot, verify every item so session and memory work correctly and "summarize this chat" / "what do you know about me" behave as expected.
+
+### 6.1 IDs (run_id, user_id)
+- **Create in app when missing:** If the client does not send `run_id`, generate one (e.g. `uuid.uuid4()`). If the client does not send `user_id`, use `run_id` (or a fixed app user) so the conversation is still scoped. Do this before calling session/memory so every request has valid IDs.
+- **Return in API response:** Always return `run_id` and `user_id` in the response body so the client can send them back on the next request. Without this, each request gets a new session and conversation context is lost.
+- **Pass into pipeline:** Pass request `run_id` (and optionally `user_id`) from the API into the RAG/pipeline layer so the same run is used for session context build, Mem0 search/add, and compaction.
+
+### 6.2 Session
+- **Tables:** Library session tables (`session_registry`, `session_working_state`, `session_conversation_turns`) must exist (run library `setup_database.sql`).
+- **Backend wired at startup:** `SessionBackend(get_connection)`, `set_default_backend(backend)`, `provider_factory._app_session_backend = backend` so the library can read/write session.
+- **Context built once, before routing:** `build_full_context` (or **`process_turn`**) yields **`session_context`** + **`user_background`**. Pass **both** into standard RAG **and** SuperRAG so meta-questions behave the same. See **GETTING_STARTED.md §6b** for prompt rules (summarize = session only).
+- **Persistence order:** Append user message to session **before** generating the reply; append assistant message **after** generating. So the current turn is in session for the next request.
+- **Compaction:** When `build_session_context` (or equivalent) signals compaction (e.g. `compaction_queued`), call `run_compaction(...)` with the app’s LLM for summarization so history stays bounded.
+- **Expiry / cleanup (required for production):** Sessions have a TTL; expired ones stay `status='active'` in the DB until the app runs the cleanup worker. You **must** run `run_cleanup_once` (or `run_cleanup_loop`) periodically (e.g. every `session_cleanup_interval_seconds`) so expired sessions are archived. Without this, the active session list grows forever. Use `get_cleanup_config_from_settings(settings)` and pass `session_backend` and `llm_summarize` (for archive summarization).
+
+### 6.3 Memory (Mem0)
+- **Config at startup:** `set_memory_config(settings)` once so Mem0 can use FAISS and LLM.
+- **Search:** `build_full_context` / **`process_turn`** runs search and passes hits as **`user_background`** (`--- User Background ---` block). The host must forward that string **separately** from **`session_context`** in the LLM prompt.
+- **Add:** After each assistant response, **`process_turn`** calls Mem0 **`add`** for you. Without successful turns, "what do you know about me" stays empty.
+
+### 6.4 App DB (questions/answers)
+- **run_id on app tables:** If the app stores questions/answers, add `run_id` to those tables (e.g. `migrations/add_run_id_to_questions_answers.sql`) and save/return it. This links app data to the same conversation. Optionally make save resilient: if `run_id` column does not exist, fall back to INSERT without run_id and log that the migration should be run.
+
+### 6.5 Prompts
+- **Two strings + roles:** Use **`session_context`** for this thread; **`user_background`** for cross-session facts (**use when relevant**, but not as "lines we said in chat" unless also in session). For **summarize / recap this chat**, use **session only**; see **GETTING_STARTED.md §6b** copy-paste block. Optionally add a **pipeline guard** if models still treat RAG chunks as dialogue.
+
+### 6.5b LLM working-state patch (optional)
+- **Full guide:** `memory_management/docs/WORKING_STATE_LLM_PATCH.md` (canonical prompt, `parse_llm_response_for_working_state`, post-`process_turn` `merge_working_state_patch` + `provider.update_working_state`). Skip if you do not need structured progress/investigation state from the chat model.
+
+### 6.6 Diagnostics (optional)
+- **Structured log:** Optionally log per request: request vs resolved `user_id`/`run_id`, session context length, memory search result count, path used (standard_rag vs super_rag), success. E.g. `SESSION_MEMORY_DIAGNOSTICS=true` and write to `logs/session_memory.jsonl`. Use this to debug missing run_id, empty session, or wrong path.

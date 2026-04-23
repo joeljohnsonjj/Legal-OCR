@@ -4,6 +4,7 @@ Embed text for Qdrant vectors. Keep in sync with production embedding model (env
 
 from __future__ import annotations
 
+import json
 import os
 from functools import lru_cache
 from typing import List, Optional
@@ -11,7 +12,47 @@ from typing import List, Optional
 
 @lru_cache(maxsize=1)
 def _embedding_dim() -> int:
+    if _use_bedrock_embeddings():
+        return 1024
     return int(os.getenv("RAG_EMBEDDING_DIM", "384"))
+
+
+def _use_bedrock_embeddings() -> bool:
+    if (os.getenv("RAG_USE_BEDROCK_EMBEDDING") or "").strip().lower() in ("true", "1", "yes"):
+        return True
+    if (os.getenv("RAG_EMBEDDING_PROVIDER") or "").strip().lower() == "bedrock":
+        return True
+    return False
+
+
+@lru_cache(maxsize=1)
+def _bedrock_client():
+    import boto3
+
+    region = (os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "us-east-1").strip()
+    return boto3.client("bedrock-runtime", region_name=region)
+
+
+def _bedrock_model_id() -> str:
+    return (
+        os.getenv("EMBEDDING_MODEL_ID")
+        or "amazon.titan-embed-text-v2:0"
+    ).strip()
+
+
+def _embed_texts_bedrock(texts: List[str]) -> List[List[float]]:
+    client = _bedrock_client()
+    model_id = _bedrock_model_id()
+    out: List[List[float]] = []
+    for text in texts:
+        body = {"inputText": text}
+        resp = client.invoke_model(modelId=model_id, body=json.dumps(body))
+        payload = json.loads(resp["body"].read())
+        embedding = payload.get("embedding") or payload.get("vector")
+        if not embedding:
+            raise ValueError(f"Bedrock embedding response missing vector (keys={list(payload.keys())})")
+        out.append(embedding)
+    return out
 
 
 def embed_texts(texts: List[str], model: Optional[str] = None) -> List[List[float]]:
@@ -22,6 +63,8 @@ def embed_texts(texts: List[str], model: Optional[str] = None) -> List[List[floa
     """
     if not texts:
         return []
+    if _use_bedrock_embeddings():
+        return _embed_texts_bedrock(texts)
     use_local = os.getenv("USE_LOCAL_EMBEDDING", "").strip().lower() in ("true", "1", "yes")
     use_openai = bool(os.getenv("OPENAI_API_KEY", "").strip())
     if use_local:
@@ -52,7 +95,14 @@ def embed_text(text: str) -> List[float]:
 
 
 def warm_sentence_transformer() -> None:
-    """Preload sentence-transformers model at startup to avoid first-request latency."""
+    """Warm embedding backend to avoid first-request latency."""
+    if _use_bedrock_embeddings():
+        try:
+            _embed_texts_bedrock(["warmup"])
+        except Exception:
+            # Warmup is best-effort; failures should not stop startup.
+            return
+        return
     use_local = os.getenv("USE_LOCAL_EMBEDDING", "").strip().lower() in ("true", "1", "yes")
     if not use_local and os.getenv("OPENAI_API_KEY", "").strip():
         return
