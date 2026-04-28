@@ -6,8 +6,8 @@ import {
   useState,
   type ReactNode,
 } from 'react';
-import { ChevronDown, ChevronUp, Send } from 'lucide-react';
-import { chatQueryStream } from '../services/apiService';
+import { ChevronDown, ChevronUp, RotateCcw, Send } from 'lucide-react';
+import { chatQueryStream, chatReset } from '../services/apiService';
 import {
   CHAT_ACCENT_ON_LIGHT,
   CHAT_ACCENT_ON_RED,
@@ -94,8 +94,37 @@ type UiMessage = {
   content: string;
 };
 
+type ChatSessionIds = {
+  userId: string;
+  runId: string;
+};
+
+type ChatStorageState = {
+  messages: UiMessage[];
+  session: ChatSessionIds;
+};
+
 function normalizeAssistantAnswer(text: string): string {
   return text.replace(/^answer:\s*/i, '').trim();
+}
+
+function storageKey(landRecordId: string): string {
+  return `legal-ocr-chat:${landRecordId}`;
+}
+
+function introMessage(): UiMessage[] {
+  return [{ id: 'intro', role: 'assistant', content: 'How can I help you?' }];
+}
+
+function createSessionIds(): ChatSessionIds {
+  if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) {
+    return { userId: crypto.randomUUID(), runId: crypto.randomUUID() };
+  }
+  const stamp = Date.now();
+  return {
+    userId: `user-${stamp}-${Math.random().toString(16).slice(2)}`,
+    runId: `run-${stamp}-${Math.random().toString(16).slice(2)}`,
+  };
 }
 
 /** Linkify URLs and highlight “Clause … – …” spans like the reference mock. */
@@ -154,28 +183,50 @@ function formatMessageBody(
 ): ReactNode {
   const lines = content.split('\n');
   const accent = variant === 'user' ? CHAT_ACCENT_ON_RED : CHAT_ACCENT_ON_LIGHT;
+  const quoteStyle =
+    variant === 'user'
+      ? { color: 'rgba(255,255,255,0.95)' }
+      : { color: CHAT_TEXT_SECONDARY };
 
   return lines.map((line, li) => {
     const trimmed = line.trim();
-    const isQuoted =
-      trimmed.length >= 2 && trimmed.startsWith('"') && trimmed.endsWith('"');
-    const inner = isQuoted ? trimmed.slice(1, -1) : line;
-    const body = isQuoted ? (
-      <em
-        style={
-          variant === 'user'
-            ? { color: 'rgba(255,255,255,0.95)' }
-            : { color: CHAT_TEXT_SECONDARY }
-        }
-      >
-        &quot;{formatInlineSegment(inner, `${keyBase}-q-${li}`, accent)}&quot;
+    const quoteChar = trimmed.length >= 2 ? trimmed[0] : '';
+    const isFullyQuoted =
+      (quoteChar === '"' || quoteChar === "'") && trimmed.endsWith(quoteChar);
+    const body = isFullyQuoted ? (
+      <em style={quoteStyle}>
+        {quoteChar}
+        {formatInlineSegment(trimmed.slice(1, -1), `${keyBase}-q-${li}`, accent)}
+        {quoteChar}
       </em>
     ) : (
       <span
         className={variant === 'user' ? 'text-white' : ''}
         style={variant === 'assistant' ? { color: CHAT_TEXT_PRIMARY } : undefined}
       >
-        {formatInlineSegment(line, `${keyBase}-l-${li}`, accent)}
+        {line
+          .split(/(".*?"|'.*?')/g)
+          .filter((segment) => segment.length > 0)
+          .map((segment, si) => {
+            const segQuote = segment.length >= 2 ? segment[0] : '';
+            const isQuotedSegment =
+              (segQuote === '"' || segQuote === "'") && segment.endsWith(segQuote);
+            if (!isQuotedSegment) {
+              return (
+                <span key={`${keyBase}-s-${li}-${si}`}>
+                  {formatInlineSegment(segment, `${keyBase}-s-${li}-${si}`, accent)}
+                </span>
+              );
+            }
+            const inner = segment.slice(1, -1);
+            return (
+              <em key={`${keyBase}-q-${li}-${si}`} style={quoteStyle}>
+                {segQuote}
+                {formatInlineSegment(inner, `${keyBase}-q-${li}-${si}`, accent)}
+                {segQuote}
+              </em>
+            );
+          })}
       </span>
     );
     return (
@@ -192,15 +243,14 @@ export function ChatSidebar({
   onClose,
   landRecordId = DEFAULT_LAND_RECORD_ID,
 }: ChatSidebarProps) {
-  const [messages, setMessages] = useState<UiMessage[]>([
-    { id: 'intro', role: 'assistant', content: 'How can I help you?' },
-  ]);
+  const [messages, setMessages] = useState<UiMessage[]>(introMessage());
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
   const [sendHovered, setSendHovered] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [collapsed, setCollapsed] = useState(false);
   const [streamingMessageId, setStreamingMessageId] = useState<string | null>(null);
+  const [sessionIds, setSessionIds] = useState<ChatSessionIds | null>(null);
   const [panelSize, setPanelSize] = useState(() => ({
     w: CHAT_PANEL_WIDTH,
     h: defaultChatHeightPx(),
@@ -238,12 +288,40 @@ export function ChatSidebar({
   useEffect(() => {
     if (prevLandRef.current !== landRecordId) {
       prevLandRef.current = landRecordId;
-      setMessages([{ id: 'intro', role: 'assistant', content: 'How can I help you?' }]);
-      setInput('');
-      setError(null);
-      setCollapsed(false);
     }
+    if (typeof window === 'undefined') {
+      return;
+    }
+    const raw = window.localStorage.getItem(storageKey(landRecordId));
+    if (raw) {
+      try {
+        const parsed = JSON.parse(raw) as ChatStorageState;
+        if (parsed?.messages?.length) {
+          setMessages(parsed.messages);
+        } else {
+          setMessages(introMessage());
+        }
+        setSessionIds(parsed?.session || createSessionIds());
+      } catch {
+        setMessages(introMessage());
+        setSessionIds(createSessionIds());
+      }
+    } else {
+      setMessages(introMessage());
+      setSessionIds(createSessionIds());
+    }
+    setInput('');
+    setError(null);
+    setCollapsed(false);
   }, [landRecordId]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined' || !sessionIds) {
+      return;
+    }
+    const payload: ChatStorageState = { messages, session: sessionIds };
+    window.localStorage.setItem(storageKey(landRecordId), JSON.stringify(payload));
+  }, [messages, sessionIds, landRecordId]);
 
   useEffect(() => {
     const onWin = () => setPanelSize((s) => clampSize(s.w, s.h));
@@ -309,6 +387,21 @@ export function ChatSidebar({
     bottomRef.current?.scrollIntoView({ behavior: 'auto', block: 'end' });
   }, [messages, loading, renderOverlay, sheetEntered, collapsed]);
 
+  const handleReset = useCallback(async () => {
+    if (loading) return;
+    setError(null);
+    try {
+      const next = await chatReset();
+      setMessages(introMessage());
+      setSessionIds({ userId: next.user_id, runId: next.run_id });
+      setInput('');
+      setStreamingMessageId(null);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : 'Reset failed';
+      setError(msg);
+    }
+  }, [loading]);
+
   const send = useCallback(async () => {
     const trimmed = input.trim();
     if (!trimmed || loading) return;
@@ -319,6 +412,10 @@ export function ChatSidebar({
     const stamp = Date.now();
     const userId = `user-${stamp}-${Math.random().toString(16).slice(2)}`;
     const assistantId = `assistant-${stamp}-${Math.random().toString(16).slice(2)}`;
+    const activeSession = sessionIds ?? createSessionIds();
+    if (!sessionIds) {
+      setSessionIds(activeSession);
+    }
     setMessages((prev) => [...prev, { id: userId, role: 'user', content: trimmed }]);
 
     setLoading(true);
@@ -326,14 +423,17 @@ export function ChatSidebar({
     setMessages((prev) => [...prev, { id: assistantId, role: 'assistant', content: '' }]);
 
     try {
-      await chatQueryStream({ message: trimmed }, (chunk) => {
-        setMessages((prev) =>
-          prev.map((msg) => {
-            if (msg.id !== assistantId) return msg;
-            return { ...msg, content: msg.content + chunk };
-          })
-        );
-      });
+      await chatQueryStream(
+        { message: trimmed, user_id: activeSession.userId, run_id: activeSession.runId },
+        (chunk) => {
+          setMessages((prev) =>
+            prev.map((msg) => {
+              if (msg.id !== assistantId) return msg;
+              return { ...msg, content: msg.content + chunk };
+            })
+          );
+        }
+      );
 
       setMessages((prev) =>
         prev.map((msg) => {
@@ -355,7 +455,7 @@ export function ChatSidebar({
       setLoading(false);
       setStreamingMessageId(null);
     }
-  }, [input, loading, landRecordId]);
+  }, [input, loading, landRecordId, sessionIds]);
 
   if (!renderOverlay) return null;
 
@@ -465,6 +565,17 @@ export function ChatSidebar({
                   {CHAT_ASSISTANT_NAME}
                 </h2>
               </div>
+              <button
+                type="button"
+                onClick={handleReset}
+                onPointerDown={(e) => e.stopPropagation()}
+                className="relative z-50 mr-1 flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-md text-white transition-colors hover:bg-white/15"
+                style={{ transitionDuration: '0.2s' }}
+                aria-label="Reset chat"
+                disabled={loading}
+              >
+                <RotateCcw className="h-4 w-4" strokeWidth={2} />
+              </button>
               {!collapsed && (
                 <button
                   type="button"

@@ -50,6 +50,7 @@ openai>=1.0.0
 mem0ai>=0.1.0
 mem0ai[nlp]
 langchain-aws
+rank-bm25>=0.2.2
 
 # AWS Parameter Store (optional)
 boto3
@@ -62,3 +63,4 @@ google-crc32c>=1.5.0
 # gcp-storage-emulator>=0.0.0
 
 psycopg2
+fastembed

@@ -1527,6 +1527,13 @@ class ChatResponse(BaseModel):
     context_was_empty: bool
 
 
+class ChatResetResponse(BaseModel):
+    """Response from POST /chat/reset."""
+
+    user_id: str
+    run_id: str
+
+
 class ProcessResponse(BaseModel):
     """Response model for document processing endpoint"""
     status: str
@@ -1929,6 +1936,35 @@ async def chat_rag_post(request: ChatRequest = Body(...)):
         raise HTTPException(status_code=500, detail=client_msg) from e
 
 
+@app.post("/chat/reset", response_model=ChatResetResponse, tags=["Query"])
+async def chat_reset():
+    """
+    Reset chat session identifiers. Optionally clears memory index and session store
+    (for SQLite sessions) so the next chat starts fresh.
+    """
+    global _default_user_id, _default_run_id
+    _default_user_id = str(uuid4())
+    _default_run_id = str(uuid4())
+
+    settings = _memory_settings or _memory_settings_from_env()
+    if getattr(settings, "memory_enabled", False):
+        try:
+            from memory_management.memory import clear_memory_index
+
+            clear_memory_index()
+            logging.info("[chat_reset] memory index cleared")
+        except Exception as e:
+            logging.warning("[chat_reset] memory clear failed: %s", e)
+    if getattr(settings, "session_provider", "") == "sqlite":
+        try:
+            _reset_sqlite_session_store(getattr(settings, "session_db_path", "") or "")
+            logging.info("[chat_reset] sqlite session store reset")
+        except Exception as e:
+            logging.warning("[chat_reset] sqlite session reset failed: %s", e)
+
+    return ChatResetResponse(user_id=_default_user_id, run_id=_default_run_id)
+
+
 @app.post("/chat/stream", tags=["Query"])
 async def chat_rag_stream(request: ChatRequest = Body(...)):
     """
@@ -1937,7 +1973,7 @@ async def chat_rag_stream(request: ChatRequest = Body(...)):
     Returns a text/plain stream where chunks arrive as the LLM generates them.
     """
     from llm_client import generate_content_stream, get_default_model
-    from legal_rag.pipeline import run_chat_retrieval
+    from legal_rag.pipeline import _response_guidance, run_chat_retrieval
     from legal_rag.retrieval import CHAT_SYSTEM_PROMPT
 
     msg = request.message.strip()
@@ -1974,11 +2010,19 @@ async def chat_rag_stream(request: ChatRequest = Body(...)):
         except Exception:
             pass
     t_retrieval = time.perf_counter()
-    _route, assembled, _blocks, _hits = run_chat_retrieval(
+    _route, assembled, _blocks, _hits, meta = run_chat_retrieval(
         msg,
         top_k=request.top_k,
         document_id=(request.document_id or "").strip() or None,
         router_model=None,
+    )
+    logging.info(
+        "[chat_stream] route record_type=%s intent=%s summary_mode=%s hits=%s relevant_obligations=%s",
+        _route.record_type_filter,
+        _route.intent,
+        _route.summary_mode,
+        len(_hits),
+        meta.get("relevant_obligation_count", 0),
     )
     retrieval_elapsed = time.perf_counter() - t_retrieval
 
@@ -1990,8 +2034,11 @@ async def chat_rag_stream(request: ChatRequest = Body(...)):
             "legal_rag.qdrant_store.upsert_document_pages_and_obligations.)"
         )
 
+    response_guidance = _response_guidance(_route, meta.get("relevant_obligation_count", 0))
+    guidance_block = f"{response_guidance}\n\n" if response_guidance else ""
     prompt = (
         f"{CHAT_SYSTEM_PROMPT}\n\n"
+        f"{guidance_block}"
         f"---\nSession Context:\n{session_context}\n---\n"
         f"User Background:\n{user_background}\n---\n"
         f"Retrieved Legal Context:\n{assembled}\n---\n\n"

@@ -365,6 +365,8 @@ export interface ChatQueryRequest {
   message: string;
   document_id?: string | null;
   top_k?: number;
+  user_id?: string | null;
+  run_id?: string | null;
 }
 
 export interface ChatQueryResponse {
@@ -373,6 +375,11 @@ export interface ChatQueryResponse {
   hit_count: number;
   block_count: number;
   context_was_empty: boolean;
+}
+
+export interface ChatResetResponse {
+  user_id: string;
+  run_id: string;
 }
 
 function enhanceFetchError(error: unknown): Error {
@@ -456,6 +463,30 @@ export async function chatQueryStream(
     }
   } catch (error) {
     console.error('Error in chat stream:', error);
+    throw enhanceFetchError(error);
+  }
+}
+
+export async function chatReset(): Promise<ChatResetResponse> {
+  const url = `${API_BASE_URL}/chat/reset`;
+
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+    });
+
+    if (!response.ok) {
+      const isServiceDown =
+        response.status === 503 || response.status === 502 || response.status === 504;
+      const err = new Error(`API request failed with status ${response.status}`);
+      (err as { isConnectionError?: boolean }).isConnectionError = isServiceDown;
+      throw err;
+    }
+
+    return (await response.json()) as ChatResetResponse;
+  } catch (error) {
+    console.error('Error resetting chat session:', error);
     throw enhanceFetchError(error);
   }
 }

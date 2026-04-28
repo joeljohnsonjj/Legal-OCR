@@ -264,6 +264,95 @@ def fetch_raw_page(document_id: str, page_number: int) -> Optional[str]:
     return pl.get("page_text") or None
 
 
+def fetch_extracted_obligations(
+    document_id: Optional[str] = None,
+    *,
+    batch_size: int = 512,
+) -> List[Dict[str, Any]]:
+    """Fetch all extracted obligation payloads (optionally for a single document)."""
+    from qdrant_client.models import FieldCondition, Filter, MatchValue
+
+    client = _client()
+    name = _collection_name()
+
+    must = [FieldCondition(key="record_type", match=MatchValue(value=RECORD_TYPE_EXTRACTED_OBLIGATION))]
+    if document_id:
+        must.append(FieldCondition(key="document_id", match=MatchValue(value=document_id)))
+
+    flt = Filter(must=must)
+    out: List[Dict[str, Any]] = []
+    total_batches = 0
+    offset = None
+    while True:
+        points, next_offset = client.scroll(
+            collection_name=name,
+            scroll_filter=flt,
+            limit=batch_size,
+            with_payload=True,
+            offset=offset,
+        )
+        total_batches += 1
+        for p in points or []:
+            out.append(
+                {
+                    "id": str(p.id),
+                    "score": 0.0,
+                    "payload": p.payload or {},
+                }
+            )
+        if next_offset is None:
+            break
+        offset = next_offset
+    logger.info(
+        "[qdrant] fetch_extracted_obligations document_id=%s batches=%s results=%s",
+        document_id or "",
+        total_batches,
+        len(out),
+    )
+    return out
+
+
+def fetch_document_ids(
+    *,
+    batch_size: int = 512,
+) -> List[str]:
+    """Fetch distinct document_id values from raw_page records."""
+    from qdrant_client.models import FieldCondition, Filter, MatchValue
+
+    client = _client()
+    name = _collection_name()
+
+    flt = Filter(must=[FieldCondition(key="record_type", match=MatchValue(value=RECORD_TYPE_RAW_PAGE))])
+    out: List[str] = []
+    seen: set[str] = set()
+    offset = None
+    total_batches = 0
+    while True:
+        points, next_offset = client.scroll(
+            collection_name=name,
+            scroll_filter=flt,
+            limit=batch_size,
+            with_payload=True,
+            offset=offset,
+        )
+        total_batches += 1
+        for p in points or []:
+            pl = p.payload or {}
+            doc_id = str(pl.get("document_id") or "").strip()
+            if doc_id and doc_id not in seen:
+                seen.add(doc_id)
+                out.append(doc_id)
+        if next_offset is None:
+            break
+        offset = next_offset
+    logger.info(
+        "[qdrant] fetch_document_ids batches=%s results=%s",
+        total_batches,
+        len(out),
+    )
+    return out
+
+
 def delete_document(document_id: str) -> None:
     """Remove all points for a document (both tracks)."""
     from qdrant_client.models import Filter, FieldCondition, FilterSelector, MatchValue

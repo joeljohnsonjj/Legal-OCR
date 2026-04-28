@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from legal_rag.schemas import RECORD_TYPE_EXTRACTED_OBLIGATION, RECORD_TYPE_RAW_PAGE
 
@@ -49,11 +49,61 @@ def dedupe_search_hits(hits: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return out
 
 
+def filter_hits_relative_cutoff(
+    vector_hits: Sequence[Dict[str, Any]],
+    *,
+    score_ratio: float,
+    record_type: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Filter hits to those within a relative ratio of the best score."""
+    if not vector_hits:
+        return []
+    scores = [float(h.get("score") or 0.0) for h in vector_hits]
+    best = max(scores) if scores else 0.0
+    if best <= 0:
+        return list(vector_hits)
+    cutoff = best * score_ratio
+    filtered: List[Dict[str, Any]] = []
+    for h in vector_hits:
+        if record_type and _payload(h).get("record_type") != record_type:
+            filtered.append(h)
+            continue
+        score = float(h.get("score") or 0.0)
+        if score >= cutoff:
+            filtered.append(h)
+    return filtered
+
+
+def assemble_page_context(
+    document_id: str,
+    page_texts: Dict[int, str],
+) -> tuple[str, List[RetrievedBlock]]:
+    """Assemble a context string for fixed raw pages (e.g., document summary)."""
+    blocks: List[RetrievedBlock] = []
+    parts: List[str] = []
+    for idx, page_num in enumerate(sorted(page_texts.keys()), start=1):
+        text = page_texts[page_num] or ""
+        blocks.append(
+            RetrievedBlock(
+                document_id=document_id,
+                page_number=page_num,
+                record_type=RECORD_TYPE_RAW_PAGE,
+                raw_page_text=text,
+            )
+        )
+        parts.append(
+            f"--- Block {idx} | document={document_id} | page={page_num} | type=raw_page ---\n{text}\n"
+        )
+    assembled = "\n".join(parts).strip()
+    return assembled, blocks
+
+
 def assemble_chat_context(
     vector_hits: List[Dict[str, Any]],
     fetch_raw_page: Callable[[str, int], Optional[str]],
     *,
     include_obligation_summary: bool = True,
+    include_parent_pages: bool = True,
 ) -> tuple[str, List[RetrievedBlock]]:
     """
     Build the `assembled_context` string and structured blocks.
@@ -121,7 +171,7 @@ def assemble_chat_context(
                 prose = obligation_prose_for_chat(ob)
 
             parent = None
-            if doc_id and page_num > 0:
+            if include_parent_pages and doc_id and page_num > 0:
                 parent = fetch_raw_page(doc_id, page_num)
                 if parent is None:
                     logger.debug("Parent raw_page not found for %s page %s", doc_id, page_num)
@@ -143,17 +193,18 @@ def assemble_chat_context(
             elif summary:
                 chunk += f"Relevant obligation:\n{summary}\n"
             page_key = (doc_id, page_num)
-            if parent:
-                if page_key in parent_page_included:
-                    chunk += (
-                        f"\nFull page text for document={doc_id} page={page_num} "
-                        f"already appears once above in this context; it is not repeated here.\n"
-                    )
+            if include_parent_pages:
+                if parent:
+                    if page_key in parent_page_included:
+                        chunk += (
+                            f"\nFull page text for document={doc_id} page={page_num} "
+                            f"already appears once above in this context; it is not repeated here.\n"
+                        )
+                    else:
+                        parent_page_included.add(page_key)
+                        chunk += f"\nFull page text (parent context):\n{parent}\n"
                 else:
-                    parent_page_included.add(page_key)
-                    chunk += f"\nFull page text (parent context):\n{parent}\n"
-            else:
-                chunk += "\n(Full page text unavailable for this page.)\n"
+                    chunk += "\n(Full page text unavailable for this page.)\n"
             parts.append(chunk)
             continue
 
@@ -193,6 +244,10 @@ HOW TO RESPOND
   and clearly state what was not found.
 • Use plain, precise English — avoid unnecessary legal jargon unless quoting directly.
 • Default to a crisp, short answer (1–4 sentences) that directly addresses the user’s question.
+• If a "Response guidance" instruction appears above the context, follow it exactly.
+• For document summaries, do not mention which pages were used. If page counts or document length
+  are explicitly present in the retrieved context, you may mention them; otherwise do not invent
+  metadata.
 • If the user explicitly asks for details, give a longer, structured answer.
 • For obligation questions, include the essentials:
    - Party responsible

@@ -42,6 +42,17 @@ Optionally, the request can **limit to one document** (for example a specific PD
 
 The database returns the **most similar** items to the question, up to a set limit (for example the top 8). Each item includes a **score** (how close the match is).
 
+### 3a. Summary mode for list-all questions
+
+When the user asks to **list all obligations** or asks for an overview, the router enables **summary mode**:
+
+- The search uses a higher **top-k** (200) to estimate coverage.
+- A **relative cutoff** keeps only results within a score band of the best match so weak hits are dropped.
+- Response style is controlled by the number of **relevant obligations**:
+  - **0–8**: list obligations with citations.
+  - **9–30**: summarize obligation themes instead of listing each one.
+  - **>30**: return an approximate count and ask the user to narrow by topic.
+
 ### 4. Add full page context for obligation hits
 
 When the hit is an **obligation**, the system does not stop at the short duty summary. It also **loads the full text of the page** that obligation was tied to (the same page stored during indexing). That way the answering model sees both:
@@ -61,6 +72,15 @@ A **separate** language model receives:
 - The **user’s question**,
 
 with instructions to answer **only from that context**, use normal sentences, and **not** invent clauses that are not there.
+
+---
+
+## Document summary requests
+
+If the user asks to **summarize the whole document**, the router switches to **document summary** intent:
+
+- The system pulls **only the first three pages** of the document.
+- The model returns a concise high-level overview based on those pages.
 
 ---
 
