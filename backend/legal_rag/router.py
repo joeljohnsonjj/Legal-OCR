@@ -180,7 +180,10 @@ def _router_system_prompt() -> str:
         "choose search_financial_obligations, intent=normal, summary_mode=false.\n"
         "4) If the query asks about general clauses, definitions, or policies (not obligations) → "
         "choose search_general_document, intent=normal, summary_mode=false.\n"
-        "5) If the query could match BOTH tools → always prefer search_financial_obligations.\n\n"
+        "5) If the query is about the conversation itself (previous questions, chat history, "
+        "prior interactions, or session context) and is NOT asking for a document summary → "
+        "choose search_general_document, intent=normal, summary_mode=false.\n"
+        "6) If the query could match BOTH tools → always prefer search_financial_obligations.\n\n"
         "## SUMMARY_MODE RULES\n"
         "- ALWAYS true when intent is list_all_obligations or document_summary.\n"
         "- ALWAYS false when intent is normal.\n\n"
@@ -198,7 +201,9 @@ def _router_system_prompt() -> str:
         "Query: \"Summarize the entire lease agreement.\" → "
         "tool=search_general_document, intent=document_summary, summary_mode=true, keywords=[\"lease\"]\n"
         "Query: \"What is the pet policy?\" → "
-        "tool=search_general_document, intent=normal, summary_mode=false, keywords=[\"pet\"]\n\n"
+        "tool=search_general_document, intent=normal, summary_mode=false, keywords=[\"pet\"]\n"
+        "Query: \"What are the questions I asked before?\" → "
+        "tool=search_general_document, intent=normal, summary_mode=false, keywords=[\"questions\"]\n\n"
         "Return only the tool call with those arguments; do not add extra text."
     )
 
