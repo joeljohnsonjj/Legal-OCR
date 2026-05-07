@@ -31,6 +31,7 @@ def generate_content(
     temperature: float = 0.1,
     response_mime_type: str = "application/json",
     max_output_tokens: Optional[int] = None,
+    require_json_object: bool = True,
 ) -> LLMResponse:
     """
     Call Azure OpenAI Chat Completions via REST.
@@ -60,7 +61,7 @@ def generate_content(
         "temperature": temperature,
         "max_tokens": max_output_tokens if max_output_tokens is not None else int(os.getenv("AZURE_OPENAI_MAX_TOKENS") or os.getenv("OPENAI_MAX_OUTPUT_TOKENS", "8192")),
     }
-    if response_mime_type == "application/json":
+    if response_mime_type == "application/json" and require_json_object:
         body["response_format"] = {"type": "json_object"}
 
     timeout_seconds = float(os.getenv("AZURE_OPENAI_TIMEOUT_SECONDS", "300"))
@@ -104,6 +105,7 @@ async def generate_content_async(
     temperature: float = 0.1,
     response_mime_type: str = "application/json",
     max_output_tokens: Optional[int] = None,
+    require_json_object: bool = True,
 ) -> LLMResponse:
     """Async version using asyncio.to_thread."""
     return await asyncio.to_thread(
@@ -114,6 +116,7 @@ async def generate_content_async(
         temperature=temperature,
         response_mime_type=response_mime_type,
         max_output_tokens=max_output_tokens,
+        require_json_object=require_json_object,
     )
 
 
@@ -125,6 +128,7 @@ async def generate_content_stream(
     temperature: float = 0.1,
     response_mime_type: str = "application/json",
     max_output_tokens: Optional[int] = None,
+    require_json_object: bool = True,
 ) -> AsyncIterator[str]:
     """
     Stream Azure OpenAI response token-by-token (async generator).
@@ -156,7 +160,7 @@ async def generate_content_stream(
         "max_tokens": max_output_tokens if max_output_tokens is not None else int(os.getenv("AZURE_OPENAI_MAX_TOKENS") or os.getenv("OPENAI_MAX_OUTPUT_TOKENS", "8192")),
         "stream": True,
     }
-    if response_mime_type == "application/json":
+    if response_mime_type == "application/json" and require_json_object:
         body["response_format"] = {"type": "json_object"}
 
     async with httpx.AsyncClient(timeout=300.0) as client:

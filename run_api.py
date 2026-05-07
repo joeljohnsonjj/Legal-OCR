@@ -69,6 +69,8 @@ def main():
         reload=reload,
         reload_excludes=["**/chroma_db/**", "**/output/*.sqlite3"],
         log_level="info",
+        access_log=True,
+        use_colors=True,
     )
 
 

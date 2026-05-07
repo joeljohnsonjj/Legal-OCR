@@ -57,6 +57,7 @@ def generate_content(
     temperature: float = 0.1,
     response_mime_type: str = "application/json",
     max_output_tokens: Optional[int] = None,
+    require_json_object: bool = True,
 ):
     """
     Call the configured LLM (Azure OpenAI, Bedrock Claude, or Gemini). Returns an object with .text.
@@ -72,6 +73,7 @@ def generate_content(
             temperature=temperature,
             response_mime_type=response_mime_type,
             max_output_tokens=max_output_tokens,
+            require_json_object=require_json_object,
         )
     if use_bedrock_llm():
         from bedrock_client import generate_content as bedrock_generate
@@ -82,6 +84,7 @@ def generate_content(
             temperature=temperature,
             response_mime_type=response_mime_type,
             max_output_tokens=max_output_tokens,
+            require_json_object=require_json_object,
         )
     from gemini_client import generate_content as gemini_generate
     return gemini_generate(
@@ -91,6 +94,7 @@ def generate_content(
         temperature=temperature,
         response_mime_type=response_mime_type,
         max_output_tokens=max_output_tokens,
+        require_json_object=require_json_object,
     )
 
 
@@ -102,6 +106,7 @@ async def generate_content_async(
     temperature: float = 0.1,
     response_mime_type: str = "application/json",
     max_output_tokens: Optional[int] = None,
+    require_json_object: bool = True,
 ):
     """Async version: uses the configured LLM. Returns an object with .text."""
     if _use_azure_openai():
@@ -113,6 +118,7 @@ async def generate_content_async(
             temperature=temperature,
             response_mime_type=response_mime_type,
             max_output_tokens=max_output_tokens,
+            require_json_object=require_json_object,
         )
     if use_bedrock_llm():
         from bedrock_client import generate_content_async as bedrock_generate_async
@@ -123,6 +129,7 @@ async def generate_content_async(
             temperature=temperature,
             response_mime_type=response_mime_type,
             max_output_tokens=max_output_tokens,
+            require_json_object=require_json_object,
         )
     from gemini_client import generate_content_async as gemini_generate_async
     return await gemini_generate_async(
@@ -132,6 +139,7 @@ async def generate_content_async(
         temperature=temperature,
         response_mime_type=response_mime_type,
         max_output_tokens=max_output_tokens,
+        require_json_object=require_json_object,
     )
 
 
@@ -143,6 +151,7 @@ async def generate_content_stream(
     temperature: float = 0.1,
     response_mime_type: str = "application/json",
     max_output_tokens: Optional[int] = None,
+    require_json_object: bool = True,
 ) -> AsyncIterator[str]:
     """Stream merge/rank output; supported for Azure OpenAI and Bedrock only."""
     if _use_azure_openai():
@@ -155,6 +164,7 @@ async def generate_content_stream(
             temperature=temperature,
             response_mime_type=response_mime_type,
             max_output_tokens=max_output_tokens,
+            require_json_object=require_json_object,
         ):
             yield token
         return
@@ -168,6 +178,7 @@ async def generate_content_stream(
             temperature=temperature,
             response_mime_type=response_mime_type,
             max_output_tokens=max_output_tokens,
+            require_json_object=require_json_object,
         ):
             yield token
         return

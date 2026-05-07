@@ -183,7 +183,9 @@ def generate_content(
     temperature: float = 0.1,
     response_mime_type: str = "application/json",
     max_output_tokens: Optional[int] = None,
+    require_json_object: bool = True,
 ) -> LLMResponse:
+    _ = require_json_object
     del api_key  # AWS credentials from env / default chain
     model_id = _resolve_model_id(model)
     client = _client()
@@ -235,6 +237,7 @@ async def generate_content_async(
     temperature: float = 0.1,
     response_mime_type: str = "application/json",
     max_output_tokens: Optional[int] = None,
+    require_json_object: bool = True,
 ) -> LLMResponse:
     return await asyncio.to_thread(
         generate_content,
@@ -244,6 +247,7 @@ async def generate_content_async(
         temperature=temperature,
         response_mime_type=response_mime_type,
         max_output_tokens=max_output_tokens,
+        require_json_object=require_json_object,
     )
 
 
@@ -295,7 +299,9 @@ async def generate_content_stream(
     temperature: float = 0.1,
     response_mime_type: str = "application/json",
     max_output_tokens: Optional[int] = None,
+    require_json_object: bool = True,
 ) -> AsyncIterator[str]:
+    _ = require_json_object
     del api_key
     model_id = _resolve_model_id(model)
     loop = asyncio.get_running_loop()

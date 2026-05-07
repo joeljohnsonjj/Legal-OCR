@@ -9,9 +9,15 @@ import sys
 import signal
 import logging
 from pathlib import Path
-from dotenv import load_dotenv
 
-# Load environment variables
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    def load_dotenv(*_args, **_kwargs):
+        pass
+
+
+# Load environment variables when python-dotenv is installed
 load_dotenv()
 
 # Add the gcp-storage-emulator to the path if using local version
@@ -57,17 +63,32 @@ def signal_handler(sig, frame):
     sys.exit(0)
 
 
+def _register_signal_handlers():
+    """Register handlers; skip signals the platform does not support."""
+    for sig_name in ("SIGINT", "SIGTERM"):
+        sig = getattr(signal, sig_name, None)
+        if sig is None:
+            continue
+        try:
+            signal.signal(sig, signal_handler)
+        except (OSError, ValueError) as e:
+            logger.warning("Could not register handler for %s: %s", sig_name, e)
+
+
 def main():
     """Start the GCS emulator server"""
     global server
-    
-    # Register signal handlers for graceful shutdown
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-    
+
+    _register_signal_handlers()
+
     # Get configuration from environment variables
     host = os.getenv("GCS_EMULATOR_HOST", "localhost")
-    port = int(os.getenv("GCS_EMULATOR_PORT", "4443"))
+    port_raw = os.getenv("GCS_EMULATOR_PORT", "4443")
+    try:
+        port = int(port_raw)
+    except ValueError:
+        logger.error("Invalid GCS_EMULATOR_PORT %r; must be an integer.", port_raw)
+        sys.exit(1)
     default_bucket = os.getenv("GCS_BUCKET", "heb-legal")
     data_dir = os.getenv("GCS_EMULATOR_DATA_DIR", "./fake-gcs-data")
     in_memory = os.getenv("GCS_EMULATOR_IN_MEMORY", "false").lower() == "true"
