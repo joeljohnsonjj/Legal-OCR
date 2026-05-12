@@ -19,6 +19,7 @@ import asyncio
 import json
 import logging
 import os
+import random
 import threading
 import time
 from typing import Any, AsyncIterator, Dict, Optional
@@ -53,8 +54,79 @@ class LLMResponse:
 def _bedrock_config() -> tuple[str, Config]:
     region = (os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "us-east-1").strip()
     timeout = int(os.getenv("BEDROCK_READ_TIMEOUT", "600"))
-    cfg = Config(read_timeout=timeout, connect_timeout=60, retries={"max_attempts": 5})
+    # Fewer boto-layer retries so we do not stack 5× botocore × N× app retries on ThrottlingException.
+    # Adaptive mode backs off more politely than legacy rapid retries.
+    boto_attempts_raw = (os.getenv("BEDROCK_BOTO_MAX_ATTEMPTS", "3") or "3").strip()
+    try:
+        boto_attempts = max(1, min(int(boto_attempts_raw), 10))
+    except ValueError:
+        boto_attempts = 3
+    cfg = Config(
+        read_timeout=timeout,
+        connect_timeout=60,
+        retries={"max_attempts": boto_attempts, "mode": "adaptive"},
+    )
     return region, cfg
+
+
+def _is_bedrock_throttle_error(exc: BaseException) -> bool:
+    """True when AWS is asking us to slow down (InvokeModel throttling / saturation)."""
+    if type(exc).__name__ in ("ThrottlingException", "TooManyRequestsException"):
+        return True
+    s = str(exc).lower()
+    if "throttl" in s or "too many requests" in s:
+        return True
+    if isinstance(exc, ClientError):
+        err = (exc.response or {}).get("Error", {}) or {}
+        code = (err.get("Code") or "").strip()
+        if code in ("ThrottlingException", "TooManyRequestsException", "ServiceUnavailable", "Throttling"):
+            return True
+    return False
+
+
+def _invoke_model_with_throttle_backoff(client, *, model_id: str, body: str):
+    """
+    Invoke Bedrock with extra sleeps on throttling (beyond botocore's built-in retries).
+    Env: BEDROCK_INVOKE_MAX_ATTEMPTS (default 12), BEDROCK_THROTTLE_BASE_DELAY_SECONDS (default 4).
+    """
+    max_attempts_raw = (os.getenv("BEDROCK_INVOKE_MAX_ATTEMPTS", "12") or "12").strip()
+    base_raw = (os.getenv("BEDROCK_THROTTLE_BASE_DELAY_SECONDS", "4") or "4").strip()
+    try:
+        max_attempts = max(1, min(int(max_attempts_raw), 40))
+    except ValueError:
+        max_attempts = 12
+    try:
+        base_delay = max(0.5, float(base_raw))
+    except ValueError:
+        base_delay = 4.0
+
+    last_exc: Optional[BaseException] = None
+    for attempt in range(max_attempts):
+        try:
+            return client.invoke_model(
+                modelId=model_id,
+                body=body,
+                contentType="application/json",
+                accept="application/json",
+            )
+        except Exception as e:
+            last_exc = e
+            if not _is_bedrock_throttle_error(e) or attempt >= max_attempts - 1:
+                raise
+            # Exponential backoff with jitter; cap single sleep at 120s
+            delay = min(base_delay * (2 ** min(attempt, 8)), 120.0)
+            delay *= 0.85 + random.random() * 0.3
+            logger.warning(
+                "Bedrock InvokeModel throttled (attempt %s/%s); sleeping %.1fs before retry. %s",
+                attempt + 1,
+                max_attempts,
+                delay,
+                str(e)[:220],
+            )
+            time.sleep(delay)
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("Bedrock invoke_model: retry loop exited without response")
 
 
 def _use_assumed_role_bedrock() -> bool:
@@ -196,11 +268,10 @@ def generate_content(
         response_mime_type=response_mime_type,
     )
     try:
-        resp = client.invoke_model(
-            modelId=model_id,
+        resp = _invoke_model_with_throttle_backoff(
+            client,
+            model_id=model_id,
             body=json.dumps(body),
-            contentType="application/json",
-            accept="application/json",
         )
     except ClientError as e:
         err = (e.response or {}).get("Error", {}) if getattr(e, "response", None) else {}
@@ -251,6 +322,47 @@ async def generate_content_async(
     )
 
 
+def _invoke_model_with_response_stream_throttle_backoff(client, *, model_id: str, body: str):
+    """Same throttle policy as _invoke_model_with_throttle_backoff for streaming invoke."""
+    max_attempts_raw = (os.getenv("BEDROCK_INVOKE_MAX_ATTEMPTS", "12") or "12").strip()
+    base_raw = (os.getenv("BEDROCK_THROTTLE_BASE_DELAY_SECONDS", "4") or "4").strip()
+    try:
+        max_attempts = max(1, min(int(max_attempts_raw), 40))
+    except ValueError:
+        max_attempts = 12
+    try:
+        base_delay = max(0.5, float(base_raw))
+    except ValueError:
+        base_delay = 4.0
+
+    last_exc: Optional[BaseException] = None
+    for attempt in range(max_attempts):
+        try:
+            return client.invoke_model_with_response_stream(
+                modelId=model_id,
+                contentType="application/json",
+                accept="application/json",
+                body=body,
+            )
+        except Exception as e:
+            last_exc = e
+            if not _is_bedrock_throttle_error(e) or attempt >= max_attempts - 1:
+                raise
+            delay = min(base_delay * (2 ** min(attempt, 8)), 120.0)
+            delay *= 0.85 + random.random() * 0.3
+            logger.warning(
+                "Bedrock InvokeModelWithResponseStream throttled (attempt %s/%s); sleeping %.1fs. %s",
+                attempt + 1,
+                max_attempts,
+                delay,
+                str(e)[:220],
+            )
+            time.sleep(delay)
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("Bedrock invoke_model_with_response_stream: retry loop exited without response")
+
+
 def _stream_text_chunks(
     prompt: str,
     *,
@@ -266,10 +378,9 @@ def _stream_text_chunks(
         max_output_tokens=max_output_tokens,
         response_mime_type=response_mime_type,
     )
-    response = client.invoke_model_with_response_stream(
-        modelId=model_id,
-        contentType="application/json",
-        accept="application/json",
+    response = _invoke_model_with_response_stream_throttle_backoff(
+        client,
+        model_id=model_id,
         body=json.dumps(body),
     )
     stream = response.get("body")

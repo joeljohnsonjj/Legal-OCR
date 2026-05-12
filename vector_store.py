@@ -18,6 +18,7 @@ Re-index Chroma after changing embedding logic (``index_obligations`` / reproces
 """
 
 import hashlib
+import json
 import logging
 import os
 import re
@@ -367,7 +368,10 @@ def _obligation_metadata(obligation: Dict[str, Any], document_name: str, index: 
     if isinstance(citation, str):
         citation_str = citation[:2000]  # ChromaDB metadata size limit
     else:
-        citation_str = str(citation or "")[:2000]
+        try:
+            citation_str = json.dumps(citation, ensure_ascii=False)[:2000]
+        except (TypeError, ValueError):
+            citation_str = str(citation or "")[:2000]
     
     # Add source category metadata for individual obligations
     source_category = obligation.get("source_category", "")
@@ -843,13 +847,46 @@ def query_individual_obligations(
                     continue
                 
                 doc = (results["documents"][0][i]) if results.get("documents") and results["documents"][0] else ""
-                
+                _cit_meta = meta.get("Citation", "") or ""
+                # #region agent log
+                if len(obligations) < 5:
+                    try:
+                        import json as _agent_json, time as _agent_time
+
+                        with open(
+                            r"c:\Users\AmithKrishnan(G1)XIN\Downloads\Legal-OCR\debug-fe1e15.log",
+                            "a",
+                            encoding="utf-8",
+                        ) as _agent_f:
+                            _agent_f.write(
+                                _agent_json.dumps(
+                                    {
+                                        "sessionId": "fe1e15",
+                                        "hypothesisId": "H1",
+                                        "location": "vector_store.query_individual_obligations",
+                                        "message": "chroma hit Citation metadata sample",
+                                        "data": {
+                                            "doc_name": (meta.get("document_name") or "")[:160],
+                                            "citation_head": str(_cit_meta)[:220],
+                                            "looks_like_python_repr": str(_cit_meta).lstrip().startswith("[{"),
+                                            "chunk_index": str(meta.get("chunk_index", ""))[:24],
+                                            "source_category": str(meta.get("source_category", ""))[:120],
+                                        },
+                                        "timestamp": int(_agent_time.time() * 1000),
+                                    },
+                                    ensure_ascii=False,
+                                )
+                                + "\n"
+                            )
+                    except Exception:
+                        pass
+                # #endregion
                 obligations.append({
                     "id": obligation_id,
                     "document_name": meta.get("document_name", ""),
                     "DutyType": meta.get("DutyType", ""),
                     "Responsible_Party": meta.get("Responsible_Party", ""),
-                    "Citation": meta.get("Citation", ""),
+                    "Citation": _cit_meta,
                     "source_category": meta.get("source_category", ""),
                     "obligation_index_in_category": meta.get("obligation_index_in_category", ""),
                     "chunk_index": meta.get("chunk_index", ""),

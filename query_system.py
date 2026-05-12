@@ -791,6 +791,39 @@ def _parse_section_field(val: Any) -> List[str]:
     return parts if parts else [s]
 
 
+def _parse_chroma_stored_citation_field(val: Any) -> Optional[List[Dict[str, Any]]]:
+    """
+    Chroma metadata stores ``Citation`` as a string. New rows use JSON (from ``json.dumps``);
+    older rows used ``str(list[dict])`` (Python repr). Return a list of dicts when parseable.
+    """
+    if val is None:
+        return None
+    if isinstance(val, list):
+        if val and all(isinstance(x, dict) for x in val):
+            return val
+        return None
+    if not isinstance(val, str):
+        return None
+    s = val.strip()
+    if not s.startswith("["):
+        return None
+    try:
+        data = json.loads(s)
+        if isinstance(data, list) and data and all(isinstance(x, dict) for x in data):
+            return data
+    except (json.JSONDecodeError, TypeError, ValueError):
+        pass
+    try:
+        import ast
+
+        data = ast.literal_eval(s)
+        if isinstance(data, list) and data and all(isinstance(x, dict) for x in data):
+            return data
+    except (ValueError, SyntaxError, TypeError, MemoryError):
+        pass
+    return None
+
+
 def _parse_one_citation_segment(segment: str) -> Optional[Dict[str, Any]]:
     """Parse a single citation segment (e.g. 'Document: X.pdf | Page 4, Section 7(a)') into one { docId, pageNumbers, section }."""
     s = (segment or "").strip()
@@ -852,6 +885,46 @@ def citation_string_to_structured(citation: Any) -> List[Dict[str, Any]]:
     s = (citation or "").strip()
     if not s:
         return []
+    structured = _parse_chroma_stored_citation_field(s)
+    if structured is not None:
+        # #region agent log
+        try:
+            import time as _agent_time
+
+            with open(
+                r"c:\Users\AmithKrishnan(G1)XIN\Downloads\Legal-OCR\debug-fe1e15.log",
+                "a",
+                encoding="utf-8",
+            ) as _agent_f:
+                _agent_f.write(
+                    json.dumps(
+                        {
+                            "sessionId": "fe1e15",
+                            "hypothesisId": "H4",
+                            "location": "query_system.citation_string_to_structured",
+                            "message": "parsed Chroma JSON/repr citation metadata",
+                            "data": {"n_items": len(structured)},
+                            "timestamp": int(_agent_time.time() * 1000),
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
+        except Exception:
+            pass
+        # #endregion
+        out: List[Dict[str, Any]] = []
+        for c in structured:
+            if not isinstance(c, dict):
+                continue
+            out.append(
+                {
+                    "docId": str(c.get("docId") or c.get("doc_id") or "").strip(),
+                    "pageNumbers": _parse_page_numbers_field(c.get("pageNumbers")),
+                    "section": _parse_section_field(c.get("section")),
+                }
+            )
+        return merge_structured_citations_by_doc_id(out)
     # Multiple documents: "Document: A | ... ; Document: B | ..." (split only when ; is followed by "Document:")
     if re.search(r'\s+;\s+Document:\s*', s, re.I):
         segments = re.split(r'\s+;\s+(?=Document:\s*)', s, flags=re.I)
@@ -917,6 +990,26 @@ def _str_list_field(val: Any) -> List[str]:
     return [s] if s else []
 
 
+def _structured_citations_substantive(citations: Any) -> bool:
+    """True when citations carry at least one doc id or usable page number (not empty shells)."""
+    if not isinstance(citations, list) or not citations:
+        return False
+    for c in citations:
+        if not isinstance(c, dict):
+            continue
+        if str(c.get("docId") or "").strip():
+            return True
+        pn = c.get("pageNumbers")
+        if isinstance(pn, int) and pn > 0:
+            return True
+        if isinstance(pn, list) and any(
+            (isinstance(x, int) and x > 0) or (isinstance(x, str) and x.strip().isdigit() and int(x) > 0)
+            for x in pn
+        ):
+            return True
+    return False
+
+
 def _normalize_inner_api_obligation(ob: Dict[str, Any]) -> Dict[str, Any]:
     """API shape: Responsible Party, Owner Responsibility[], Reasoning[], citations (preferred) or Citation."""
     party = str(ob.get("Responsible Party") or ob.get("Responsible party") or "").strip() or "Unknown"
@@ -928,8 +1021,9 @@ def _normalize_inner_api_obligation(ob: Dict[str, Any]) -> Dict[str, Any]:
     dn = str(ob.get("document_name") or "").strip()
     if dn:
         out["document_name"] = dn
-    if isinstance(ob.get("citations"), list) and ob["citations"]:
-        out["citations"] = ob["citations"]
+    raw_citations = ob.get("citations")
+    if isinstance(raw_citations, list) and raw_citations and _structured_citations_substantive(raw_citations):
+        out["citations"] = json.loads(json.dumps(raw_citations))
         return out
     cit = ob.get("Citation")
     if isinstance(cit, list) and cit:
@@ -937,22 +1031,33 @@ def _normalize_inner_api_obligation(ob: Dict[str, Any]) -> Dict[str, Any]:
         for c in cit:
             if not isinstance(c, dict):
                 continue
-            doc = str(c.get("docId") or "").strip()
-            pn = c.get("pageNumbers")
-            if isinstance(pn, int):
-                pn_out: Any = pn
-            elif isinstance(pn, list):
-                pn_out = pn
-            else:
-                try:
-                    pn_out = int(pn) if pn is not None else []
-                except (TypeError, ValueError):
-                    pn_out = []
-            sec = c.get("section")
-            sec_out = str(sec).strip() if not isinstance(sec, list) else sec
+            doc = str(c.get("docId") or c.get("doc_id") or "").strip()
+            pn_out = _parse_page_numbers_field(c.get("pageNumbers"))
+            sec_out = _parse_section_field(c.get("section"))
             norm.append({"docId": doc, "pageNumbers": pn_out, "section": sec_out})
         if norm:
             out["citations"] = norm
+            return out
+    if isinstance(cit, str) and cit.strip():
+        parsed = _parse_chroma_stored_citation_field(cit)
+        if parsed is not None:
+            norm2: List[Dict[str, Any]] = []
+            for c in parsed:
+                if not isinstance(c, dict):
+                    continue
+                doc = str(c.get("docId") or c.get("doc_id") or "").strip()
+                norm2.append(
+                    {
+                        "docId": doc,
+                        "pageNumbers": _parse_page_numbers_field(c.get("pageNumbers")),
+                        "section": _parse_section_field(c.get("section")),
+                    }
+                )
+            if norm2:
+                out["citations"] = merge_structured_citations_by_doc_id(norm2)
+                return out
+        out["citations"] = citation_string_to_structured(cit)
+        return out
     return out
 
 
@@ -1411,6 +1516,8 @@ def enrich_nested_results_citations_from_merge_in(payload: Dict[str, Any], merge
 def normalize_query_response_shape(
     payload: Dict[str, Any],
     merge_in: List[Dict[str, Any]],
+    *,
+    skip_citation_enrichment: bool = False,
 ) -> None:
     """
     Ensure results are [{category, obligations[]}]; enrich per-obligation citations; totals.
@@ -1442,7 +1549,7 @@ def normalize_query_response_shape(
     else:
         payload["results"] = []
 
-    if is_nested_category_query_results(payload.get("results") or []):
+    if is_nested_category_query_results(payload.get("results") or []) and not skip_citation_enrichment:
         enrich_nested_results_citations_from_merge_in(payload, merge_in)
 
     payload.pop("citations", None)
@@ -1489,6 +1596,12 @@ def _merge_rank_max_output_tokens() -> Optional[int]:
         return max(1024, int(raw))
     except ValueError:
         return 20480
+
+
+def _skip_merge_and_rank_for_testing() -> bool:
+    """SKIP_MERGE_AND_RANK: skip merge/rank LLM and return retrieval-shaped payload (for local testing)."""
+    v = (os.getenv("SKIP_MERGE_AND_RANK") or "").strip().lower()
+    return v in ("true", "1", "yes", "on")
 
 
 def _filtered_fr_has_payload(fr: Any) -> bool:
@@ -2022,7 +2135,9 @@ def build_rank_response_without_llm_merge(
             out["merge_note"] = "Merge LLM output was invalid or truncated; returned unmerged retrieval results."
         if not skip_query_post_filters:
             apply_query_coherence_to_payload(user_query, out)
-        normalize_query_response_shape(out, filtered_results)
+        normalize_query_response_shape(
+            out, filtered_results, skip_citation_enrichment=merge_fallback
+        )
         return out
 
     rows: List[Dict[str, Any]] = []
@@ -2051,7 +2166,9 @@ def build_rank_response_without_llm_merge(
     if not skip_query_post_filters:
         apply_query_scope_trim_to_results(user_query, out)
         apply_query_coherence_to_payload(user_query, out)
-    normalize_query_response_shape(out, filtered_results)
+    normalize_query_response_shape(
+        out, filtered_results, skip_citation_enrichment=merge_fallback
+    )
     return out
 
 
@@ -2070,6 +2187,24 @@ def merge_rank_fallback_payload(
         merge_fallback=True,
         skip_query_post_filters=skip_query_post_filters,
     )
+
+
+def _empty_merge_rank_result(
+    user_query: str,
+    *,
+    documents_searched_count: int,
+    merge_note: str,
+) -> Dict[str, Any]:
+    """Structured empty merge response when merge JSON cannot be parsed (no retrieval fallback)."""
+    return {
+        "query": user_query,
+        "total_documents_searched": documents_searched_count,
+        "total_obligations_found": 0,
+        "total_categories": 0,
+        "results": [],
+        "processed_at": datetime.now().isoformat(),
+        "merge_note": merge_note,
+    }
 
 
 def deduplicate_and_merge_citations(obligations: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -2347,9 +2482,78 @@ class ObligationQuerySystem:
                         pw = json.load(f)
                     page_results = pw.get("page_results") or {}
                     keys_sorted = sorted(page_results.keys(), key=lambda x: int(x) if str(x).isdigit() else 0)
-                    flat = [ob for k in keys_sorted for ob in page_results[k]]
+                    doc_name = pw.get("document_name", "Unknown")
+                    flat: List[Dict[str, Any]] = []
+                    for k in keys_sorted:
+                        for bucket in page_results.get(k) or []:
+                            if not isinstance(bucket, dict):
+                                continue
+                            category = str(bucket.get("category") or "").strip()
+                            for ob in bucket.get("obligations") or []:
+                                if not isinstance(ob, dict):
+                                    continue
+                                ob_copy = json.loads(json.dumps(ob))
+                                if category and not str(ob_copy.get("category") or "").strip():
+                                    ob_copy["category"] = category
+                                citations = ob_copy.get("citations")
+                                if isinstance(citations, list) and citations:
+                                    normalized: List[Dict[str, Any]] = []
+                                    for c in citations:
+                                        if not isinstance(c, dict):
+                                            continue
+                                        if "pageNumbers" in c or "references" in c or "docId" in c:
+                                            normalized.append(c)
+                                            continue
+                                        page = c.get("page")
+                                        section = c.get("section")
+                                        if page or section:
+                                            try:
+                                                pn = int(page) if page is not None else None
+                                            except (TypeError, ValueError):
+                                                pn = None
+                                            normalized.append(
+                                                {
+                                                    "docId": str(ob_copy.get("docId") or doc_name),
+                                                    "pageNumbers": [pn] if pn else [],
+                                                    "section": [str(section)] if section else [],
+                                                }
+                                            )
+                                    if normalized:
+                                        ob_copy["citations"] = normalized
+                                flat.append(ob_copy)
+                    # #region agent log
+                    try:
+                        import json as _agent_json, time as _agent_time
+
+                        sample_keys = sorted(list(flat[0].keys()))[:8] if flat else []
+                        with open(
+                            r"c:\Users\AmithKrishnan(G1)XIN\Downloads\Legal-OCR\debug-fe1e15.log",
+                            "a",
+                            encoding="utf-8",
+                        ) as _agent_f:
+                            _agent_f.write(
+                                _agent_json.dumps(
+                                    {
+                                        "sessionId": "fe1e15",
+                                        "hypothesisId": "H6",
+                                        "location": "query_system.load_consolidated_jsons",
+                                        "message": "pagewise flattened to obligations",
+                                        "data": {
+                                            "doc_name": str(doc_name)[:160],
+                                            "flat_count": len(flat),
+                                            "sample_keys": sample_keys,
+                                        },
+                                        "timestamp": int(_agent_time.time() * 1000),
+                                    },
+                                    ensure_ascii=False,
+                                )
+                                + "\n"
+                            )
+                    except Exception:
+                        pass
+                    # #endregion
                     data = {
-                        "document_name": pw.get("document_name", "Unknown"),
+                        "document_name": doc_name,
                         "consolidated_results": flat,
                         "total_obligations_found": len(flat),
                         "party_metadata": pw.get("party_metadata") or {},
@@ -2553,11 +2757,58 @@ class ObligationQuerySystem:
             """Last resort when metadata does not line up with consolidated JSON."""
             duty = (vector_result.get("DutyType") or "").strip()
             cit = vector_result.get("Citation") or ""
+            # #region agent log
+            try:
+                import json as _agent_json, time as _agent_time
+
+                _cs = str(cit)[:200] if cit is not None else ""
+                with open(
+                    r"c:\Users\AmithKrishnan(G1)XIN\Downloads\Legal-OCR\debug-fe1e15.log",
+                    "a",
+                    encoding="utf-8",
+                ) as _agent_f:
+                    _agent_f.write(
+                        _agent_json.dumps(
+                            {
+                                "sessionId": "fe1e15",
+                                "hypothesisId": "H2",
+                                "location": "query_system._find_obligation._synthetic_unresolved",
+                                "message": "synthetic fallback citation shape",
+                                "data": {
+                                    "cit_type": type(cit).__name__,
+                                    "cit_head": _cs,
+                                    "looks_like_repr": bool(
+                                        isinstance(cit, str) and cit.lstrip().startswith("[{")
+                                    ),
+                                },
+                                "timestamp": int(_agent_time.time() * 1000),
+                            },
+                            ensure_ascii=False,
+                        )
+                        + "\n"
+                    )
+            except Exception:
+                pass
+            # #endregion
             owner: List[str] = []
-            if duty:
-                owner.append(duty)
-            if cit:
-                owner.append(str(cit)[:800])
+            cit_for_row: Any = cit
+            parsed_meta = _parse_chroma_stored_citation_field(cit)
+            if parsed_meta is not None:
+                from vector_store import _citation_blob_for_chunk as _cit_blob
+
+                blob = (_cit_blob({"citations": parsed_meta}) or "").strip()
+                if duty:
+                    owner.append(duty)
+                if blob:
+                    owner.append(blob[:800])
+                elif not duty:
+                    owner.append("Citation metadata present but could not be formatted as lease text.")
+                cit_for_row = parsed_meta
+            else:
+                if duty:
+                    owner.append(duty)
+                if cit:
+                    owner.append(str(cit)[:800])
             if not owner:
                 owner = [
                     "Indexed obligation could not be matched to consolidated JSON (category/index metadata). "
@@ -2571,7 +2822,7 @@ class ObligationQuerySystem:
                     "Vector metadata did not resolve to a consolidated obligation row; "
                     "embedding keywords are not shown as lease text."
                 ],
-                "Citation": cit,
+                "Citation": cit_for_row,
                 "source_category": (source_category or "").strip() or "Uncategorized",
             }
 
@@ -2589,6 +2840,37 @@ class ObligationQuerySystem:
                 global_index = None
 
             consolidated_results = consolidated_data.get("consolidated_results") or []
+            # #region agent log
+            if not results and consolidated_results:
+                try:
+                    import json as _agent_json, time as _agent_time
+
+                    with open(
+                        r"c:\Users\AmithKrishnan(G1)XIN\Downloads\Legal-OCR\debug-fe1e15.log",
+                        "a",
+                        encoding="utf-8",
+                    ) as _agent_f:
+                        _agent_f.write(
+                            _agent_json.dumps(
+                                {
+                                    "sessionId": "fe1e15",
+                                    "hypothesisId": "H5",
+                                    "location": "query_system._find_obligation_in_consolidated_data",
+                                    "message": "consolidated results empty; using flat consolidated_results",
+                                    "data": {
+                                        "doc_name": str(consolidated_data.get("document_name") or "")[:160],
+                                        "flat_count": len(consolidated_results),
+                                        "chunk_index_raw": str(vector_result.get("chunk_index", ""))[:40],
+                                    },
+                                    "timestamp": int(_agent_time.time() * 1000),
+                                },
+                                ensure_ascii=False,
+                            )
+                            + "\n"
+                        )
+                except Exception:
+                    pass
+            # #endregion
 
             # Try to find by source category and index (prefer per-category index)
             for category_data in results:
@@ -2598,15 +2880,28 @@ class ObligationQuerySystem:
                     if obligation_index is not None and 0 <= obligation_index < len(obligations):
                         return _finalize_row(obligations[obligation_index], category_name)
 
-            # Secondary pass: use global index across all categories (index order matches indexing)
+            # Secondary pass: use global index across all categories (must match
+            # ``flatten_obligations_for_individual_indexing``: only dict obligations are indexed).
             if global_index is not None:
                 counter = 0
                 for category_data in results:
                     category_name = category_data.get("category", "")
                     for ob in category_data.get('obligations', []):
+                        if not isinstance(ob, dict):
+                            continue
                         if counter == global_index:
                             return _finalize_row(ob, category_name)
                         counter += 1
+
+            # Flat consolidated_results fallback (pagewise input): resolve by global index.
+            if not results and consolidated_results and global_index is not None:
+                if 0 <= global_index < len(consolidated_results):
+                    ob = consolidated_results[global_index]
+                    if isinstance(ob, dict):
+                        category_label = (
+                            str(ob.get("category") or source_category or "").strip() or "Other"
+                        )
+                        return _finalize_row(ob, category_label)
 
             # Match by party + duty type within category
             duty_type = (vector_result.get("DutyType") or "").strip().lower()
@@ -2634,6 +2929,56 @@ class ObligationQuerySystem:
                             continue
                         return _finalize_row(ob, category_name)
 
+            # Flat consolidated_results fallback: match by party + duty.
+            if not results and consolidated_results and (party or duty_type):
+                for ob in consolidated_results:
+                    if not isinstance(ob, dict):
+                        continue
+                    ob_party = (ob.get("Responsible Party") or "").strip().lower()
+                    ob_duty = (ob.get("DutyType") or "").strip().lower()
+                    if party and ob_party != party:
+                        continue
+                    if duty_type and ob_duty != duty_type:
+                        continue
+                    category_label = str(ob.get("category") or source_category or "").strip() or "Other"
+                    return _finalize_row(ob, category_label)
+
+            # #region agent log
+            try:
+                import json as _agent_json, time as _agent_time
+
+                _n_cat = len(results) if isinstance(results, list) else 0
+                with open(
+                    r"c:\Users\AmithKrishnan(G1)XIN\Downloads\Legal-OCR\debug-fe1e15.log",
+                    "a",
+                    encoding="utf-8",
+                ) as _agent_f:
+                    _agent_f.write(
+                        _agent_json.dumps(
+                            {
+                                "sessionId": "fe1e15",
+                                "hypothesisId": "H3",
+                                "location": "query_system._find_obligation_in_consolidated_data",
+                                "message": "no consolidated match; using synthetic row",
+                                "data": {
+                                    "source_category": (source_category or "")[:200],
+                                    "source_category_norm": source_category_norm[:200],
+                                    "obligation_index": obligation_index,
+                                    "global_index": global_index,
+                                    "chunk_index_raw": str(vector_result.get("chunk_index", ""))[:40],
+                                    "duty_type": (vector_result.get("DutyType") or "")[:120],
+                                    "party": (vector_result.get("Responsible_Party") or "")[:120],
+                                    "consolidated_top_level_categories": _n_cat,
+                                },
+                                "timestamp": int(_agent_time.time() * 1000),
+                            },
+                            ensure_ascii=False,
+                        )
+                        + "\n"
+                    )
+            except Exception:
+                pass
+            # #endregion
             return _synthetic_unresolved()
 
         except Exception as e:
@@ -2672,29 +3017,6 @@ class ObligationQuerySystem:
         Returns:
             Formatted results from LLM processing
         """
-        # Check if merge and rank is disabled for testing
-        skip_merge_and_rank = os.getenv("SKIP_MERGE_AND_RANK", "false").lower() in ("true", "1", "yes")
-        
-        if skip_merge_and_rank:
-            self.logger.info("[DEBUG] SKIP_MERGE_AND_RANK enabled - returning raw vector search results")
-            # Return raw vector search results without merge and rank
-            all_obligations = []
-            for category in categorized_obligations:
-                if isinstance(category, dict):
-                    all_obligations.extend(category.get('obligations', []))
-                else:
-                    all_obligations.append(category)
-            
-            return {
-                "query": user_query,
-                "total_obligations_found": len(all_obligations),
-                "total_documents_searched": len(set(ob.get("document_name") for ob in all_obligations if ob.get("document_name"))),
-                "total_categories": len(categorized_obligations),
-                "results": all_obligations,
-                "processed_at": datetime.now().isoformat(),
-                "note": "Raw vector search results (merge and rank skipped for testing)"
-            }
-        
         # Create document name to ID mapping 
         document_name_to_id = {}
         for category in categorized_obligations:
@@ -3437,34 +3759,36 @@ Array of per-document objects containing categorized legal obligations.
 OBJECTIVE:
 Return a comprehensive set of obligations relevant to the user's query. You must capture the ENTIRE functional ecosystem of the queried concept, including related rights, remedies, financial penalties, and execution mechanics.
 
+RELEVANCE GUARDRAILS (STRICT):
+1. **Null/Empty Query:** If the user query is "null", "none", empty, or consists only of whitespace, you MUST return a JSON object with an empty `results` array.
+2. **Atomic Filtering:** Evaluate every single string inside "Owner Responsibility" independently. If one line is relevant, KEEP it. If the next line in the same object is NOT relevant, you MUST DROP it. Do not keep a line just because it is bundled with a relevant one.
+3. **Boilerplate vs. Specificity:** Do not keep generic lease obligations (e.g., general maintenance, HVAC, or insurance) unless they specifically mention the query or its direct functional synonyms.
+
 RELEVANCE RULE (THE "ECOSYSTEM" APPROACH):
-Keep an "Owner Responsibility" line if it touches ANY of the following aspects of the query:
+Keep an "Owner Responsibility" line ONLY if it touches ANY of the following as it relates specifically to the query:
   1. Direct Subject: Mentions the query or its direct synonyms.
   2. Mechanics & Operations: How the concept is performed, paid, calculated, or enforced.
-  3. Rights, Remedies & Offsets: Legal rights, the ability to withhold/offset, or remedies triggered by the concept.
-  4. Penalties, Defaults & Exceptions: Consequences of failing the obligation, holdover clauses, or permitted exceptions.
+  3. Rights, Remedies & Offsets: Legal rights (e.g., abatement, withholding) triggered by the concept.
+  4. Penalties & Defaults: Consequences of failing the obligation (e.g., late fees, interest).
 
-FILTERING STRATEGY & LINE-BY-LINE PRUNING:
-- Broad Legal Interpretation: Legal concepts are deeply intertwined. (e.g., If a query is "rent", you MUST keep lines about offsets against rent, holdovers, and abatements. If a query is "HVAC", keep lines about utility charges, maintenance access, and repair cost allocation).
-- LINE-BY-LINE EVALUATION: You MUST evaluate each individual string inside the "Owner Responsibility" array. Do NOT keep the entire array just because one or two lines are relevant. You must aggressively DELETE the specific string items within the array that do not fit the query's ecosystem.
-- Only keep the specific strings that are relevant to the query's direct subject, mechanics, rights, or penalties.
-- When in doubt about a specific line, KEEP the duty line. Over-inclusion of contextual legal clauses is always better than missing a critical financial or legal liability.
+FILTERING STRATEGY (THE ALGORITHMIC CHECKLIST):
+Apply this test to every string in the "Owner Responsibility" array:
+1. Is the query "null"? -> DELETE ALL.
+2. Does this specific line explicitly contain the query or a term functionally inseparable from it? -> If YES, KEEP.
+3. Does this specific line describe the payment, interest, or penalty logic for the query? -> If YES, KEEP.
+4. Is this line about a different topic (e.g., HVAC, plumbing, or security) even if it's in a 'Rent' category? -> If YES, DELETE.
+5. If the string answers NO to questions 2 and 3 -> DELETE IT.
 
-REASONING HANDLING (NO 1:1 ALIGNMENT REQUIRED):
-- You DO NOT need to maintain a strict 1:1 mapping between the "Owner Responsibility" and "Reasoning" arrays.
-- Simply retain ALL "Reasoning" lines that logically support, explain, or justify the specific "Owner Responsibility" lines you have chosen to keep.
-- A single responsibility might have multiple reasonings, or vice versa. This is perfectly fine.
-- Only remove "Reasoning" lines that exclusively apply to the responsibilities you filtered out.
+CRITICAL RULE FOR RUN-ON SENTENCES:
+If a single string contains both relevant and irrelevant info (e.g., a sentence covering both Rent and Janitorial services), KEEP the whole string. But if they are separate strings in the array, you MUST filter them individually.
+
+REASONING HANDLING:
+- Retain ONLY the "Reasoning" lines that logically support the "Owner Responsibility" lines you chose to KEEP. 
+- If you delete a responsibility line about HVAC, you MUST delete the reasoning line about HVAC.
 
 STRUCTURE PRESERVATION:
-- Keep category names EXACTLY as provided.
-- Keep "Responsible Party" EXACTLY unchanged.
-- Preserve original citations without modification.
-- NEVER merge obligations across different "Responsible Parties" or documents.
-
-OUTPUT REQUIREMENTS:
-- Remove empty obligations.
-- Remove empty categories.
+- Keep category names, parties, and citations EXACTLY as provided.
+- If an obligation's "Owner Responsibility" array becomes empty after filtering, remove that entire obligation object.
 
 OUTPUT FORMAT:
 {{
@@ -3478,8 +3802,8 @@ OUTPUT FORMAT:
       "obligations": [
         {{
           "Responsible Party": "<party>",
-          "Owner Responsibility": ["<filtered duty 1>", "<filtered duty 2>"],
-          "Reasoning": ["<relevant reason A>", "<relevant reason B>", "<relevant reason C>"],
+          "Owner Responsibility": ["<filtered line 1>"],
+          "Reasoning": ["<relevant reason A>"],
           "citations": [<original citation objects>]
         }}
       ]
@@ -3487,19 +3811,12 @@ OUTPUT FORMAT:
   ]
 }}
 
-QUALITY CHECK (BEFORE OUTPUT):
-1. Did I evaluate "Owner Responsibility" line-by-line and delete specific strings that are irrelevant?
-2. Did I include related offsets, penalties, and exceptions, not just literal keyword matches?
-3. Did I keep all reasoning lines that support the retained responsibilities, without worrying about strict 1:1 array lengths?
-4. Are there no empty arrays or null categories?
-
 User query: {uq}
 
 INPUT:
 {json.dumps(prompt_payload, indent=2)}
 
 Output only the JSON object:"""
-        
     async def merge_and_rank_results_stream(self, user_query: str, filtered_results: List[Dict[str, Any]], 
                               document_name_to_id: Optional[Dict[str, str]] = None) -> AsyncIterator[Dict[str, Any]]:
         """
@@ -3547,6 +3864,35 @@ Output only the JSON object:"""
                 }
                 return
 
+            if _skip_merge_and_rank_for_testing():
+                self.logger.info(
+                    "[STREAM] SKIP_MERGE_AND_RANK=true: skipping merge/rank LLM (%d obligations in merge input)",
+                    _count_obligations_in_filtered(merge_in),
+                )
+                payload_stream = build_rank_response_without_llm_merge(
+                    user_query,
+                    merge_in,
+                    documents_searched_count=len(filtered_results),
+                    merge_fallback=False,
+                )
+                note = (payload_stream.get("merge_note") or "").strip()
+                skip_msg = "Testing: merge/rank LLM skipped (SKIP_MERGE_AND_RANK)."
+                payload_stream["merge_note"] = f"{note} {skip_msg}".strip() if note else skip_msg
+                for grp in payload_stream.get("results") or []:
+                    if isinstance(grp, dict):
+                        yield {"type": "category_group", "data": grp}
+                meta: Dict[str, Any] = {
+                    "query": user_query,
+                    "total_documents_searched": len(filtered_results),
+                    "total_obligations_found": int(payload_stream.get("total_obligations_found") or 0),
+                    "total_categories": int(payload_stream.get("total_categories") or 0),
+                    "processed_at": datetime.now().isoformat(),
+                }
+                if (payload_stream.get("merge_note") or "").strip():
+                    meta["merge_note"] = (payload_stream.get("merge_note") or "").strip()
+                yield {"type": "metadata", "data": meta}
+                return
+
             merge_prompt = self._build_merge_rank_prompt(user_query, merge_in)
             self.logger.info("[STREAM] Merge/rank LLM call - streaming response from LLM")
             from streaming_json_parser import parse_obligations_stream
@@ -3569,20 +3915,10 @@ Output only the JSON object:"""
             n_stream = int(payload_stream.get("total_obligations_found") or 0)
             n_in = _count_obligations_in_filtered(merge_in)
             if n_stream == 0 and n_in > 0:
-                self.logger.warning(
-                    "[STREAM] merge produced zero obligations after coherence/normalize (input had %d); emitting retrieval-safe fallback",
+                self.logger.info(
+                    "[STREAM] merge produced zero obligations after coherence/normalize (input had %d); leaving merged payload as-is (no retrieval fallback)",
                     n_in,
                 )
-                payload_stream = merge_rank_fallback_payload(
-                    user_query,
-                    merge_in,
-                    documents_searched_count=len(filtered_results),
-                    skip_query_post_filters=True,
-                )
-                note = (payload_stream.get("merge_note") or "").strip()
-                payload_stream["merge_note"] = (
-                    (note + " ") if note else ""
-                ) + "Stream merge post-process yielded no obligations; returned retrieval-safe payload."
 
             for grp in payload_stream.get("results") or []:
                 if isinstance(grp, dict):
@@ -3664,6 +4000,30 @@ Output only the JSON object:"""
                     "processed_at": datetime.now().isoformat(),
                 }
 
+            if _skip_merge_and_rank_for_testing():
+                self.logger.info(
+                    "SKIP_MERGE_AND_RANK=true: skipping merge/rank LLM (%d obligations in merge input)",
+                    _count_obligations_in_filtered(merge_in),
+                )
+                final_result = build_rank_response_without_llm_merge(
+                    user_query,
+                    merge_in,
+                    documents_searched_count=len(filtered_results),
+                    merge_fallback=False,
+                )
+                note = (final_result.get("merge_note") or "").strip()
+                skip_msg = "Testing: merge/rank LLM skipped (SKIP_MERGE_AND_RANK)."
+                final_result["merge_note"] = f"{note} {skip_msg}".strip() if note else skip_msg
+                final_result["total_documents_searched"] = len(filtered_results)
+                final_result["processed_at"] = datetime.now().isoformat()
+                num_results = int(final_result.get("total_obligations_found") or 0)
+                self.logger.info(
+                    "[TIMING] merge_and_rank: total - %.3fs (%d obligations, merge LLM skipped)",
+                    time.perf_counter() - t0,
+                    num_results,
+                )
+                return final_result
+
             # 2. Build full merge+rank+filter prompt (no code merge; LLM does filtering, merging, ranking)
             t_step = time.perf_counter()
             merge_prompt = self._build_merge_rank_prompt(user_query, merge_in)
@@ -3680,21 +4040,21 @@ Output only the JSON object:"""
             )
             self.logger.info(f"[TIMING] merge_and_rank: 3. llm_api_call - {time.perf_counter() - t_step:.3f}s")
             
-            # 4. Parse JSON (tolerant) or return unmerged fallback
+            # 4. Parse JSON (tolerant) or empty shape on failure (no retrieval fallback)
             t_step = time.perf_counter()
             result_text = response.text.strip()
             try:
                 final_result = parse_llm_json_object(result_text)
             except ValueError as e:
                 self.logger.warning(
-                    "merge/rank JSON parse failed (%s); using unmerged fallback. Response tail: %r",
+                    "merge/rank JSON parse failed (%s); returning empty merge result (no retrieval fallback). Response tail: %r",
                     e,
                     result_text[-500:],
                 )
-                final_result = merge_rank_fallback_payload(
+                final_result = _empty_merge_rank_result(
                     user_query,
-                    merge_in,
                     documents_searched_count=len(filtered_results),
+                    merge_note=f"Merge response could not be parsed as JSON: {e}",
                 )
             self.logger.info(f"[TIMING] merge_and_rank: 4. parse_response - {time.perf_counter() - t_step:.3f}s")
             final_result.setdefault("query", user_query)
@@ -3712,22 +4072,11 @@ Output only the JSON object:"""
             n_after = int(final_result.get("total_obligations_found") or 0)
             n_in = _count_obligations_in_filtered(merge_in)
             if n_after == 0 and n_in > 0:
-                self.logger.warning(
-                    "merge_and_rank returned zero obligations after coherence/normalize (input had %d); using retrieval-safe fallback",
+                self.logger.info(
+                    "merge_and_rank returned zero obligations after coherence/normalize (input had %d); leaving merged result as-is (no retrieval fallback)",
                     n_in,
                 )
-                final_result = merge_rank_fallback_payload(
-                    user_query,
-                    merge_in,
-                    documents_searched_count=len(filtered_results),
-                    skip_query_post_filters=True,
-                )
-                final_result.setdefault("query", user_query)
-                note = (final_result.get("merge_note") or "").strip()
-                final_result["merge_note"] = (
-                    (note + " ") if note else ""
-                ) + "Post-merge processing yielded no obligations; returned retrieval-safe unfiltered groups."
-            
+
             final_result["total_documents_searched"] = len(filtered_results)
             final_result["processed_at"] = datetime.now().isoformat()
             num_results = int(final_result.get("total_obligations_found") or 0)
@@ -3789,6 +4138,25 @@ Output only the JSON object:"""
                     "processed_at": datetime.now().isoformat(),
                 }
 
+            if _skip_merge_and_rank_for_testing():
+                self.logger.info(
+                    "SKIP_MERGE_AND_RANK=true: skipping category merge/rank LLM (%d obligations in merge input)",
+                    _count_obligations_in_filtered(merge_in),
+                )
+                final_result = build_rank_response_without_llm_merge(
+                    user_query,
+                    merge_in,
+                    documents_searched_count=len(filtered_results),
+                    merge_fallback=False,
+                )
+                note = (final_result.get("merge_note") or "").strip()
+                skip_msg = "Testing: category merge/rank LLM skipped (SKIP_MERGE_AND_RANK)."
+                final_result["merge_note"] = f"{note} {skip_msg}".strip() if note else skip_msg
+                final_result["total_documents_searched"] = len(filtered_results)
+                final_result["processed_at"] = datetime.now().isoformat()
+                apply_query_scope_trim_to_results(user_query, final_result)
+                return final_result
+
             self.logger.info("[TIMING] merge_and_rank: start")
             t_start = time.perf_counter()
 
@@ -3812,21 +4180,21 @@ Output only the JSON object:"""
             )
             self.logger.info(f"[TIMING] merge_and_rank: 3. llm_api_call - {time.perf_counter() - t_step:.3f}s")
 
-            # 4. Parse JSON (tolerant) or return unmerged fallback  
+            # 4. Parse JSON (tolerant) or empty shape on failure (no retrieval fallback)
             t_step = time.perf_counter()
             result_text = response.text.strip()
             try:
                 final_result = parse_llm_json_object(result_text)
             except ValueError as e:
                 self.logger.warning(
-                    "Category merge/rank JSON parse failed (%s); using unmerged fallback. Response tail: %r",
+                    "Category merge/rank JSON parse failed (%s); returning empty merge result (no retrieval fallback). Response tail: %r",
                     e,
                     result_text[-500:],
                 )
-                final_result = merge_rank_fallback_payload(
+                final_result = _empty_merge_rank_result(
                     user_query,
-                    merge_in,
                     documents_searched_count=len(filtered_results),
+                    merge_note=f"Merge response could not be parsed as JSON: {e}",
                 )
             self.logger.info(f"[TIMING] merge_and_rank: 4. parse_response - {time.perf_counter() - t_step:.3f}s")
             final_result.setdefault("query", user_query)
@@ -3905,8 +4273,9 @@ Output only the JSON object:"""
                 document_ids=document_ids,
                 max_distance=2.0  # Filter for relevance
             )
-            
-            self.logger.info(f"[TIMING] Step: individual obligation semantic search - done in {time.perf_counter() - t_individual_search:.3f}s ({len(individual_results)} obligations)")
+            dt_individual_search = time.perf_counter() - t_individual_search
+
+            self.logger.info(f"[TIMING] Step: individual obligation semantic search - done in {dt_individual_search:.3f}s ({len(individual_results)} obligations)")
             
             if not individual_results:
                 self.logger.info("No matching individual obligations found; falling back to category-based approach")
@@ -3917,8 +4286,9 @@ Output only the JSON object:"""
             self.logger.info("[TIMING] Step: loading full obligation details - start")
             
             full_obligations = await self._load_full_obligation_details_async(individual_results)
-            
-            self.logger.info(f"[TIMING] Step: loading full obligation details - done in {time.perf_counter() - t_load_details:.3f}s ({len(full_obligations)} full obligations)")
+            dt_load_details = time.perf_counter() - t_load_details
+
+            self.logger.info(f"[TIMING] Step: loading full obligation details - done in {dt_load_details:.3f}s ({len(full_obligations)} full obligations)")
             
             # Step 3: Group by categories for LLM processing
             categorized_obligations = self._group_obligations_by_source_category(full_obligations)
@@ -3930,10 +4300,11 @@ Output only the JSON object:"""
             formatted_results = await self._process_obligations_with_llm_async(
                 user_query, categorized_obligations, "individual_obligations"
             )
+            dt_llm_processing = time.perf_counter() - t_llm_processing
 
             self.logger.info(
                 "[TIMING] Step: LLM filtering and ranking - done in %.3fs",
-                time.perf_counter() - t_llm_processing,
+                dt_llm_processing,
             )
             
             # Save output if requested
@@ -3952,11 +4323,11 @@ Output only the JSON object:"""
                 "after_llm_filtering": int(formatted_results.get("total_obligations_found") or 0),
                 "query_time_seconds": query_elapsed,
                 "metadata": {
-                    "individual_search_time": t_individual_search,
-                    "load_details_time": t_load_details,  
-                    "llm_processing_time": t_llm_processing,
-                    "document_filters": document_ids
-                }
+                    "individual_search_time": dt_individual_search,
+                    "load_details_time": dt_load_details,
+                    "llm_processing_time": dt_llm_processing,
+                    "document_filters": document_ids,
+                },
             }
             
         except Exception as e:
