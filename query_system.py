@@ -2102,6 +2102,43 @@ def merge_prompt_filtered_snapshot(filtered_results: List[Dict[str, Any]]) -> Li
     return out
 
 
+def _apply_filter_mask_to_payload(
+    payload: List[Dict[str, Any]],
+    mask: Dict[int, bool],
+) -> List[Dict[str, Any]]:
+    """
+    Applies a boolean mask (id -> keep) to the Owner Responsibility lines in the payload.
+    Reasoning is LEFT UNTOUCHED — Call 2 will handle Reasoning pruning.
+    Obligations whose Owner Responsibility becomes empty are removed.
+    Categories whose obligations become empty are removed.
+    Returns a deep copy of the filtered payload.
+    """
+    result: List[Dict[str, Any]] = []
+    global_id = 0  # must match indexing order used in _build_filter_only_prompt
+
+    for doc_block in payload:
+        new_block = {k: v for k, v in doc_block.items() if k != "results"}
+        new_groups: List[Dict[str, Any]] = []
+        for grp in doc_block.get("results") or []:
+            new_obs: List[Dict[str, Any]] = []
+            for ob in grp.get("obligations") or []:
+                kept_lines: List[str] = []
+                for line in ob.get("Owner Responsibility") or []:
+                    if mask.get(global_id, True):  # default keep on missing id
+                        kept_lines.append(line)
+                    global_id += 1
+                if kept_lines:
+                    new_ob = copy.deepcopy(ob)
+                    new_ob["Owner Responsibility"] = kept_lines
+                    new_obs.append(new_ob)
+            if new_obs:
+                new_groups.append({**grp, "obligations": new_obs})
+        if new_groups:
+            result.append({**new_block, "results": new_groups})
+
+    return result
+
+
 def build_rank_response_without_llm_merge(
     user_query: str,
     filtered_results: List[Dict[str, Any]],
@@ -3730,6 +3767,56 @@ Output the filtered JSON:"""
         
         return citations
     
+    def _build_filter_only_prompt(
+        self, user_query: str, payload: List[Dict[str, Any]]
+    ) -> str:
+        """
+        Call 1 of 2: Responsibility-only filtering.
+        Asks the LLM to output a boolean mask per Owner Responsibility line.
+        Does NOT touch Reasoning — that is Call 2's job.
+        """
+        uq = json.dumps(user_query, ensure_ascii=False)
+
+        indexed_lines: List[Dict[str, Any]] = []
+        for doc_block in payload:
+            for grp in doc_block.get("results") or []:
+                for ob in grp.get("obligations") or []:
+                    for line in ob.get("Owner Responsibility") or []:
+                        indexed_lines.append({
+                            "id": len(indexed_lines),
+                            "text": line,
+                        })
+
+        lines_json = json.dumps(indexed_lines, indent=2, ensure_ascii=False)
+
+        return f"""You are a legal contract relevance classifier.
+
+TASK: For each item in the list below, decide whether the "text" string is relevant to the user query.
+Output ONLY a JSON array of objects in this exact format:
+[{{"id": <int>, "keep": true}}, {{"id": <int>, "keep": false}}, ...]
+
+RELEVANCE RULES — KEEP (apply every rule independently per string):
+1. KEEP if the string directly mentions the query topic or a legal/financial synonym of it.
+2. KEEP if the string describes how the query topic is calculated, paid, enforced, or remedied.
+3. KEEP if the string describes a penalty, late fee, interest rate, or abatement that is triggered by the query topic.
+
+RELEVANCE RULES — DROP (apply every rule independently per string):
+4. DROP if the string is about a different operational topic (e.g., HVAC, insurance, plumbing) that has no connection to the query.
+5. DROP if the string is generic boilerplate that does not specifically relate to the query.
+6. DROP if the string is exclusively about a financial collateral instrument (security deposit, letter of credit, performance bond, guarantee, escrow) — these are security mechanisms, not performance obligations tied to the query topic. EXCEPTION: KEEP if the string explicitly links the collateral instrument to the query topic (e.g., "security deposit applied to unpaid rent").
+7. DROP if the string describes a one-time administrative permission fee charged for granting an approval or consent (e.g., assignment processing fee, subletting approval fee, alteration consent fee) — unless the fee is expressed as a multiple or percentage of the query topic amount.
+8. DROP if the string describes a lease termination right, cancellation right, or early exit option — even if the trigger condition involves the query topic. Termination is a legal remedy, not a performance obligation.
+
+IMPORTANT: A string that contains BOTH the query topic AND another topic → KEEP it (run-on sentence rule).
+Evaluate each string completely independently. Do not let adjacent strings influence your decision.
+
+User query: {uq}
+
+Strings to classify:
+{lines_json}
+
+Output only the JSON array:"""
+
     def _build_merge_rank_prompt(self, user_query: str, filtered_results: List[Dict[str, Any]], category_mode: bool = False) -> str:
         """Build the merge-and-rank LLM prompt. Shared by /query, /query/stream, and /query/stream/raw so results are consistent."""
         non_empty_results = [r for r in filtered_results if _filtered_fr_has_payload(r)]
@@ -3763,28 +3850,46 @@ RELEVANCE GUARDRAILS (STRICT):
 1. **Null/Empty Query:** If the user query is "null", "none", empty, or consists only of whitespace, you MUST return a JSON object with an empty `results` array.
 2. **Atomic Filtering:** Evaluate every single string inside "Owner Responsibility" independently. If one line is relevant, KEEP it. If the next line in the same object is NOT relevant, you MUST DROP it. Do not keep a line just because it is bundled with a relevant one.
 3. **Boilerplate vs. Specificity:** Do not keep generic lease obligations (e.g., general maintenance, HVAC, or insurance) unless they specifically mention the query or its direct functional synonyms.
+4. **Collateral Instruments are NOT Obligations:** Security deposits, letters of credit, performance bonds, escrow accounts, and guarantees are financial security mechanisms — they are NEVER the same as a performance obligation (e.g., rent, maintenance, insurance). Exclude them unless the string explicitly connects the collateral to the query topic (e.g., "security deposit drawn for unpaid rent").
+5. **Remedies are NOT Obligations:** Lease termination rights, cancellation clauses, early exit options, and cure-period rights are legal remedies — not performance obligations. Exclude them even when the trigger condition relates to the query topic.
 
 RELEVANCE RULE (THE "ECOSYSTEM" APPROACH):
 Keep an "Owner Responsibility" line ONLY if it touches ANY of the following as it relates specifically to the query:
   1. Direct Subject: Mentions the query or its direct synonyms.
   2. Mechanics & Operations: How the concept is performed, paid, calculated, or enforced.
-  3. Rights, Remedies & Offsets: Legal rights (e.g., abatement, withholding) triggered by the concept.
-  4. Penalties & Defaults: Consequences of failing the obligation (e.g., late fees, interest).
+  3. Financial Rights & Offsets: Financial rights (e.g., abatement, withholding, overpayment recovery) triggered by the concept.
+  4. Penalties & Defaults: Consequences of failing the obligation (e.g., late fees, interest, holdover premium).
 
 FILTERING STRATEGY (THE ALGORITHMIC CHECKLIST):
 Apply this test to every string in the "Owner Responsibility" array:
 1. Is the query "null"? -> DELETE ALL.
 2. Does this specific line explicitly contain the query or a term functionally inseparable from it? -> If YES, KEEP.
 3. Does this specific line describe the payment, interest, or penalty logic for the query? -> If YES, KEEP.
-4. Is this line about a different topic (e.g., HVAC, plumbing, or security) even if it's in a 'Rent' category? -> If YES, DELETE.
-5. If the string answers NO to questions 2 and 3 -> DELETE IT.
+4. Is this line exclusively about a collateral instrument (security deposit, letter of credit, bond) with no explicit link to the query topic? -> If YES, DELETE.
+5. Is this line exclusively about a termination right, cancellation clause, or cure-period remedy? -> If YES, DELETE.
+6. Is this line about a one-time administrative fee for granting a permission (assignment fee, subletting fee) that is not expressed as a rent multiple/percentage? -> If YES, DELETE.
+7. Is this line about a completely different operational topic (HVAC, plumbing, janitorial) with no link to the query? -> If YES, DELETE.
+8. If the string answers NO to questions 2 and 3 and YES to none of 4–7 -> evaluate holistically; when in doubt DELETE.
 
 CRITICAL RULE FOR RUN-ON SENTENCES:
 If a single string contains both relevant and irrelevant info (e.g., a sentence covering both Rent and Janitorial services), KEEP the whole string. But if they are separate strings in the array, you MUST filter them individually.
 
 REASONING HANDLING:
-- Retain ONLY the "Reasoning" lines that logically support the "Owner Responsibility" lines you chose to KEEP. 
-- If you delete a responsibility line about HVAC, you MUST delete the reasoning line about HVAC.
+The "Owner Responsibility" array in the INPUT has ALREADY been pre-filtered. 
+Every string in it is confirmed relevant. DO NOT remove any responsibility lines.
+
+Your job for "Reasoning" is:
+- A Reasoning line MUST BE KEPT if it provides justification, context, or legal basis 
+  for ANY of the surviving Owner Responsibility lines in the same obligation object.
+- A Reasoning line is "justifying" if: reading it helps a contract analyst understand 
+  WHY the responsibility exists, HOW it is calculated, or WHAT legal clause it derives from.
+- A Reasoning line MUST BE DROPPED only if it exclusively justifies a topic that is 
+  completely absent from the surviving Owner Responsibility lines (e.g., it explains an 
+  HVAC obligation when no HVAC responsibility survived).
+- When in doubt → KEEP the Reasoning line. Over-including context is always 
+  preferable to dropping legal justification.
+- Do NOT try to match Reasoning lines to Responsibility lines one-to-one. 
+  One Reasoning line may justify multiple responsibilities. Keep it once.
 
 STRUCTURE PRESERVATION:
 - Keep category names, parties, and citations EXACTLY as provided.
@@ -3792,7 +3897,7 @@ STRUCTURE PRESERVATION:
 
 OUTPUT FORMAT:
 {{
-  "query": "{uq}",
+  "query": {uq},
   "total_documents_searched": {ndocs},
   "total_obligations_found": <int>,
   "total_categories": <int>,
@@ -3817,8 +3922,14 @@ INPUT:
 {json.dumps(prompt_payload, indent=2)}
 
 Output only the JSON object:"""
-    async def merge_and_rank_results_stream(self, user_query: str, filtered_results: List[Dict[str, Any]], 
-                              document_name_to_id: Optional[Dict[str, str]] = None) -> AsyncIterator[Dict[str, Any]]:
+    async def merge_and_rank_results_stream(
+        self,
+        user_query: str,
+        filtered_results: List[Dict[str, Any]],
+        document_name_to_id: Optional[Dict[str, str]] = None,
+        *,
+        category_mode: bool = False,
+    ) -> AsyncIterator[Dict[str, Any]]:
         """
         Streams merge JSON: each parsed top-level element of "results" is a category group
         { "category", "obligations" }, then final metadata with counts.
@@ -3826,7 +3937,7 @@ Output only the JSON object:"""
         try:
             # Filter out empty results
             non_empty_results = [r for r in filtered_results if _filtered_fr_has_payload(r)]
-            
+
             if not non_empty_results:
                 yield {
                     "type": "metadata",
@@ -3842,7 +3953,9 @@ Output only the JSON object:"""
 
             merge_in, merge_orig = cap_merge_filtered_results(
                 non_empty_results,
-                _merge_max_input_obligations_for_query(user_query, document_blocks=len(non_empty_results)),
+                _merge_max_input_obligations_for_query(
+                    user_query, document_blocks=len(non_empty_results)
+                ),
             )
             if merge_orig > _count_obligations_in_filtered(merge_in):
                 self.logger.info(
@@ -3877,14 +3990,18 @@ Output only the JSON object:"""
                 )
                 note = (payload_stream.get("merge_note") or "").strip()
                 skip_msg = "Testing: merge/rank LLM skipped (SKIP_MERGE_AND_RANK)."
-                payload_stream["merge_note"] = f"{note} {skip_msg}".strip() if note else skip_msg
+                payload_stream["merge_note"] = (
+                    f"{note} {skip_msg}".strip() if note else skip_msg
+                )
                 for grp in payload_stream.get("results") or []:
                     if isinstance(grp, dict):
                         yield {"type": "category_group", "data": grp}
                 meta: Dict[str, Any] = {
                     "query": user_query,
                     "total_documents_searched": len(filtered_results),
-                    "total_obligations_found": int(payload_stream.get("total_obligations_found") or 0),
+                    "total_obligations_found": int(
+                        payload_stream.get("total_obligations_found") or 0
+                    ),
                     "total_categories": int(payload_stream.get("total_categories") or 0),
                     "processed_at": datetime.now().isoformat(),
                 }
@@ -3893,7 +4010,67 @@ Output only the JSON object:"""
                 yield {"type": "metadata", "data": meta}
                 return
 
-            merge_prompt = self._build_merge_rank_prompt(user_query, merge_in)
+            filtered_payload = merge_in
+            try:
+                filter_prompt = self._build_filter_only_prompt(user_query, merge_in)
+                self.logger.info("[STREAM] 2-call pipeline: Call 1 (filter) starting")
+                t1 = time.perf_counter()
+                filter_response = await self._generate_content_async(
+                    prompt=filter_prompt,
+                    temperature=0.0,
+                    response_mime_type="application/json",
+                    max_output_tokens=4096,
+                )
+                self.logger.info(
+                    "[STREAM] 2-call pipeline: Call 1 done in %.3fs",
+                    time.perf_counter() - t1,
+                )
+
+                raw_mask_text = filter_response.text.strip()
+                if raw_mask_text.startswith("```"):
+                    raw_mask_text = re.sub(r"^```[a-zA-Z]*\n?", "", raw_mask_text)
+                    raw_mask_text = raw_mask_text.rstrip("`").strip()
+
+                mask_list: List[Dict[str, Any]] = json.loads(raw_mask_text)
+                mask: Dict[int, bool] = {
+                    int(item["id"]): bool(item["keep"]) for item in mask_list
+                }
+                filtered_payload = _apply_filter_mask_to_payload(merge_in, mask)
+
+                if not filtered_payload:
+                    self.logger.info(
+                        "[STREAM] 2-call pipeline: filter removed all obligations"
+                    )
+                    empty_payload = _empty_merge_rank_result(
+                        user_query,
+                        documents_searched_count=len(filtered_results),
+                        merge_note="Responsibility filter removed all obligations.",
+                    )
+                    meta = {
+                        "query": empty_payload.get("query", user_query),
+                        "total_documents_searched": int(
+                            empty_payload.get("total_documents_searched") or 0
+                        ),
+                        "total_obligations_found": int(
+                            empty_payload.get("total_obligations_found") or 0
+                        ),
+                        "total_categories": int(empty_payload.get("total_categories") or 0),
+                        "processed_at": empty_payload.get("processed_at")
+                        or datetime.now().isoformat(),
+                        "merge_note": empty_payload.get("merge_note"),
+                    }
+                    yield {"type": "metadata", "data": meta}
+                    return
+            except Exception as e:
+                self.logger.warning(
+                    "[STREAM] 2-call pipeline: Call 1 failed (%s); using unfiltered payload",
+                    e,
+                )
+                filtered_payload = merge_in
+
+            merge_prompt = self._build_merge_rank_prompt(
+                user_query, filtered_payload, category_mode=category_mode
+            )
             self.logger.info("[STREAM] Merge/rank LLM call - streaming response from LLM")
             from streaming_json_parser import parse_obligations_stream
 
@@ -3904,45 +4081,132 @@ Output only the JSON object:"""
                 response_mime_type="application/json",
                 max_output_tokens=_merge_rank_max_output_tokens(),
             )
-            streamed: List[Dict[str, Any]] = []
+
+            total_categories = 0
+            total_obligations = 0
             async for chunk in parse_obligations_stream(token_stream):
-                if isinstance(chunk, dict):
-                    streamed.append(chunk)
-
-            payload_stream: Dict[str, Any] = {"results": streamed, "query": user_query}
-            apply_query_coherence_to_payload(user_query, payload_stream)
-            normalize_query_response_shape(payload_stream, merge_in)
-            n_stream = int(payload_stream.get("total_obligations_found") or 0)
-            n_in = _count_obligations_in_filtered(merge_in)
-            if n_stream == 0 and n_in > 0:
-                self.logger.info(
-                    "[STREAM] merge produced zero obligations after coherence/normalize (input had %d); leaving merged payload as-is (no retrieval fallback)",
-                    n_in,
-                )
-
-            for grp in payload_stream.get("results") or []:
-                if isinstance(grp, dict):
-                    yield {"type": "category_group", "data": grp}
+                if not isinstance(chunk, dict):
+                    continue
+                cat = str(chunk.get("category") or "").strip() or "Other"
+                obs_in = chunk.get("obligations")
+                if not isinstance(obs_in, list):
+                    continue
+                inner: List[Dict[str, Any]] = []
+                for ob in obs_in:
+                    if not isinstance(ob, dict):
+                        continue
+                    inner.append(_normalize_inner_api_obligation(ob))
+                if not inner:
+                    continue
+                payload_group = {"results": [{"category": cat, "obligations": inner}]}
+                enrich_nested_results_citations_from_merge_in(payload_group, merge_in)
+                sanitize_reasoning_duplication_across_obligations(payload_group["results"])
+                strip_related_keywords_from_api_payload(payload_group)
+                group = payload_group["results"][0]
+                total_categories += 1
+                total_obligations += len(group.get("obligations") or [])
+                yield {"type": "category_group", "data": group}
 
             yield {
                 "type": "metadata",
                 "data": {
                     "query": user_query,
                     "total_documents_searched": len(filtered_results),
-                    "total_obligations_found": int(payload_stream.get("total_obligations_found") or 0),
-                    "total_categories": int(payload_stream.get("total_categories") or 0),
+                    "total_obligations_found": total_obligations,
+                    "total_categories": total_categories,
                     "processed_at": datetime.now().isoformat(),
                 },
             }
-            
+
         except Exception as e:
             import traceback
+
             self.logger.error(f"Error in streaming merge_and_rank: {e}")
             self.logger.error(traceback.format_exc())
-            yield {
-                "type": "error",
-                "message": str(e)
-            }
+            yield {"type": "error", "message": str(e)}
+
+    async def _filter_then_merge_rank(
+        self,
+        user_query: str,
+        merge_in: List[Dict[str, Any]],
+        *,
+        category_mode: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Two-call pipeline for maximum filtering accuracy.
+
+        Call 1: Filter Owner Responsibility lines only (boolean mask).
+        Call 2: Prune Reasoning by justification, then merge + rank.
+
+        Falls back to single-call if Call 1 fails.
+        """
+        try:
+            filter_prompt = self._build_filter_only_prompt(user_query, merge_in)
+            self.logger.info("[2-CALL] Call 1 — responsibility filter starting")
+            t1 = time.perf_counter()
+            filter_response = await self._generate_content_async(
+                prompt=filter_prompt,
+                temperature=0.0,
+                response_mime_type="application/json",
+                max_output_tokens=4096,
+            )
+            self.logger.info("[2-CALL] Call 1 done in %.3fs", time.perf_counter() - t1)
+
+            raw_mask_text = filter_response.text.strip()
+            if raw_mask_text.startswith("```"):
+                raw_mask_text = re.sub(r"^```[a-zA-Z]*\n?", "", raw_mask_text)
+                raw_mask_text = raw_mask_text.rstrip("`").strip()
+
+            mask_list: List[Dict[str, Any]] = json.loads(raw_mask_text)
+            mask: Dict[int, bool] = {int(item["id"]): bool(item["keep"]) for item in mask_list}
+
+            n_total = len(mask)
+            n_kept = sum(1 for v in mask.values() if v)
+            self.logger.info("[2-CALL] Filter mask: %d/%d lines kept", n_kept, n_total)
+
+            filtered_payload = _apply_filter_mask_to_payload(merge_in, mask)
+
+            if not filtered_payload:
+                self.logger.info("[2-CALL] Filter removed all obligations; returning empty")
+                return _empty_merge_rank_result(
+                    user_query,
+                    documents_searched_count=0,
+                    merge_note="Responsibility filter removed all obligations.",
+                )
+
+        except Exception as e:
+            self.logger.warning(
+                "[2-CALL] Call 1 (filter) failed (%s); falling back to single-call merge", e
+            )
+            filtered_payload = merge_in
+
+        self.logger.info("[2-CALL] Call 2 — reasoning prune + merge + rank starting")
+        t2 = time.perf_counter()
+        merge_prompt = self._build_merge_rank_prompt(
+            user_query, filtered_payload, category_mode=category_mode
+        )
+        response = await self._generate_content_async(
+            prompt=merge_prompt,
+            temperature=0.1,
+            response_mime_type="application/json",
+            max_output_tokens=_merge_rank_max_output_tokens(),
+        )
+        self.logger.info("[2-CALL] Call 2 done in %.3fs", time.perf_counter() - t2)
+
+        result_text = response.text.strip()
+        try:
+            final_result = parse_llm_json_object(result_text)
+        except ValueError as e:
+            self.logger.warning(
+                "[2-CALL] Call 2 JSON parse failed (%s); returning merge fallback", e
+            )
+            final_result = build_rank_response_without_llm_merge(
+                user_query,
+                filtered_payload,
+                documents_searched_count=len(filtered_payload),
+                merge_fallback=True,
+            )
+        return final_result
 
     async def merge_and_rank_results(self, user_query: str, filtered_results: List[Dict[str, Any]], 
                               document_name_to_id: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
@@ -4024,39 +4288,12 @@ Output only the JSON object:"""
                 )
                 return final_result
 
-            # 2. Build full merge+rank+filter prompt (no code merge; LLM does filtering, merging, ranking)
+            # 2+3. Two-call pipeline: filter responsibilities (Call 1) then prune reasoning + merge + rank (Call 2)
             t_step = time.perf_counter()
-            merge_prompt = self._build_merge_rank_prompt(user_query, merge_in)
-            self.logger.info(f"[TIMING] merge_and_rank: 2. build_prompt - {time.perf_counter() - t_step:.3f}s")
-            self.logger.info(f"Merge and rank (LLM) for query: '{user_query}'")
-            
-            # 3. Call LLM API asynchronously (filter + merge + rank in one call)
-            t_step = time.perf_counter()
-            response = await self._generate_content_async(
-                prompt=merge_prompt,
-                temperature=0.1,
-                response_mime_type="application/json",
-                max_output_tokens=_merge_rank_max_output_tokens(),
-            )
-            self.logger.info(f"[TIMING] merge_and_rank: 3. llm_api_call - {time.perf_counter() - t_step:.3f}s")
-            
-            # 4. Parse JSON (tolerant) or empty shape on failure (no retrieval fallback)
-            t_step = time.perf_counter()
-            result_text = response.text.strip()
-            try:
-                final_result = parse_llm_json_object(result_text)
-            except ValueError as e:
-                self.logger.warning(
-                    "merge/rank JSON parse failed (%s); returning empty merge result (no retrieval fallback). Response tail: %r",
-                    e,
-                    result_text[-500:],
-                )
-                final_result = _empty_merge_rank_result(
-                    user_query,
-                    documents_searched_count=len(filtered_results),
-                    merge_note=f"Merge response could not be parsed as JSON: {e}",
-                )
-            self.logger.info(f"[TIMING] merge_and_rank: 4. parse_response - {time.perf_counter() - t_step:.3f}s")
+            self.logger.info(f"Merge and rank (2-call LLM pipeline) for query: '{user_query}'")
+            final_result = await self._filter_then_merge_rank(user_query, merge_in)
+            self.logger.info(f"[TIMING] merge_and_rank: 2+3. two_call_pipeline - {time.perf_counter() - t_step:.3f}s")
+
             final_result.setdefault("query", user_query)
             
             # 5. Convert citations to structured format (in case LLM returned string)
@@ -4164,39 +4401,14 @@ Output only the JSON object:"""
             t_step = time.perf_counter()
             self.logger.info(f"[TIMING] merge_and_rank: 1. filter_empty_results - {time.perf_counter() - t_step:.3f}s")
 
-            # 2. Build merge prompt (CATEGORY MODE)
+            # 2+3. Two-call pipeline (category mode uses same Call 2 prompt flag)
             t_step = time.perf_counter()
-            merge_prompt = self._build_merge_rank_prompt(user_query, merge_in, category_mode=True)
-            self.logger.info(f"[TIMING] merge_and_rank: 2. build_prompt - {time.perf_counter() - t_step:.3f}s")
-            self.logger.info(f"Merge and rank (LLM CATEGORY MODE) for query: '{user_query}'")
-            
-            # 3. Call LLM API asynchronously (filter + merge + rank in one call)
-            t_step = time.perf_counter()
-            response = await self._generate_content_async(
-                prompt=merge_prompt,
-                temperature=0.1,
-                response_mime_type="application/json",
-                max_output_tokens=_merge_rank_max_output_tokens(),
+            self.logger.info(f"Merge and rank (2-call LLM CATEGORY MODE) for query: '{user_query}'")
+            final_result = await self._filter_then_merge_rank(
+                user_query, merge_in, category_mode=True
             )
-            self.logger.info(f"[TIMING] merge_and_rank: 3. llm_api_call - {time.perf_counter() - t_step:.3f}s")
+            self.logger.info(f"[TIMING] merge_and_rank: 2+3. two_call_pipeline - {time.perf_counter() - t_step:.3f}s")
 
-            # 4. Parse JSON (tolerant) or empty shape on failure (no retrieval fallback)
-            t_step = time.perf_counter()
-            result_text = response.text.strip()
-            try:
-                final_result = parse_llm_json_object(result_text)
-            except ValueError as e:
-                self.logger.warning(
-                    "Category merge/rank JSON parse failed (%s); returning empty merge result (no retrieval fallback). Response tail: %r",
-                    e,
-                    result_text[-500:],
-                )
-                final_result = _empty_merge_rank_result(
-                    user_query,
-                    documents_searched_count=len(filtered_results),
-                    merge_note=f"Merge response could not be parsed as JSON: {e}",
-                )
-            self.logger.info(f"[TIMING] merge_and_rank: 4. parse_response - {time.perf_counter() - t_step:.3f}s")
             final_result.setdefault("query", user_query)
 
             # 5. Convert citations to structured format (in case LLM returned string)
@@ -5337,25 +5549,55 @@ async def query_obligations_stream(request: Optional[QueryRequest] = Body(defaul
             qs = query_system_instance
             if req.output_folder:
                 qs = ObligationQuerySystem(local_output_folder=req.output_folder, model=get_default_model())
-            
-            consolidated_files = qs.load_consolidated_jsons()
-            
-            if req.document_ids:
-                consolidated_files = [
-                    f for f in consolidated_files
-                    if any(doc_id in f["document_name"] or doc_id in f["file_name"] for doc_id in req.document_ids)
-                ]
-            
-            if not consolidated_files:
-                force_logger.info("[STREAM] No documents found for query")
-                yield json.dumps({"type": "error", "message": "No documents found"}) + "\n"
+
+            query_text = user_query
+            if not query_text or query_text.strip() == "":
+                query_text = "utilities including water, gas, heat, light, electricity, telephone service, HVAC, sprinkler system, electrical and plumbing systems"
+                logging.info("[STREAM] No query provided - defaulting to utilities query")
+
+            if not qs._vector_store_available():
+                logging.warning("[STREAM] vector_store module missing; using legacy query")
+                legacy_result = await qs.query_legacy(
+                    query_text,
+                    save_output=req.save_output,
+                    document_ids=req.document_ids,
+                    use_category_mode_override=False,
+                )
+                for grp in legacy_result.get("results") or []:
+                    line = json.dumps({"type": "category_group", "data": grp}) + "\n"
+                    _write_stream_line(line)
+                    yield line
+                meta = {
+                    "query": legacy_result.get("query", query_text),
+                    "total_documents_searched": int(
+                        legacy_result.get("total_documents_searched") or 0
+                    ),
+                    "total_obligations_found": int(
+                        legacy_result.get("total_obligations_found") or 0
+                    ),
+                    "total_categories": int(legacy_result.get("total_categories") or 0),
+                    "processed_at": legacy_result.get("processed_at") or datetime.now().isoformat(),
+                }
+                if (legacy_result.get("merge_note") or "").strip():
+                    meta["merge_note"] = legacy_result.get("merge_note")
+                line = json.dumps({"type": "metadata", "data": meta}) + "\n"
+                _write_stream_line(line)
+                yield line
                 return
-            
-            document_name_to_id = {}
-            for file_info in consolidated_files:
-                doc_name = file_info["document_name"]
-                doc_id = file_info.get("data", {}).get("document_id") or doc_name
-                document_name_to_id[doc_name] = doc_id
+
+            t_individual = time.perf_counter()
+            individual_results = qs._query_individual_obligations_vector_store(
+                query_text,
+                n_results=30,
+                document_ids=req.document_ids,
+                max_distance=2.0,
+            )
+            force_logger.info(
+                f"[STREAM] Individual obligation search returned {len(individual_results)} "
+                f"obligation(s) ({time.perf_counter() - t_individual:.2f}s)"
+            )
+
+            document_name_to_id: Dict[str, str] = {}
             if req.document_ids:
                 for doc_id in req.document_ids:
                     d = (doc_id or "").strip()
@@ -5363,69 +5605,106 @@ async def query_obligations_stream(request: Optional[QueryRequest] = Body(defaul
                         name = Path(d).name or d
                         document_name_to_id[name] = doc_id
                         document_name_to_id[name.lower()] = doc_id
-            
-            # Step 1: Vector search for filtering (same as main query())
-            t_vector = time.perf_counter()
-            vector_obligations = qs._query_vector_store(user_query, n_results=100, document_ids=req.document_ids)
-            if not vector_obligations:
-                vector_obligations = qs._merge_obligations_from_consolidated_topic_only(
-                    user_query, consolidated_files, req.document_ids
-                )
-                if vector_obligations:
-                    logging.info("[STREAM] Consolidated topic fallback (%d rows); Chroma empty", len(vector_obligations))
-            elapsed_vector = time.perf_counter() - t_vector
-            logging.info(
-                "[STREAM] Retrieval: %d obligation row(s) after vector + optional consolidated fallback (%.2fs)",
-                len(vector_obligations),
-                elapsed_vector,
-            )
-            force_logger.info(
-                f"[STREAM] Retrieval complete: {len(vector_obligations)} obligation row(s) "
-                f"after vector + optional consolidated fallback ({elapsed_vector:.2f}s)"
-            )
 
-            if vector_obligations:
-                # Vector path: group by document + extraction category for merge (nested results[])
-                logging.info(f"[STREAM] Using vector results for filtering (no per-document LLM filter)")
-                force_logger.info("[STREAM] Using vector results for filtering (no per-document LLM filter)")
-                filtered_results = grouped_merge_input_from_vector_obligations(vector_obligations)
-                filtered_results = expand_grouped_vector_merge_to_full_categories(
-                    filtered_results,
-                    consolidated_files,
-                    logger=logging.getLogger(__name__),
+            if not individual_results:
+                logging.info("[STREAM] No individual obligations; falling back to category pipeline")
+                category_matches = qs._query_categories_vector_store(
+                    query_text, n_results=50, document_ids=req.document_ids
                 )
-            else:
-                # Fallback: LLM filter each document then merge/rank
-                logging.info(f"[STREAM] No vector results; using LLM filter per document")
-                force_logger.info("[STREAM] No vector results; using LLM filter per document")
-                filter_tasks = [
-                    qs.filter_obligations_by_query(
-                        user_query,
-                        file_info["data"],
-                        file_info["document_name"]
-                    )
-                    for file_info in consolidated_files
+                if not category_matches:
+                    logging.info("[STREAM] No category matches; returning empty payload")
+                    meta = {
+                        "query": query_text,
+                        "total_documents_searched": 0,
+                        "total_obligations_found": 0,
+                        "total_categories": 0,
+                        "processed_at": datetime.now().isoformat(),
+                    }
+                    line = json.dumps({"type": "metadata", "data": meta}) + "\n"
+                    _write_stream_line(line)
+                    yield line
+                    return
+
+                distance_threshold = float(
+                    os.getenv("CATEGORY_RESULT_DISTANCE_THRESHOLD", "2.0")
+                )
+                relevant_categories = [
+                    cat
+                    for cat in category_matches
+                    if cat.get("distance", 999) <= distance_threshold
                 ]
-                filtered_results = await asyncio.gather(*filter_tasks)
-            
-            total_for_merge = _count_obligations_in_filtered(filtered_results)
-            logging.info(f"[STREAM] Merge and rank LLM call - start (input: {total_for_merge} obligations from {len(filtered_results)} doc(s))")
-            force_logger.info(
-                f"[STREAM] Merge and rank LLM call - start (input: {total_for_merge} obligations from {len(filtered_results)} doc(s))"
+                full_categories = qs._get_full_categories_from_matches(relevant_categories)
+                if not full_categories:
+                    meta = {
+                        "query": query_text,
+                        "total_documents_searched": 0,
+                        "total_obligations_found": 0,
+                        "total_categories": 0,
+                        "processed_at": datetime.now().isoformat(),
+                    }
+                    line = json.dumps({"type": "metadata", "data": meta}) + "\n"
+                    _write_stream_line(line)
+                    yield line
+                    return
+
+                obligation_stream_count = 0
+                async for event in qs.merge_and_rank_results_stream(
+                    query_text,
+                    full_categories,
+                    document_name_to_id,
+                    category_mode=True,
+                ):
+                    if event.get("type") == "category_group":
+                        obligation_stream_count += len(
+                            (event.get("data") or {}).get("obligations") or []
+                        )
+                    line = json.dumps(event) + "\n"
+                    _write_stream_line(line)
+                    force_logger.info(f"[STREAM EVENT] {line.strip()}")
+                    yield line
+                force_logger.info(
+                    "[STREAM] Category pipeline complete (streamed %d obligations)",
+                    obligation_stream_count,
+                )
+                return
+
+            full_obligations = await qs._load_full_obligation_details_async(
+                individual_results
             )
-            
-            # Step 2: Stream merge and rank results (echo to terminal so you see stream when using Postman)
+            categorized_obligations = qs._group_obligations_by_source_category(
+                full_obligations
+            )
+            normalized_results: List[Dict[str, Any]] = categorized_obligations
+            if categorized_obligations and not any(
+                isinstance(r, dict) and "results" in r for r in categorized_obligations
+            ):
+                normalized_results = [
+                    {
+                        "document_name": "individual_obligations",
+                        "results": categorized_obligations,
+                    }
+                ]
+
             obligation_stream_count = 0
-            async for event in qs.merge_and_rank_results_stream(user_query, filtered_results, document_name_to_id):
+            async for event in qs.merge_and_rank_results_stream(
+                query_text,
+                normalized_results,
+                document_name_to_id,
+                category_mode=False,
+            ):
                 if event.get("type") == "category_group":
-                    obligation_stream_count += len((event.get("data") or {}).get("obligations") or [])
+                    obligation_stream_count += len(
+                        (event.get("data") or {}).get("obligations") or []
+                    )
                 line = json.dumps(event) + "\n"
                 _write_stream_line(line)
                 force_logger.info(f"[STREAM EVENT] {line.strip()}")
                 yield line
-            
-            logging.info(f"[STREAM] Merge and rank LLM call - complete (streamed {obligation_stream_count} obligations)")
-            force_logger.info(f"[STREAM] Merge and rank LLM call - complete (streamed {obligation_stream_count} obligations)")
+
+            force_logger.info(
+                "[STREAM] Individual obligations pipeline complete (streamed %d obligations)",
+                obligation_stream_count,
+            )
             
         except Exception as e:
             logging.error(f"Error in streaming query: {e}", exc_info=True)
