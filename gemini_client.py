@@ -5,15 +5,29 @@ Supports:
   2) Vertex AI with API key: aiplatform.googleapis.com — use GOOGLE_GENAI_USE_VERTEXAI=true + GEMINI_API_KEY.
      - With GOOGLE_CLOUD_PROJECT set: standard Vertex path (project/location in URL).
      - Without project: Vertex express mode — no project ID needed; key is tied to project at creation.
+
+Streaming (streamGenerateContent + alt=sse) is implemented for Google AI Studio only.
 """
 import asyncio
+import json
 import os
-from typing import Optional
+from typing import AsyncIterator, Optional
 
+import httpx
 import requests
 from dotenv import load_dotenv
 
 load_dotenv()
+
+
+def _gemini_stream_text_slice_chars() -> int:
+    """Split large streamed text parts so downstream incremental JSON parsers see smaller chunks."""
+    try:
+        n = int(os.getenv("GEMINI_STREAM_TEXT_SLICE_CHARS", "128") or "128")
+        return max(16, min(n, 8192))
+    except ValueError:
+        return 128
+
 
 # Google AI Studio (Gemini) — accepts API key in header
 GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
@@ -55,7 +69,7 @@ def generate_content(
         raise ValueError("GEMINI_API_KEY or GOOGLE_API_KEY must be set")
 
     use_vertex = _use_vertex_api_key()
-    model_name = model or os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
+    model_name = model or os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite-preview")
 
     if use_vertex:
         project = os.getenv("GOOGLE_CLOUD_PROJECT") or os.getenv("VERTEX_PROJECT")
@@ -183,3 +197,84 @@ async def generate_content_async(
         max_output_tokens=max_output_tokens,
         require_json_object=require_json_object,
     )
+
+
+async def generate_content_stream(
+    prompt: str,
+    *,
+    model: Optional[str] = None,
+    api_key: Optional[str] = None,
+    temperature: float = 0.1,
+    response_mime_type: str = "application/json",
+    max_output_tokens: Optional[int] = None,
+    require_json_object: bool = True,
+) -> AsyncIterator[str]:
+    """
+    Stream via streamGenerateContent (SSE, alt=sse). Google AI Studio only; not supported for Vertex key mode.
+    Yields text fragments from each chunk (same contract as Azure OpenAI streaming).
+    """
+    if _use_vertex_api_key():
+        raise ValueError(
+            "Gemini streaming is only implemented for Google AI Studio. "
+            "Unset GOOGLE_GENAI_USE_VERTEXAI or use USE_AZURE_OPENAI for streaming."
+        )
+    _ = require_json_object
+    key = api_key or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+    if not key:
+        raise ValueError("GEMINI_API_KEY or GOOGLE_API_KEY must be set")
+
+    model_name = model or os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite-preview")
+    url = f"{GEMINI_BASE}/models/{model_name}:streamGenerateContent?alt=sse"
+    headers = {
+        "x-goog-api-key": key,
+        "Content-Type": "application/json",
+    }
+    gen_config = {
+        "temperature": temperature,
+        "responseMimeType": response_mime_type,
+        "maxOutputTokens": max_output_tokens
+        if max_output_tokens is not None
+        else int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "8192")),
+    }
+    body = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": gen_config,
+    }
+
+    async with httpx.AsyncClient(timeout=httpx.Timeout(300.0)) as client:
+        async with client.stream("POST", url, headers=headers, json=body) as response:
+            if response.status_code != 200:
+                error_text = await response.aread()
+                raise ValueError(
+                    f"Gemini stream error {response.status_code}: "
+                    f"{error_text.decode('utf-8', errors='ignore')}"
+                )
+            async for line in response.aiter_lines():
+                raw = (line or "").strip()
+                if not raw or raw == "data: [DONE]":
+                    continue
+                payload = raw[6:].strip() if raw.startswith("data: ") else raw
+                if not payload:
+                    continue
+                try:
+                    parsed = json.loads(payload)
+                except json.JSONDecodeError:
+                    continue
+                events = parsed if isinstance(parsed, list) else [parsed]
+                for obj in events:
+                    if not isinstance(obj, dict):
+                        continue
+                    for cand in obj.get("candidates") or []:
+                        parts = (cand.get("content") or {}).get("parts") or []
+                        for p in parts:
+                            t = p.get("text") or ""
+                            if not t:
+                                continue
+                            step = _gemini_stream_text_slice_chars()
+                            if len(t) <= step:
+                                yield t
+                                await asyncio.sleep(0)
+                                continue
+                            for i in range(0, len(t), step):
+                                yield t[i : i + step]
+                                await asyncio.sleep(0)

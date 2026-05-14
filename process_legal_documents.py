@@ -7,6 +7,8 @@ import os
 import re
 import json
 import logging
+import threading
+from collections import deque
 from pathlib import Path
 from datetime import datetime
 from force_terminal_logger import force_logger
@@ -23,7 +25,39 @@ from PIL import Image
 import pytesseract
 
 # LLM API (Azure OpenAI or Gemini via llm_client)
-from llm_client import generate_content as llm_generate_content, get_default_model, use_bedrock_llm
+from llm_client import generate_content as _llm_generate_content_impl, get_default_model
+
+_doc_llm_lock = threading.Lock()
+_doc_llm_call_times: deque[float] = deque()
+
+
+def _wait_document_llm_rate_limit() -> None:
+    """
+    Block until another LLM call may start so we stay under DOCUMENT_LLM_MAX_CALLS_PER_MINUTE
+    per DOCUMENT_LLM_RATE_LIMIT_WINDOW_SECONDS (sliding window). Set max to 0 to disable.
+    """
+    raw = (os.getenv("DOCUMENT_LLM_MAX_CALLS_PER_MINUTE") or "9").strip()
+    max_calls = int(raw or "9")
+    if max_calls <= 0:
+        return
+    window = float((os.getenv("DOCUMENT_LLM_RATE_LIMIT_WINDOW_SECONDS") or "60").strip() or "60")
+    window = max(1.0, window)
+    while True:
+        with _doc_llm_lock:
+            now = time.monotonic()
+            while _doc_llm_call_times and _doc_llm_call_times[0] < now - window:
+                _doc_llm_call_times.popleft()
+            if len(_doc_llm_call_times) < max_calls:
+                _doc_llm_call_times.append(now)
+                return
+            wait_s = _doc_llm_call_times[0] + window - now
+        time.sleep(max(wait_s, 0.05))
+
+
+def llm_generate_content(*args, **kwargs):
+    """Same as llm_client.generate_content, with document-processing rate limiting."""
+    _wait_document_llm_rate_limit()
+    return _llm_generate_content_impl(*args, **kwargs)
 
 from processing_results import (
     broaden_related_keywords,
@@ -50,8 +84,6 @@ def _configured_llm_label() -> str:
     """Human-readable LLM provider for logs (matches llm_client routing)."""
     if os.getenv("USE_AZURE_OPENAI", "").lower() in ("true", "1", "yes"):
         return "Azure OpenAI"
-    if use_bedrock_llm():
-        return "AWS Bedrock"
     return "Gemini API"
 
 
@@ -701,12 +733,10 @@ class GeminiAnalyzer:
                 raise ValueError("USE_AZURE_OPENAI is set; AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_API_KEY (or AZURE_OPENAI_KEY) must be set in .env")
             if not os.getenv("AZURE_OPENAI_DEPLOYMENT") and not os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME") and not os.getenv("OPENAI_DEPLOYMENT_NAME"):
                 raise ValueError("USE_AZURE_OPENAI is set; AZURE_OPENAI_DEPLOYMENT or AZURE_OPENAI_DEPLOYMENT_NAME must be set in .env")
-        elif use_bedrock_llm():
-            self.logger.info("LLM client: AWS Bedrock (credentials from env / default chain)")
         else:
             if not os.getenv('GEMINI_API_KEY') and not os.getenv('GOOGLE_API_KEY'):
                 raise ValueError("GEMINI_API_KEY must be set in .env (Gemini API key from https://aistudio.google.com/app/apikey)")
-        self.logger.info("LLM client (Azure OpenAI, Bedrock, or Gemini) ready")
+        self.logger.info("LLM client (Azure OpenAI or Gemini) ready")
     
     def reset_party_metadata(self):
         """
@@ -5371,12 +5401,14 @@ class LegalDocumentProcessor:
                 
             except ImportError:
                 self.logger.warning("Enhanced indexing not available, falling back to legacy approach")
-                # Fallback to original indexing
-                self._fallback_to_legacy_indexing(doc_name, flat_for_vector_index, consolidated_json_data, out_dir)
+                _consolidated = locals().get("_final")
+                consolidated_payload = consolidated_data if _consolidated is None else _consolidated
+                self._fallback_to_legacy_indexing(doc_name, flat_for_vector_index, consolidated_payload, out_dir)
             except Exception as e:
                 self.logger.error(f"Enhanced indexing failed: {e}")
-                # Fallback to original indexing
-                self._fallback_to_legacy_indexing(doc_name, flat_for_vector_index, _final, out_dir)
+                _consolidated = locals().get("_final")
+                consolidated_payload = consolidated_data if _consolidated is None else _consolidated
+                self._fallback_to_legacy_indexing(doc_name, flat_for_vector_index, consolidated_payload, out_dir)
             result_path = str(consolidated_json_path.resolve())
             if use_sections:
                 message = f"🎉 PROCESSING COMPLETE! Sections: {len(sections)}, obligations: {_count_inner_obligation_rows(all_category_groups)}, consolidated: {consolidated_ob_count}"

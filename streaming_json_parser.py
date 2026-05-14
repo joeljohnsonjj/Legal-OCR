@@ -3,6 +3,7 @@ Incremental JSON parser for streaming LLM responses.
 Yields each complete top-level element of the JSON array at path "results.item"
 (merge response: category groups { "category", "obligations" }) as soon as it is parsed.
 """
+import asyncio
 import json
 import re
 import logging
@@ -74,6 +75,7 @@ async def parse_obligations_stream(token_stream: AsyncIterator[str]) -> AsyncIte
         for item in list(events):
             if isinstance(item, dict):
                 yield item
+                await asyncio.sleep(0)
         events.clear()
 
     if buffer:
@@ -84,6 +86,7 @@ async def parse_obligations_stream(token_stream: AsyncIterator[str]) -> AsyncIte
         for item in list(events):
             if isinstance(item, dict):
                 yield item
+                await asyncio.sleep(0)
 
 
 async def _parse_obligations_buffered(token_stream: AsyncIterator[str]) -> AsyncIterator[Dict[str, Any]]:
@@ -97,6 +100,7 @@ async def _parse_obligations_buffered(token_stream: AsyncIterator[str]) -> Async
         for obligation in data.get("results", []):
             if isinstance(obligation, dict):
                 yield obligation
+                await asyncio.sleep(0)
     except json.JSONDecodeError as e:
         logger.error(f"Failed to parse streaming JSON: %s", e)
         logger.error("Buffer content: %s...", buffer[:500])
@@ -129,6 +133,7 @@ async def parse_obligations_stream_simple(token_stream: AsyncIterator[str]) -> A
                 ob = json.loads(ob_text)
                 if isinstance(ob, dict):
                     yield ob
+                    await asyncio.sleep(0)
                     # Remove the matched obligation from buffer
                     buffer = buffer[match.end():]
             except json.JSONDecodeError:

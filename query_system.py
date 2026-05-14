@@ -28,7 +28,6 @@ from llm_client import (
     generate_content as llm_generate_content,
     generate_content_stream,
     get_default_model,
-    use_bedrock_llm,
 )
 
 # FastAPI
@@ -2224,7 +2223,7 @@ class ObligationQuerySystem:
         local_output_folder: Optional[str] = None,
         model: Optional[str] = None,
     ):
-        """Initialize with local output folder. Requires GEMINI_API_KEY, or Azure vars when USE_AZURE_OPENAI, or AWS creds for Bedrock."""
+        """Initialize with local output folder. Requires GEMINI_API_KEY (or GOOGLE_API_KEY), or Azure vars when USE_AZURE_OPENAI."""
         self.local_output_folder = str(Path(local_output_folder or os.getenv("OUTPUT_FOLDER", "output")).resolve())
         _use_azure = os.getenv("USE_AZURE_OPENAI", "").lower() in ("true", "1", "yes")
         self.model = model or get_default_model()
@@ -2235,8 +2234,6 @@ class ObligationQuerySystem:
                 raise ValueError("USE_AZURE_OPENAI is set; AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_API_KEY (or AZURE_OPENAI_KEY) must be set in .env")
             if not os.getenv("AZURE_OPENAI_DEPLOYMENT") and not os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME") and not os.getenv("OPENAI_DEPLOYMENT_NAME"):
                 raise ValueError("USE_AZURE_OPENAI is set; AZURE_OPENAI_DEPLOYMENT or AZURE_OPENAI_DEPLOYMENT_NAME must be set in .env")
-        elif use_bedrock_llm():
-            pass
         else:
             if not os.getenv("GEMINI_API_KEY") and not os.getenv("GOOGLE_API_KEY"):
                 raise ValueError("GEMINI_API_KEY must be set in .env (https://aistudio.google.com/app/apikey)")
@@ -2275,7 +2272,7 @@ class ObligationQuerySystem:
         response_mime_type: str = "application/json",
         max_output_tokens: Optional[int] = None,
     ):
-        """Async wrapper for LLM API calls (Azure OpenAI, Bedrock, or Gemini)."""
+        """Async wrapper for LLM API calls (Azure OpenAI or Gemini)."""
         from llm_client import generate_content_async
         return await generate_content_async(
             prompt,
@@ -3503,8 +3500,10 @@ Output only the JSON object:"""
     async def merge_and_rank_results_stream(self, user_query: str, filtered_results: List[Dict[str, Any]], 
                               document_name_to_id: Optional[Dict[str, str]] = None) -> AsyncIterator[Dict[str, Any]]:
         """
-        Streams merge JSON: each parsed top-level element of "results" is a category group
-        { "category", "obligations" }, then final metadata with counts.
+        Streams merge JSON as NDJSON events while the LLM response is still arriving.
+
+        Emits ``obligation`` (optional) and ``category_group`` as each ``results[]`` element
+        completes (requires ``ijson`` in ``streaming_json_parser`` for true incremental parse).
         """
         try:
             # Filter out empty results
@@ -3559,13 +3558,41 @@ Output only the JSON object:"""
                 max_output_tokens=_merge_rank_max_output_tokens(),
             )
             streamed: List[Dict[str, Any]] = []
-            async for chunk in parse_obligations_stream(token_stream):
-                if isinstance(chunk, dict):
-                    streamed.append(chunk)
+            yield_obl_lines = os.getenv("STREAM_NDJSON_YIELD_OBLIGATIONS", "true").lower() in (
+                "1",
+                "true",
+                "yes",
+            )
 
-            payload_stream: Dict[str, Any] = {"results": streamed, "query": user_query}
+            async for chunk in parse_obligations_stream(token_stream):
+                if not isinstance(chunk, dict):
+                    continue
+                n_before = len(streamed)
+                streamed.append(chunk)
+                payload_stream: Dict[str, Any] = {"results": streamed, "query": user_query}
+                apply_query_coherence_to_payload(user_query, payload_stream)
+                normalize_query_response_shape(payload_stream, merge_in)
+                streamed = payload_stream["results"]
+                new_groups = streamed[n_before:]
+                for grp in new_groups:
+                    if not isinstance(grp, dict):
+                        continue
+                    if yield_obl_lines:
+                        cat = str(grp.get("category") or "").strip()
+                        for ob in grp.get("obligations") or []:
+                            if isinstance(ob, dict):
+                                yield {
+                                    "type": "obligation",
+                                    "data": {"category": cat, "obligation": ob},
+                                }
+                                await asyncio.sleep(0)
+                    yield {"type": "category_group", "data": grp}
+                    await asyncio.sleep(0)
+
+            payload_stream = {"results": streamed, "query": user_query}
             apply_query_coherence_to_payload(user_query, payload_stream)
             normalize_query_response_shape(payload_stream, merge_in)
+            streamed = payload_stream["results"]
             n_stream = int(payload_stream.get("total_obligations_found") or 0)
             n_in = _count_obligations_in_filtered(merge_in)
             if n_stream == 0 and n_in > 0:
@@ -3583,10 +3610,11 @@ Output only the JSON object:"""
                 payload_stream["merge_note"] = (
                     (note + " ") if note else ""
                 ) + "Stream merge post-process yielded no obligations; returned retrieval-safe payload."
-
-            for grp in payload_stream.get("results") or []:
-                if isinstance(grp, dict):
-                    yield {"type": "category_group", "data": grp}
+                yield {
+                    "type": "replace_results",
+                    "data": {"results": payload_stream.get("results") or []},
+                }
+                await asyncio.sleep(0)
 
             yield {
                 "type": "metadata",
@@ -3598,6 +3626,7 @@ Output only the JSON object:"""
                     "processed_at": datetime.now().isoformat(),
                 },
             }
+            await asyncio.sleep(0)
             
         except Exception as e:
             import traceback
@@ -5048,10 +5077,13 @@ async def query_obligations_stream(request: Optional[QueryRequest] = Body(defaul
             async for event in qs.merge_and_rank_results_stream(user_query, filtered_results, document_name_to_id):
                 if event.get("type") == "category_group":
                     obligation_stream_count += len((event.get("data") or {}).get("obligations") or [])
+                elif event.get("type") == "obligation":
+                    obligation_stream_count += 1
                 line = json.dumps(event) + "\n"
                 _write_stream_line(line)
                 force_logger.info(f"[STREAM EVENT] {line.strip()}")
                 yield line
+                await asyncio.sleep(0)
             
             logging.info(f"[STREAM] Merge and rank LLM call - complete (streamed {obligation_stream_count} obligations)")
             force_logger.info(f"[STREAM] Merge and rank LLM call - complete (streamed {obligation_stream_count} obligations)")
@@ -5065,7 +5097,15 @@ async def query_obligations_stream(request: Optional[QueryRequest] = Body(defaul
                 pass
             yield line
     
-    return StreamingResponse(event_generator(), media_type="application/x-ndjson")
+    return StreamingResponse(
+        event_generator(),
+        media_type="application/x-ndjson",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.post("/process", response_model=ProcessResponse, tags=["Processing"])
