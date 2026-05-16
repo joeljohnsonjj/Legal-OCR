@@ -14,9 +14,9 @@ These are legal land documents, so treat them with appropriate legal rigor, prec
 
 **Categorization & Grouping Rules:**
 1. **Meaningful Categorization:** Use the **Allowed Categories** list at the bottom of this prompt as your primary taxonomy. When a duty clearly fits, set `"category"` to the **exact left-hand key string** from that list. If no single key is a perfect fit but the obligation still clearly belongs to the same theme, you may use a **short category name you derive from those provided names** (reuse their wording and style—e.g. combine or narrow concepts so the label obviously echoes the allowed list). Only when the document describes a **genuinely distinct** duty that cannot be honestly placed under any provided key or such a derived name, you may use a **new concise, professional** high-level category name; for miscellaneous items or administrative legal duties that resist finer sorting, prefer **`Other`** or **`Legal & Indemnification`**. The bracketed items beside each key are **semantic guides only**—do not treat them as separate official names unless you are deliberately building a key-style label from that vocabulary. Every responsibility you assign MUST still fit the semantic scope of the category you choose.
-2. **No Category Forcing or Fabrication:** ONLY extract explicit responsibilities genuinely found in the document text. DO NOT invent, assume, force, or fabricate an `Owner Responsibility` just for the sake of utilizing a category. If the document does not contain responsibilities for a specific category, simply omit that category from your JSON entirely.
+2. **No Category Forcing or Fabrication:** ONLY extract explicit responsibilities genuinely found in the document text. DO NOT invent, assume, force, or fabricate a responsibility just for the sake of utilizing a category. If the document does not contain responsibilities for a specific category, simply omit that category from your JSON entirely.
 3. Inside each category, create an `obligations` array. Group the responsibilities by the `Responsible Party`.
-4. Combine items belonging to the same party into the `Owner Responsibility` array. 
+4. Combine items belonging to the same party into the `responsibilities` array. 
 5. **Mutually Exclusive Assignment:** An obligation must belong to ONE AND ONLY ONE category. Do not duplicate the exact same responsibilities across multiple categories.
 
 **Extraction Quality & Data Integrity Rules:**
@@ -26,23 +26,23 @@ These are legal land documents, so treat them with appropriate legal rigor, prec
    - Ensure all amounts and timeframes are complete with proper formatting.
 2. **Actionable Content Only:** Do not extract meaningless fragments or incomplete thoughts. FORBIDDEN EXAMPLES: "Responsible 8", "Hold expenses", "Pay Expiration Date", "Provide within". Every string MUST contain a clear, complete, actionable duty.
 3. **Complete Information:** Include full amounts, timeframes, and scope. Do not truncate values or leave incomplete parameters.
-3A. **ATOMIC RESPONSIBILITIES (CRITICAL — One action per array item):**
-    Each string in `Owner Responsibility` must express ONE single legal duty — one action, one obligation, one condition. Never join multiple distinct obligations into one string using semicolons (;), "and", or "including".
+3A. **ATOMIC RESPONSIBILITIES (CRITICAL — One action per object):**
+    Each object in the `responsibilities` array must express ONE single legal duty in its `text` field — one action, one obligation, one condition. Never join multiple distinct obligations into one string using semicolons (;), "and", or "including".
     WRONG (multiple duties joined with semicolons):
     ❌ "Pay Base Rent monthly; pay 125% holdover rent; send payments by wire transfer"
     ❌ "Obtain property insurance; maintain GL insurance of $1M per occurrence"
-    CORRECT (each obligation as its own array item):
-    ✅ ["Pay Base Rent of $_____ per month in advance in equal monthly installments",
-        "Pay 125% of Base Rent for each month of holdover after lease term expiration",
-        "Send all Rent payments to Landlord's Address or via electronic fund transfer"]
-    TEST: If a string contains a semicolon (;) and both sides of the semicolon describe a separate action, SPLIT them into two separate array items. EXCEPTION: A semicolon used within ONE obligation to clarify a single action is acceptable.
-4. **Reasoning Should Be Concise:** The `Reasoning` array should include explanations **substantive enough to be clear**—how cost, risk, or operational roles are allocated and why the duty exists per the text—not bare labels or useless fragments. **Clarity matters more than an artificially short length.** You do NOT need a strict 1:1 mapping between each responsibility and each reasoning line, but ensure no responsibility is left unsupported.
+    CORRECT (each obligation as its own object):
+    ✅ {"text": "Pay Base Rent of $_____ per month in advance in equal monthly installments", "reasoning": "..."}
+    ✅ {"text": "Pay 125% of Base Rent for each month of holdover after lease term expiration", "reasoning": "..."}
+    TEST: If a string contains a semicolon (;) and both sides of the semicolon describe a separate action, SPLIT them into two separate objects. EXCEPTION: A semicolon used within ONE obligation to clarify a single action is acceptable.
+4. **Reasoning Should Be Concise and 1:1:** The `reasoning` field inside each responsibility object must include an explanation substantive enough to be clear—how cost, risk, or operational roles are allocated and why the duty exists per the text—not bare labels or useless fragments. 
+   - CRITICAL: You MUST maintain a strict 1:1 mapping—every `text` obligation must have its own specific `reasoning` string inside the same object. 
    - CRITICAL: Reasoning must be about the responsibility itself, NOT about your consolidation choices or prompt rules.
-   - CRITICAL: Never paste the same generic `Reasoning` sentence onto many different obligations or parties. Each obligation object must use reasoning that is **distinct** and tied to that row's text.
+   - CRITICAL: Never paste the same generic `reasoning` string onto many different obligations. Each object must use reasoning that is **distinct** and tied to that specific text.
    - Summarize why the responsibility exists, based on language in the document.
    - If the document does not provide explicit reasoning, leave the field empty or state "Not specified". No hypothetical reasoning.
-5. **No Copy-Pasting Arrays:** Do NOT duplicate the same `Reasoning` or `citations` arrays across different category objects unless the obligations are truly identical and share the same source clause.
-6. **Citation Format (Important Change):** For multiple responsibilities under the same party, do NOT map citations 1:1 per responsibility. Instead, provide a combined citation per document with comma-separated strings for page numbers and sections. 
+5. **No Copy-Pasting:** Do NOT duplicate the same `reasoning` across different category objects unless the obligations are truly identical and share the same source clause.
+6. **Exact Citation Mapping (CRITICAL):** You must maintain a strict 1:1 mapping between each responsibility and its exact source citation. Do not combine citations at the category or document level. Place the specific `citation` object directly inside the corresponding responsibility object.
 
 **Inner Obligation Object — Field Rules:**
 
@@ -51,14 +51,14 @@ These are legal land documents, so treat them with appropriate legal rigor, prec
     - If **party metadata** is provided in the prompt, map reference labels (e.g. Tenant, Landlord) to **actual names** using that metadata.
     - If the actual party name is **not** available in the metadata or document text, you may use the contract reference label (e.g., `"Tenant"`, `"Landlord"`).
     - If the responsible party **cannot be identified** from the document text and metadata does not resolve it, use **`"Unspecified Party"`** — **only when unavoidable**.
-* **`Owner Responsibility` (Array of Strings):** Summarize all actions incurring a cost, financial burden, payment, reimbursement, administrative task, or legal obligation. Use concise bullet points. Do not omit any crucial element (like notice periods). Each responsibility must be a separate, complete string.
-* **`Reasoning` (Array of Strings):** Provide SPECIFIC reasoning that collectively explains WHY the listed responsibilities exist. Use concise bullet points. If the document does not provide explicit reasoning, leave the field empty or state "Not specified". No hypothetical reasoning.
-* **`docId` (String):** The document file name for all responsibilities in this obligation.
-* **`related_keywords` (Array of Strings, optional):** Short search phrases for semantic retrieval (synonyms, category hints, key terms). 
-* **`Citation` (Array of Objects):** Provide combined citations (not 1:1). Format:
-    `{ "docId": "<document file name>", "pageNumbers": "4,5,6", "section": "6,5.rent,6.kjsnak" }`
-    - `pageNumbers` is a comma-separated string of page numbers.
-    - `section` is a comma-separated string of section/heading identifiers. If no heading exists, provide a short meaningful locator such as "Paragraph discussing maintenance costs".
+* **`responsibilities` (Array of Objects):** An array where each object represents a single, atomic duty. Each object MUST contain:
+    - **`text` (String):** Summarize the action incurring a cost, financial burden, payment, reimbursement, administrative task, or legal obligation. Do not omit any crucial element (like notice periods).
+    - **`reasoning` (String):** Provide SPECIFIC reasoning that explains WHY this specific responsibility exists. If the document does not provide explicit reasoning, leave the field empty or state "Not specified". No hypothetical reasoning.
+    - **`citation` (Object):** The exact source of this specific text.
+        - **`docId` (String):** The document file name.
+        - **`pageNumbers` (String):** The exact page number(s) where this specific obligation is found (e.g., "8" or "8,9").
+        - **`section` (String):** The specific section/heading identifier (e.g., "12(a) Tenant Maintenance"). If no heading exists, provide a short meaningful locator.
+* **`related_keywords` (Array of Strings, optional):** Short search phrases for semantic retrieval (synonyms, category hints, key terms). Place this at the `Responsible Party` level.
 
 **Strict JSON Output Format:**
 Your response must be ONLY a valid JSON object matching this exact structure (no commentary, explanations, or markdown outside the JSON):
@@ -70,31 +70,29 @@ Your response must be ONLY a valid JSON object matching this exact structure (no
       "obligations": [
         {
           "Responsible Party": "ABC Retailers, Inc.",
-          "Owner Responsibility": [
-            "Maintain, repair, and replace all internal plumbing fixtures and restroom facilities",
-            "Pay all costs associated with clearing blocked internal drainage pipes"
-          ],
-          "Reasoning": [
-            "Tenant is responsible for the day-to-day maintenance of all interior premises fixtures",
-            "Standard cost allocation for usage-based plumbing blockages within the leased space"
-          ],
-          "docId": "Commercial_Lease_Agreement.pdf",
           "related_keywords": ["plumbing", "tenant maintenance", "drainage", "restroom"],
-          "citations": [
+          "responsibilities": [
             {
-              "pageNumbers": "8,9",
-              "section": "12(a) Tenant Maintenance,13. Utilities"
+              "text": "Maintain, repair, and replace all internal plumbing fixtures and restroom facilities",
+              "reasoning": "Tenant is responsible for the day-to-day maintenance of all interior premises fixtures",
+              "citation": {
+                "docId": "Commercial_Lease_Agreement.pdf",
+                "pageNumbers": "8",
+                "section": "12(a) Tenant Maintenance"
+              }
+            },
+            {
+              "text": "Pay all costs associated with clearing blocked internal drainage pipes",
+              "reasoning": "Standard cost allocation for usage-based plumbing blockages within the leased space",
+              "citation": {
+                "docId": "Commercial_Lease_Agreement.pdf",
+                "pageNumbers": "9",
+                "section": "13. Utilities"
+              }
             }
           ]
         }
       ]
-    }
-  ],
-  "docId": "Commercial_Lease_Agreement.pdf",
-  "citations": [
-    {
-      "pageNumbers": "8,9,10",
-      "section": "12(a) Tenant Maintenance,13. Utilities,14. Landlord Duties"
     }
   ]
 }

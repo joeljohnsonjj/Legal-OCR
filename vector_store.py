@@ -32,6 +32,7 @@ sys.setrecursionlimit(10000)
 
 logger = logging.getLogger(__name__)
 
+
 # Default collection and persistence path
 DEFAULT_COLLECTION_NAME = "obligations"
 DEFAULT_CHROMA_PATH = "chroma_db"
@@ -311,6 +312,22 @@ def obligation_to_keyword_chunk_text(obligation: Dict[str, Any]) -> str:
 
     Fallback when keywords are missing or empty: party + DutyType + start of Owner Responsibility.
     """
+    # If this is an atomic responsibility row, ensure embedding uses its specific keywords
+    resp_id = obligation.get("responsibility_id")
+    if resp_id:
+        # Atomic row: keywords are per-responsibility, not aggregate
+        kw_blob = _join_related_keywords_for_embedding(obligation)
+        if kw_blob and _keywords_only_embedding_enabled():
+            party = _flatten_field(obligation.get("Responsible Party")).strip()
+            role_prefix = _party_embedding_prefix(party)
+            if (os.getenv("LEGAL_OCR_EMBED_KEYWORDS_PARTY_PREFIX") or "").strip().lower() in (
+                "1",
+                "true",
+                "yes",
+            ):
+                return f"{role_prefix} {kw_blob}".strip() if role_prefix else kw_blob
+            return kw_blob
+
     party = _flatten_field(obligation.get("Responsible Party")).strip()
     role_prefix = _party_embedding_prefix(party)
     duty_cat = _flatten_field(obligation.get("DutyType")).strip()
@@ -362,6 +379,7 @@ def _obligation_metadata(obligation: Dict[str, Any], document_name: str, index: 
     """Build ChromaDB-safe metadata (str values only) for one obligation."""
     duty = _flatten_field(obligation.get("DutyType")) or ""
     party = _flatten_field(obligation.get("Responsible Party")) or ""
+    responsibility_id = str(obligation.get("responsibility_id") or "")
     citation = obligation.get("citations")
     if citation is None:
         citation = obligation.get("Citation")
@@ -374,8 +392,12 @@ def _obligation_metadata(obligation: Dict[str, Any], document_name: str, index: 
             citation_str = str(citation or "")[:2000]
     
     # Add source category metadata for individual obligations
-    source_category = obligation.get("source_category", "")
+    source_category = obligation.get("source_category", "") or obligation.get("_category", "")
     obligation_index_in_category = obligation.get("obligation_index_in_category", "")
+
+    # Serialize responsibility_type list
+    resp_type = obligation.get("responsibility_type") or []
+    resp_type_str = json.dumps(resp_type) if isinstance(resp_type, list) else str(resp_type or "")
     
     metadata = {
         "document_name": document_name,
@@ -383,6 +405,8 @@ def _obligation_metadata(obligation: Dict[str, Any], document_name: str, index: 
         "Responsible_Party": party[:500],
         "Citation": citation_str,
         "chunk_index": str(index),
+        "responsibility_id": responsibility_id[:200],
+        "responsibility_type": resp_type_str[:500],
     }
     
     if source_category:
@@ -716,20 +740,18 @@ def query_categories(
     n_results: int = 10,
     document_name: Optional[str] = None,
     chroma_path: Optional[str] = None,
-    collection_name: str = "categories", 
-    max_distance: Optional[float] = None,
+    collection_name: str = "categories",
 ) -> List[Dict[str, Any]]:
     """
     Query categories by semantic similarity to aggregated keywords.
-    
+
     Args:
         query_text: User's search query
-        n_results: Maximum number of categories to return
+        n_results: Maximum number of categories to return (Chroma top-k)
         document_name: Optional filter by document
         chroma_path: Path to ChromaDB storage
         collection_name: ChromaDB collection name for categories
-        max_distance: Maximum distance threshold for results
-        
+
     Returns:
         List of matching categories with metadata and distances
     """
@@ -743,27 +765,20 @@ def query_categories(
         
         # Build where filter for document if provided
         where = {"document_name": document_name} if document_name else None
-        
-        # Fetch more candidates if using distance threshold
-        fetch_n = 100 if max_distance is not None else n_results
-        
+
         results = collection.query(
             query_texts=[query_text],
-            n_results=fetch_n,
+            n_results=n_results,
             where=where,
             include=["documents", "metadatas", "distances"],
         )
-        
+
         categories = []
         if results and results["ids"] and results["ids"][0]:
             for i, category_id in enumerate(results["ids"][0]):
                 meta = (results["metadatas"][0][i] or {}) if results["metadatas"] else {}
                 dist = (results["distances"][0][i]) if results.get("distances") and results["distances"][0] else None
-                
-                # Apply distance threshold if specified
-                if max_distance is not None and dist is not None and dist > max_distance:
-                    continue
-                
+
                 doc = (results["documents"][0][i]) if results.get("documents") and results["documents"][0] else ""
                 
                 categories.append({
@@ -789,22 +804,20 @@ def query_individual_obligations(
     document_name: Optional[str] = None,
     chroma_path: Optional[str] = None,
     collection_name: str = "individual_obligations",
-    max_distance: Optional[float] = None,
     responsible_party: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
     Query individual obligations by semantic similarity to auto-generated keywords.
     This provides fine-grained retrieval at the obligation level rather than category level.
-    
+
     Args:
         query_text: User's search query
-        n_results: Maximum number of individual obligations to return
+        n_results: Chroma top-k / max obligations returned
         document_name: Optional filter by document
         chroma_path: Path to ChromaDB storage
         collection_name: ChromaDB collection name for individual obligations
-        max_distance: Maximum distance threshold for results
         responsible_party: Optional filter by responsible party
-        
+
     Returns:
         List of matching individual obligations with metadata and distances
     """
@@ -825,27 +838,20 @@ def query_individual_obligations(
             where = {"document_name": document_name}
         elif party_where:
             where = party_where
-        
-        # When using distance threshold, fetch more candidates then filter
-        fetch_n = 500 if max_distance is not None else n_results
-        
+
         results = collection.query(
             query_texts=[query_text],
-            n_results=fetch_n,
+            n_results=n_results,
             where=where,
             include=["documents", "metadatas", "distances"],
         )
-        
+
         obligations = []
         if results and results["ids"] and results["ids"][0]:
             for i, obligation_id in enumerate(results["ids"][0]):
                 meta = (results["metadatas"][0][i] or {}) if results["metadatas"] else {}
                 dist = (results["distances"][0][i]) if results.get("distances") and results["distances"][0] else None
-                
-                # Apply distance threshold if specified
-                if max_distance is not None and dist is not None and dist > max_distance:
-                    continue
-                
+
                 doc = (results["documents"][0][i]) if results.get("documents") and results["documents"][0] else ""
                 _cit_meta = meta.get("Citation", "") or ""
                 # #region agent log
@@ -890,12 +896,13 @@ def query_individual_obligations(
                     "source_category": meta.get("source_category", ""),
                     "obligation_index_in_category": meta.get("obligation_index_in_category", ""),
                     "chunk_index": meta.get("chunk_index", ""),
+                    "responsibility_id": meta.get("responsibility_id", ""),
                     "distance": dist,
                     "document": doc,  # The auto-generated keywords that were embedded
                 })
-        
-        return obligations[:n_results]  # Apply final limit
-        
+
+        return obligations[:n_results]
+
     except Exception as e:
         logger.error(f"Individual obligation vector query error: {e}", exc_info=True)
         return []
@@ -907,7 +914,6 @@ def query_obligations(
     document_name: Optional[str] = None,
     chroma_path: Optional[str] = None,
     collection_name: str = DEFAULT_COLLECTION_NAME,
-    max_distance: Optional[float] = None,
     responsible_party: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
@@ -915,7 +921,7 @@ def query_obligations(
     Returns list of dicts with keys: id, document_name, DutyType, Responsible_Party, Citation, distance, document (chunk text).
     If document_name is provided, results are filtered to that document only.
     If responsible_party is provided, results are filtered to that party only (e.g. "Tenant", "Landlord").
-    If max_distance is set, only results with distance <= max_distance are returned (query uses large n_results then filters).
+    ``n_results`` is the Chroma top-k (no distance cutoff).
     """
     try:
         client = get_chroma_client(chroma_path)
@@ -929,11 +935,9 @@ def query_obligations(
             where = {"document_name": document_name}
         elif party_where:
             where = party_where
-        # When using distance threshold, fetch more candidates then filter
-        fetch_n = 500 if max_distance is not None else n_results
         results = collection.query(
             query_texts=[query_text],
-            n_results=fetch_n,
+            n_results=n_results,
             where=where,
             include=["documents", "metadatas", "distances"],
         )
@@ -942,8 +946,6 @@ def query_obligations(
             for i, id_ in enumerate(results["ids"][0]):
                 meta = (results["metadatas"][0][i] or {}) if results["metadatas"] else {}
                 dist = (results["distances"][0][i]) if results.get("distances") and results["distances"][0] else None
-                if max_distance is not None and dist is not None and dist > max_distance:
-                    continue
                 doc = (results["documents"][0][i]) if results.get("documents") and results["documents"][0] else ""
                 out.append({
                     "id": id_,
@@ -955,7 +957,7 @@ def query_obligations(
                     "distance": dist,
                     "document": doc,
                 })
-        return out
+        return out[:n_results]
     except KeyError as e:
         if e.args and e.args[0] == "_type":
             logger.error(

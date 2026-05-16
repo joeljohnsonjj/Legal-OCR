@@ -227,6 +227,75 @@ def _auto_reasoning_from_responsibility(resp: Any, *, party: str = "", category:
     return f"Allocates the financial responsibility described to {p} under the lease."
 
 
+def _infer_responsibility_type(text: str, category: str) -> List[str]:
+    """
+    Infer responsibility_type tags from text and category.
+    Returns a list of applicable type tags.
+    """
+    types: List[str] = []
+    text_l = (text or "").lower()
+    cat_l = (category or "").lower()
+
+    # Financial types
+    if any(
+        x in text_l for x in ("pay", "payment", "rent", "fee", "cost", "expense", "tax", "insurance premium")
+    ):
+        types.append("financial")
+    if any(x in text_l for x in ("monthly", "annual", "quarterly", "in advance", "when due")):
+        types.append("recurring")
+    if any(x in text_l for x in ("reimburse", "refund", "credit", "offset")):
+        types.append("reimbursement")
+
+    # Operational types
+    if any(x in text_l for x in ("maintain", "repair", "keep", "replace", "upkeep")):
+        types.append("maintenance")
+    if any(x in text_l for x in ("utility", "electric", "water", "gas", "sewer", "hvac")):
+        types.append("utilities")
+
+    # Legal types
+    if any(x in text_l for x in ("indemnif", "hold harmless", "defend")):
+        types.append("indemnification")
+    if any(x in text_l for x in ("comply", "compliance", "ordinance", "law", "regulation")):
+        types.append("compliance")
+    if any(x in text_l for x in ("insur", "coverage", "policy", "liability")):
+        types.append("insurance")
+    if any(x in text_l for x in ("notify", "notice", "written notice")):
+        types.append("notification")
+
+    # Category fallback
+    if not types:
+        if "financial" in cat_l:
+            types.append("financial")
+        elif "maintenance" in cat_l or "repair" in cat_l:
+            types.append("maintenance")
+        elif "legal" in cat_l or "indemnif" in cat_l:
+            types.append("legal")
+        elif "utilit" in cat_l:
+            types.append("utilities")
+        else:
+            types.append("operational")
+
+    return sorted(set(types))
+
+
+def _make_responsibility_id(party: str, category: str, index: int) -> str:
+    """
+    Generate a stable, human-readable responsibility_id.
+    Format: {party_slug}-{category_slug}-{index:03d}
+    """
+    import re
+
+    def slugify(s: str) -> str:
+        s = (s or "").lower().strip()
+        s = re.sub(r"[^a-z0-9]+", "-", s)
+        s = s.strip("-")
+        return s[:20]
+
+    party_slug = slugify(party)
+    cat_slug = slugify(category)
+    return f"{party_slug}-{cat_slug}-{index:03d}"
+
+
 def _sanitize_reasonings_in_obligation(ob: Dict[str, Any], *, category: str = "") -> None:
     """Make Reasoning responsibility-specific; remove filler/meta entries."""
     if not isinstance(ob, dict):
@@ -1532,6 +1601,9 @@ HARD CONSTRAINTS:
 - ATOMICITY: "merged_responsibility" must describe ONE single legal duty. Never join two
   obligations using semicolons (;) even if merging multiple source_ids. If you must merge,
   choose the more complete phrasing — do NOT concatenate with semicolons or "and".
+- CANONICALIZATION: When you merge, produce the MOST COMPLETE and PRECISE phrasing of the single legal duty.
+- NEVER pad merged_responsibility with references to other unrelated duties.
+- The resulting merged_responsibility is a CANONICAL LEGAL DUTY STATEMENT, not a summary.
 - Single-item groups (no merge) are the correct default for most obligations.
 
 Context:
@@ -1757,6 +1829,7 @@ Input obligations (id + responsibility text):
                     "reasoning": merged_reason,
                     "citation_sources": sources,
                     "related_keywords": merged_kw,
+                    "source_ids": [str(x.get("id") or "") for x in g],
                 }
             )
 
@@ -1800,6 +1873,7 @@ Input obligations (id + responsibility text):
                     "reasoning": merged_reason,
                     "citation_sources": merged_sources,
                     "related_keywords": merged_kw,
+                    "source_ids": [str(sid) for sid in src_ids],
                 }
             )
         return merged_items
@@ -1957,43 +2031,82 @@ Input obligations (id + responsibility text):
             if next_items:
                 current = self._renumber_consolidation_items(next_items)
 
-        owner_resps = [str(x.get("text") or "").strip() for x in current if str(x.get("text") or "").strip()]
-        reasons: List[str] = []
-        for x in current:
-            if not str(x.get("text") or "").strip():
+        # --- ATOMIC RESPONSIBILITY BUILDER ---
+        atomic_responsibilities = []
+        legacy_citations: List[Dict[str, Any]] = []
+        for idx, x in enumerate(current, 1):
+            txt = str(x.get("text") or "").strip()
+            if not txt:
                 continue
+
+            # Reasoning: take first phrase from semicolon-joined reasoning
             raw_r = str(x.get("reasoning") or "").strip()
             phrase_list = [p.strip() for p in raw_r.split(";") if p.strip()]
-            reasons.append(phrase_list[0] if phrase_list else "")
-        cites = [self._collapse_sources_to_citation(list(x.get("citation_sources") or [])) for x in current if str(x.get("text") or "").strip()]
+            reasoning_text = phrase_list[0] if phrase_list else ""
 
-        # Citations stay aligned 1:1 with consolidated responsibility lines (same count).
-        while len(cites) < len(owner_resps):
-            cites.append({"pageNumbers": [1], "section": ["Document"]})
-        cites = cites[: len(owner_resps)]
+            # Citation: collapse page/section sources into the Citation API shape
+            cite_obj = self._collapse_sources_to_citation(list(x.get("citation_sources") or []))
+            citation_out = {
+                "docId": document_name,
+                "pageNumbers": ",".join(str(p) for p in (cite_obj.get("pageNumbers") or [])),
+                "section": "; ".join(str(s) for s in (cite_obj.get("section") or [])),
+            }
+            legacy_citations.append(
+                {
+                    "pageNumbers": list(cite_obj.get("pageNumbers") or []),
+                    "section": list(cite_obj.get("section") or []),
+                }
+            )
 
-        # Reasoning length may differ from Owner Responsibility (extras appended separately; no padding).
-        orphan_extra = [str(x or "").strip() for x in (orphan_reasonings or [])]
-        orphan_extra = [x for x in orphan_extra if x]
-        full_reasoning = reasons + orphan_extra
+            # Keywords: per-item keywords already computed on x
+            item_kw = self._coerce_related_keywords_list(
+                x.get("related_keywords"),
+                category=category_name,
+                owner_responsibility=txt,
+            )
 
+            # Source IDs: which pagewise items were merged into this one
+            source_ids = x.get("source_ids") or [str(x.get("id") or f"r{idx}")]
+
+            # Responsibility type: infer from text/category (financial, operational, compliance, etc.)
+            resp_type = _infer_responsibility_type(txt, category_name)
+
+            # Generate a stable ID: party + category slug + index
+            rid = _make_responsibility_id(party, category_name, idx)
+
+            atomic_responsibilities.append(
+                {
+                    "responsibility_id": rid,
+                    "text": txt,
+                    "reasoning": reasoning_text,
+                    "citation": citation_out,
+                    "related_keywords": item_kw,
+                    "responsibility_type": resp_type,
+                    "source_ids": source_ids,
+                }
+            )
+
+        # Merged keywords for the entire obligation container (used for legacy compatibility)
         merged_keywords = self._merge_related_keywords_from_item_dicts(
             [x for x in current if isinstance(x, dict)], cap=64, category_name=category_name
         )
         if not merged_keywords:
             merged_keywords = broaden_related_keywords(
                 category=category_name,
-                owner_responsibility=owner_resps,
+                owner_responsibility=[r["text"] for r in atomic_responsibilities],
                 base_keywords=[],
                 max_items=64,
             )
 
         return {
             "Responsible Party": party,
-            "Owner Responsibility": owner_resps,
-            "Reasoning": full_reasoning,
+            "responsibilities": atomic_responsibilities,
             "related_keywords": merged_keywords,
-            "citations": cites,
+            # Keep these legacy fields for backward compatibility with any existing callers
+            # They will be populated from the atomic objects so nothing breaks
+            "Owner Responsibility": [r["text"] for r in atomic_responsibilities],
+            "Reasoning": [r["reasoning"] for r in atomic_responsibilities],
+            "citations": legacy_citations,
             "docId": document_name,
         }
 
@@ -2293,6 +2406,31 @@ IMPORTANT - CITATION HANDLING:
         
         return {
             "Responsible Party": party,
+            "responsibilities": [
+                {
+                    "text": str(resp or "").strip(),
+                    "reasoning": str(reason or "").strip(),
+                    "citation": {
+                        "docId": document_name,
+                        "pageNumbers": (
+                            ",".join(str(p) for p in (cite.get("pageNumbers") or []))
+                            if isinstance(cite, dict) and cite.get("pageNumbers") is not None
+                            else (str(cite.get("page")) if isinstance(cite, dict) and cite.get("page") else "")
+                        ),
+                        "section": (
+                            "; ".join(str(s) for s in (cite.get("section") or []))
+                            if isinstance(cite, dict) and isinstance(cite.get("section"), list)
+                            else (str(cite.get("section")) if isinstance(cite, dict) and cite.get("section") else "")
+                        ),
+                    },
+                }
+                for resp, reason, cite in zip(
+                    final_responsibilities,
+                    final_reasonings,
+                    final_citations,
+                )
+                if str(resp or "").strip()
+            ],
             "Owner Responsibility": final_responsibilities,
             "Reasoning": final_reasonings,
             "citations": final_citations,
@@ -2355,6 +2493,55 @@ IMPORTANT - CITATION HANDLING:
                         page = 1
                     return {"page": page, "section": str(ref0.get("section") or "").strip() or "Document"}
             return {"page": 1, "section": "Document"}
+
+        def _extract_responsibility_rows(ob: Dict[str, Any]) -> List[Dict[str, Any]]:
+            if not isinstance(ob, dict):
+                return []
+            resp_objs = ob.get("responsibilities")
+            if isinstance(resp_objs, list) and resp_objs:
+                out = []
+                for r in resp_objs:
+                    if not isinstance(r, dict):
+                        continue
+                    txt = str(r.get("text") or "").strip()
+                    if not txt:
+                        continue
+                    out.append(
+                        {
+                            "text": txt,
+                            "reasoning": str(r.get("reasoning") or "").strip(),
+                            "citation": r.get("citation") if isinstance(r.get("citation"), dict) else {},
+                            "related_keywords": r.get("related_keywords"),
+                        }
+                    )
+                if out:
+                    return out
+            # Legacy fallback (Owner Responsibility arrays)
+            responsibilities = ob.get("Owner Responsibility", [])
+            reasonings_raw = ob.get("Reasoning", [])
+            reas_list = (
+                reasonings_raw
+                if isinstance(reasonings_raw, list)
+                else ([reasonings_raw] if reasonings_raw else [])
+            )
+            reas_list = [str(x or "").strip() for x in reas_list]
+            citations = ob.get("citations", [])
+            out = []
+            for i, resp in enumerate(responsibilities or []):
+                txt = str(resp or "").strip()
+                if not txt:
+                    continue
+                reason = reas_list[i] if i < len(reas_list) else ""
+                cite = citations[i] if i < len(citations) else (citations[-1] if citations else {})
+                out.append(
+                    {
+                        "text": txt,
+                        "reasoning": str(reason or "").strip(),
+                        "citation": cite if isinstance(cite, dict) else {},
+                        "related_keywords": None,
+                    }
+                )
+            return out
         
         for category_group in results:
             if not isinstance(category_group, dict):
@@ -2373,11 +2560,7 @@ IMPORTANT - CITATION HANDLING:
             party_groups = {}
             for obligation in obligations:
                 party = _normalize_party_for_grouping(obligation.get("Responsible Party", "Unknown"))
-                responsibilities = obligation.get("Owner Responsibility", [])
-                reasonings_raw = obligation.get("Reasoning", [])
-                reas_list = reasonings_raw if isinstance(reasonings_raw, list) else ([reasonings_raw] if reasonings_raw else [])
-                reas_list = [str(x or "").strip() for x in reas_list]
-                citations = obligation.get("citations", [])
+                rows = _extract_responsibility_rows(obligation)
                 
                 if party not in party_groups:
                     party_groups[party] = {
@@ -2387,29 +2570,19 @@ IMPORTANT - CITATION HANDLING:
                         "keyword_rows": [],
                     }
 
-                party_groups[party]["responsibilities"].extend(responsibilities)
-                party_groups[party]["reasonings"].extend(reas_list)
-                for one_duty in responsibilities:
-                    duty_txt = str(one_duty or "").strip()
+                for row in rows:
+                    duty_txt = row.get("text", "")
+                    party_groups[party]["responsibilities"].append(duty_txt)
+                    party_groups[party]["reasonings"].append(row.get("reasoning", ""))
+                    party_groups[party]["citations"].append(
+                        _coerce_citation_to_page_section(row.get("citation"))
+                    )
                     ob_kw = self._coerce_related_keywords_list(
-                        obligation.get("related_keywords"),
+                        row.get("related_keywords") or obligation.get("related_keywords"),
                         category=category_name,
                         owner_responsibility=duty_txt,
                     )
                     party_groups[party]["keyword_rows"].append(list(ob_kw))
-
-                # Citations: one entry per responsibility row (aligned with duties, not with reasoning count).
-                for i in range(len(responsibilities)):
-                    # Better citation handling - try to use available citations or keep original structure
-                    if i < len(citations):
-                        party_groups[party]["citations"].append(_coerce_citation_to_page_section(citations[i]))
-                    elif len(citations) == 1:
-                        party_groups[party]["citations"].append(_coerce_citation_to_page_section(citations[0]))
-                    elif len(citations) > 0:
-                        party_groups[party]["citations"].append(_coerce_citation_to_page_section(citations[-1]))
-                    else:
-                        # Only use fallback if no citations exist at all
-                        party_groups[party]["citations"].append({"page": 1, "section": "Document"})
             
             # Use LLM to consolidate each party group (limit size to avoid citation loss)
             consolidated_obligations = []
@@ -2778,6 +2951,31 @@ IMPORTANT - CITATION HANDLING:
             
             fallback_result = {
                 "Responsible Party": party,
+            "responsibilities": [
+                {
+                    "text": str(resp or "").strip(),
+                    "reasoning": str(reason or "").strip(),
+                    "citation": {
+                        "docId": document_name,
+                        "pageNumbers": (
+                            ",".join(str(p) for p in (cite.get("pageNumbers") or []))
+                            if isinstance(cite, dict) and cite.get("pageNumbers") is not None
+                            else (str(cite.get("page")) if isinstance(cite, dict) and cite.get("page") else "")
+                        ),
+                        "section": (
+                            "; ".join(str(s) for s in (cite.get("section") or []))
+                            if isinstance(cite, dict) and isinstance(cite.get("section"), list)
+                            else (str(cite.get("section")) if isinstance(cite, dict) and cite.get("section") else "")
+                        ),
+                    },
+                }
+                for resp, reason, cite in zip(
+                    responsibilities,
+                    reasonings,
+                    grouped_citations,
+                )
+                if str(resp or "").strip()
+            ],
                 "Owner Responsibility": responsibilities,
                 "Reasoning": reasonings,
                 "citations": grouped_citations,

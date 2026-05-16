@@ -278,39 +278,73 @@ def process_consolidated_results_with_auto_keywords(consolidated_results: List[D
 
 def flatten_obligations_for_individual_indexing(consolidated_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
-    Flatten consolidated results into individual obligations for obligation-level indexing.
-    Each obligation becomes a separate indexable unit with its own auto-generated keywords.
-    
-    Args:
-        consolidated_results: List of category dictionaries from consolidated JSON
-        
-    Returns:
-        List of individual obligations with metadata about their source category
+    Flatten consolidated results for individual-obligation Chroma indexing.
+
+    When an obligation has ``responsibilities[]`` (atomic schema), emit **one index row per
+    responsibility** so vector hits map to a single duty line. Legacy obligations (no atomic list)
+    stay one row per obligation object.
     """
     if not consolidated_results or not isinstance(consolidated_results, list):
         return []
-    
-    individual_obligations = []
-    
+
+    individual_obligations: List[Dict[str, Any]] = []
+
     for category_data in consolidated_results:
         if not isinstance(category_data, dict):
             continue
-            
+
         category_name = category_data.get("category", "Unknown Category")
         obligations = category_data.get("obligations", [])
-        
+
         for i, obligation in enumerate(obligations):
             if not isinstance(obligation, dict):
                 continue
-            
-            # Create enhanced individual obligation
+
+            atomic = obligation.get("responsibilities")
+            if isinstance(atomic, list) and atomic:
+                has_text = any(
+                    isinstance(x, dict) and str(x.get("text") or "").strip() for x in atomic
+                )
+                if has_text:
+                    for r in atomic:
+                        if not isinstance(r, dict):
+                            continue
+                        txt = str(r.get("text") or "").strip()
+                        if not txt:
+                            continue
+                        reason = str(r.get("reasoning") or "").strip()
+                        row: Dict[str, Any] = {
+                            "Responsible Party": obligation.get("Responsible Party"),
+                            "Owner Responsibility": [txt],
+                            "Reasoning": [reason] if reason else [],
+                            "DutyType": obligation.get("DutyType") or category_name,
+                            "responsibility_id": r.get("responsibility_id", ""),
+                            "responsibility_type": r.get("responsibility_type", []),
+                            "source_category": category_name,
+                            "obligation_index_in_category": i,
+                        }
+                        rk = r.get("related_keywords")
+                        if isinstance(rk, list) and rk:
+                            row["related_keywords"] = rk
+                        cit = r.get("citation")
+                        if isinstance(cit, dict) and (
+                            cit.get("docId") or cit.get("pageNumbers") or cit.get("section")
+                        ):
+                            row["citations"] = [cit]
+                        enhanced = enhance_obligation_with_auto_keywords(row)
+                        enhanced["source_category"] = category_name
+                        enhanced["obligation_index_in_category"] = i
+                        individual_obligations.append(enhanced)
+                    continue
+
             enhanced_obligation = enhance_obligation_with_auto_keywords(obligation)
-            
-            # Add category metadata
             enhanced_obligation["source_category"] = category_name
             enhanced_obligation["obligation_index_in_category"] = i
-            
             individual_obligations.append(enhanced_obligation)
-    
-    logger.info(f"Flattened {len(individual_obligations)} individual obligations from {len(consolidated_results)} categories")
+
+    logger.info(
+        "Flattened %d individual Chroma rows from %d categories (atomic = one row per responsibility)",
+        len(individual_obligations),
+        len(consolidated_results),
+    )
     return individual_obligations

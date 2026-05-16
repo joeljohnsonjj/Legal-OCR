@@ -169,6 +169,10 @@ def _vector_obligation_dedupe_sig(ob: Dict[str, Any]) -> Tuple[str, str, str, st
     doc = _vector_obligation_doc_key(ob)
     cit = str(ob.get("Citation") or "")[:140]
     party = (ob.get("Responsible Party") or "")[:80].lower().strip()
+    resp_id = (ob.get("responsibility_id") or "").strip()
+    if resp_id:
+        return (doc, party, resp_id, cit)
+
     o0 = ""
     or_list = ob.get("Owner Responsibility")
     if isinstance(or_list, list) and or_list:
@@ -359,10 +363,223 @@ def _line_matches_query_scope(line: str, match_tokens: List[str]) -> bool:
     return False
 
 
+def _aggregate_citations_from_atomic_dicts(
+    matched: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Dedupe structured citations built from atomic ``citation`` objects."""
+    agg: List[Dict[str, Any]] = []
+    seen: Set[Tuple[str, str, str]] = set()
+    for r in matched:
+        if not isinstance(r, dict):
+            continue
+        c = r.get("citation")
+        if not isinstance(c, dict):
+            continue
+        doc = str(c.get("docId") or "").strip()
+        pn_out = _parse_page_numbers_field(c.get("pageNumbers"))
+        sec_out = _parse_section_field(c.get("section"))
+        key = (doc, str(sorted(pn_out)), str(sorted(sec_out)))
+        if key in seen:
+            continue
+        seen.add(key)
+        agg.append({"docId": doc, "pageNumbers": pn_out, "section": sec_out})
+    return agg
+
+
+def _dedupe_individual_vector_hits(hits: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Drop duplicate Chroma rows (same doc + responsibility_id, or same doc + chunk_index)."""
+    seen: Set[Tuple[str, str]] = set()
+    out: List[Dict[str, Any]] = []
+    for h in hits or []:
+        doc = str(h.get("document_name") or "").strip().lower()
+        rid = str(h.get("responsibility_id") or "").strip()
+        ch = str(h.get("chunk_index") or "").strip()
+        key = (doc, rid) if rid else (doc, f"c:{ch}")
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(h)
+    return out
+
+
+def _resolve_obligation_by_global_flat_index(
+    results: List[Dict[str, Any]], global_index: int
+) -> Tuple[Optional[Dict[str, Any]], str]:
+    """
+    Walk ``results`` in the same order as ``obligation_keywords.flatten_obligations_for_individual_indexing``
+    so ``chunk_index`` from Chroma matches one indexed row (atomic = one row per responsibility).
+    """
+    counter = 0
+    for category_data in results:
+        if not isinstance(category_data, dict):
+            continue
+        category_name = category_data.get("category", "Unknown Category")
+        obligations = category_data.get("obligations", [])
+        for i, obligation in enumerate(obligations):
+            if not isinstance(obligation, dict):
+                continue
+            atomic = obligation.get("responsibilities")
+            if isinstance(atomic, list) and atomic:
+                has_text = any(
+                    isinstance(x, dict) and str(x.get("text") or "").strip() for x in atomic
+                )
+                if has_text:
+                    for r in atomic:
+                        if not isinstance(r, dict):
+                            continue
+                        txt = str(r.get("text") or "").strip()
+                        if not txt:
+                            continue
+                        if counter == global_index:
+                            one = copy.deepcopy(obligation)
+                            one["responsibilities"] = [copy.deepcopy(r)]
+                            return one, category_name
+                        counter += 1
+                    continue
+            if counter == global_index:
+                return copy.deepcopy(obligation), category_name
+            counter += 1
+    return None, ""
+
+
+def _match_responsibility_id_in_obligations_list(
+    obligations: List[Any],
+    obligation_index: Optional[int],
+    rid: str,
+) -> Optional[Dict[str, Any]]:
+    """Return a parent obligation clone with a single ``responsibilities`` entry when ``rid`` matches."""
+    if not obligations or not rid:
+        return None
+    indices: List[int]
+    if obligation_index is not None and 0 <= obligation_index < len(obligations):
+        indices = [obligation_index]
+    else:
+        indices = list(range(len(obligations)))
+    for i in indices:
+        ob = obligations[i]
+        if not isinstance(ob, dict):
+            continue
+        for r in ob.get("responsibilities") or []:
+            if not isinstance(r, dict):
+                continue
+            if str(r.get("responsibility_id") or "").strip() == rid:
+                one = copy.deepcopy(ob)
+                one["responsibilities"] = [copy.deepcopy(r)]
+                return one
+    return None
+
+
+def _resolve_obligation_by_global_legacy_parent_index(
+    results: List[Dict[str, Any]], global_index: int
+) -> Tuple[Optional[Dict[str, Any]], str]:
+    """Pre-atomic Chroma: one indexed row per parent obligation (count dict obligations only)."""
+    counter = 0
+    for category_data in results:
+        if not isinstance(category_data, dict):
+            continue
+        category_name = category_data.get("category", "")
+        for ob in category_data.get("obligations", []):
+            if not isinstance(ob, dict):
+                continue
+            if counter == global_index:
+                return copy.deepcopy(ob), category_name
+            counter += 1
+    return None, ""
+
+
+def _slim_obligation_row_for_vector_hit(ob: Dict[str, Any], user_query: str) -> Dict[str, Any]:
+    """
+    After a vector hit resolves to a consolidated obligation, keep only duties relevant to the
+    query (text + per-responsibility keywords). Produces a small merge payload: Responsible Party,
+    Owner Responsibility[], Reasoning[], citations[] — no ``responsibilities`` blob, no
+    ``related_keywords``.
+    """
+    party = str(ob.get("Responsible Party") or ob.get("Responsible party") or "").strip() or "Unknown"
+    src_cat = str(ob.get("source_category") or "").strip()
+    doc_name = str(ob.get("document_name") or "").strip()
+    vmeta = ob.get("_vector_metadata")
+
+    out: Dict[str, Any] = {"Responsible Party": party, "source_category": src_cat}
+    if doc_name:
+        out["document_name"] = doc_name
+    if vmeta is not None:
+        out["_vector_metadata"] = vmeta
+
+    terms = _significant_query_terms_for_scope(user_query)
+    match_tokens = _match_tokens_for_query_scope(terms) if terms else []
+
+    atomic = ob.get("responsibilities")
+    if isinstance(atomic, list) and atomic:
+        matched: List[Dict[str, Any]] = []
+        if not match_tokens:
+            for r in atomic:
+                if isinstance(r, dict) and str(r.get("text") or "").strip():
+                    matched.append(r)
+                    if len(matched) >= 3:
+                        break
+        else:
+            for r in atomic:
+                if not isinstance(r, dict):
+                    continue
+                txt = str(r.get("text") or "").strip()
+                if not txt:
+                    continue
+                if _line_matches_query_scope(txt.lower(), match_tokens):
+                    matched.append(r)
+                    continue
+                rk = r.get("related_keywords")
+                if isinstance(rk, list) and rk:
+                    blob = " ".join(str(x).lower() for x in rk if x)
+                    if _line_matches_query_scope(blob, match_tokens):
+                        matched.append(r)
+        if not matched:
+            for r in atomic:
+                if isinstance(r, dict) and str(r.get("text") or "").strip():
+                    matched = [r]
+                    break
+
+        or_lines = [str(r.get("text") or "").strip() for r in matched if str(r.get("text") or "").strip()]
+        reasons = [str(r.get("reasoning") or "").strip() for r in matched]
+        agg = _aggregate_citations_from_atomic_dicts(matched)
+        out["Owner Responsibility"] = or_lines
+        out["Reasoning"] = reasons
+        if agg:
+            out["citations"] = agg
+        return out
+
+    # Legacy: array-style obligation (no ``responsibilities``)
+    or_raw = ob.get("Owner Responsibility") or []
+    or_list = or_raw if isinstance(or_raw, list) else ([str(or_raw)] if str(or_raw).strip() else [])
+    reason_raw = ob.get("Reasoning") or []
+    reason_list = reason_raw if isinstance(reason_raw, list) else ([str(reason_raw)] if str(reason_raw).strip() else [])
+
+    if not match_tokens:
+        idxs = list(range(min(len(or_list), 3)))
+    else:
+        idxs = [
+            i
+            for i, line in enumerate(or_list)
+            if isinstance(line, str) and line.strip() and _line_matches_query_scope(line.lower(), match_tokens)
+        ]
+    if not idxs and or_list:
+        idxs = [0]
+
+    out["Owner Responsibility"] = [str(or_list[i]).strip() for i in idxs if i < len(or_list) and str(or_list[i]).strip()]
+    out["Reasoning"] = [
+        str(reason_list[i]).strip() for i in idxs if i < len(reason_list) and str(reason_list[i]).strip()
+    ]
+    raw_cit = ob.get("citations") if ob.get("citations") is not None else ob.get("Citation")
+    if isinstance(raw_cit, list) and raw_cit and len(raw_cit) == len(or_list):
+        out["citations"] = [raw_cit[i] for i in idxs if i < len(raw_cit) and isinstance(raw_cit[i], dict)]
+    elif isinstance(raw_cit, list) and raw_cit:
+        out["citations"] = [c for c in raw_cit if isinstance(c, dict)]
+    return out
+
+
 def _obligation_topic_match_blob(ob: Dict[str, Any], category_label: str = "") -> str:
     """Lowercased text blob for matching user queries to an obligation (incl. related_keywords)."""
     parts: List[str] = []
-    for x in (category_label, ob.get("category"), ob.get("_processing_category")):
+    for x in (category_label, ob.get("category"), ob.get("_processing_category"), ob.get("_category")):
         if x is not None and str(x).strip():
             parts.append(str(x).strip())
     for key in ("DutyType", "Owner Responsibility", "Reasoning"):
@@ -374,6 +591,9 @@ def _obligation_topic_match_blob(ob: Dict[str, Any], category_label: str = "") -
     rk = ob.get("related_keywords")
     if isinstance(rk, list):
         parts.extend(str(x).strip() for x in rk if x is not None and str(x).strip())
+    rt = ob.get("responsibility_type")
+    if isinstance(rt, list):
+        parts.extend(str(x).strip() for x in rt if x)
     return " ".join(parts).lower()
 
 
@@ -1011,9 +1231,63 @@ def _structured_citations_substantive(citations: Any) -> bool:
 
 
 def _normalize_inner_api_obligation(ob: Dict[str, Any]) -> Dict[str, Any]:
-    """API shape: Responsible Party, Owner Responsibility[], Reasoning[], citations (preferred) or Citation."""
+    """API shape: supports both atomic (new) and legacy array (old) schema.
+
+    When 'responsibilities' array is present:
+    - Uses atomic objects as the primary data source
+    - Derives Owner Responsibility / Reasoning from atomic objects
+    - Builds aggregate citations from individual atomic citation objects
+
+    When only legacy arrays present:
+    - Uses Owner Responsibility[] and Reasoning[] as-is
+    """
     party = str(ob.get("Responsible Party") or ob.get("Responsible party") or "").strip() or "Unknown"
-    out: Dict[str, Any] = {
+
+    atomic = ob.get("responsibilities")
+    if isinstance(atomic, list) and atomic:
+        or_texts = [
+            str(r.get("text") or "").strip()
+            for r in atomic
+            if isinstance(r, dict) and str(r.get("text") or "").strip()
+        ]
+        reasoning_texts = [
+            str(r.get("reasoning") or "").strip()
+            for r in atomic
+            if isinstance(r, dict) and str(r.get("reasoning") or "").strip()
+        ]
+
+        agg_citations: List[Dict[str, Any]] = []
+        seen_cite_keys: set = set()
+        for r in atomic:
+            if not isinstance(r, dict):
+                continue
+            c = r.get("citation")
+            if not isinstance(c, dict):
+                continue
+            doc = str(c.get("docId") or "").strip()
+            pn_raw = c.get("pageNumbers", "")
+            sec_raw = c.get("section", "")
+            pn_out = _parse_page_numbers_field(pn_raw)
+            sec_out = _parse_section_field(sec_raw)
+            key = (doc, str(sorted(pn_out)), str(sorted(sec_out)))
+            if key in seen_cite_keys:
+                continue
+            seen_cite_keys.add(key)
+            agg_citations.append({"docId": doc, "pageNumbers": pn_out, "section": sec_out})
+
+        out: Dict[str, Any] = {
+            "Responsible Party": party,
+            "Owner Responsibility": or_texts,
+            "Reasoning": reasoning_texts,
+        }
+        if agg_citations:
+            out["citations"] = agg_citations
+        dn = str(ob.get("document_name") or "").strip()
+        if dn:
+            out["document_name"] = dn
+        return out
+
+    out = {
         "Responsible Party": party,
         "Owner Responsibility": _str_list_field(ob.get("Owner Responsibility")),
         "Reasoning": _str_list_field(ob.get("Reasoning")),
@@ -1062,16 +1336,29 @@ def _normalize_inner_api_obligation(ob: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def strip_related_keywords_from_api_payload(payload: Dict[str, Any]) -> None:
-    """related_keywords support indexing/semantic retrieval only — omit from client-facing JSON."""
+    """related_keywords are for indexing/retrieval only — omit from client-facing JSON (all shapes)."""
     results = payload.get("results")
     if not isinstance(results, list):
         return
-    for grp in results:
-        if not isinstance(grp, dict):
-            continue
-        for ob in grp.get("obligations") or []:
-            if isinstance(ob, dict) and "related_keywords" in ob:
-                ob.pop("related_keywords", None)
+    if not results:
+        return
+    first = results[0]
+    if isinstance(first, dict) and "obligations" in first:
+        for grp in results:
+            if not isinstance(grp, dict):
+                continue
+            grp.pop("related_keywords", None)
+            for ob in grp.get("obligations") or []:
+                if isinstance(ob, dict):
+                    ob.pop("related_keywords", None)
+                    for resp in ob.get("responsibilities") or []:
+                        if isinstance(resp, dict):
+                            resp.pop("related_keywords", None)
+                            resp.pop("source_ids", None)
+        return
+    for ob in results:
+        if isinstance(ob, dict):
+            ob.pop("related_keywords", None)
 
 
 _RETRIEVAL_SHORT_QUERY_PAD = (
@@ -1489,6 +1776,8 @@ def enrich_nested_results_citations_from_merge_in(payload: Dict[str, Any], merge
                 pages_total, sections_total = _obligation_citations_richness(existing)
                 if pages_total > 1 or sections_total > 0:
                     continue
+            if isinstance(ob.get("responsibilities"), list) and ob.get("responsibilities"):
+                continue
             blob = " ".join(_str_list_field(ob.get("Owner Responsibility")) + _str_list_field(ob.get("Reasoning")))
             if len(blob.strip()) < 6:
                 continue
@@ -1657,11 +1946,6 @@ def _consolidated_obligation_to_merge_dict(full_ob: Dict[str, Any], doc_name: st
         cit_copy = normalized_cits if normalized_cits else None
     cat_raw = full_ob.get("category") or full_ob.get("_processing_category")
     cat_str = ("" if cat_raw is None else str(cat_raw)).strip() or "Other"
-    rk = full_ob.get("related_keywords")
-    if isinstance(rk, list) and rk:
-        related_kw = [str(x).strip() for x in rk if x is not None and str(x).strip()]
-    else:
-        related_kw = None
     ob_dict: Dict[str, Any] = {
         "document_name": doc_name,
         "DutyType": full_ob.get("DutyType") or "",
@@ -1676,8 +1960,6 @@ def _consolidated_obligation_to_merge_dict(full_ob: Dict[str, Any], doc_name: st
         "citations": cit_copy,
         "category": cat_str,
     }
-    if related_kw:
-        ob_dict["related_keywords"] = related_kw
     return ob_dict
 
 
@@ -1756,6 +2038,7 @@ def expand_grouped_vector_merge_to_full_categories(
     grouped_docs: List[Dict[str, Any]],
     consolidated_file_entries: List[Dict[str, Any]],
     *,
+    user_query: str = "",
     logger: Optional[logging.Logger] = None,
 ) -> List[Dict[str, Any]]:
     """
@@ -1801,6 +2084,35 @@ def expand_grouped_vector_merge_to_full_categories(
             continue
 
         normalize_party_fields_in_groups(res_tree, party_metadata=data.get("party_metadata"))
+
+        # ── Cross-category topic expansion ─────────────────────────────────────────
+        # Vector retrieval only surfaces categories with high cosine similarity.
+        # Obligations that explicitly mention the query topic (e.g. rent offset lines
+        # inside Legal & Indemnification) live in different categories and are missed.
+        # Scan EVERY category in the consolidated JSON: if any obligation in it matches
+        # the query via _query_matches_obligation_topic, add that category to cats_hit
+        # so the full category is included in the merge input.
+        # This mirrors what augment_vector_candidates_with_topic_matches already does at
+        # the individual row level, but promotes it to the category-gating level.
+        cats_before = set(cats_hit)
+        for grp in res_tree:
+            if not isinstance(grp, dict):
+                continue
+            cat = str(grp.get("category") or "").strip()
+            if not cat or cat in cats_hit:
+                continue
+            for ob in grp.get("obligations") or []:
+                if isinstance(ob, dict) and _query_matches_obligation_topic(user_query, ob, cat):
+                    cats_hit.add(cat)
+                    break
+        if cats_hit != cats_before:
+            log = logger or logging.getLogger(__name__)
+            log.info(
+                "Cross-category topic expansion for %r: added categories %s",
+                doc_name,
+                sorted(cats_hit - cats_before),
+            )
+        # ────────────────────────────────────────────────────────────────────────────
 
         new_results: List[Dict[str, Any]] = []
         for grp in res_tree:
@@ -2070,7 +2382,15 @@ def parse_llm_json_object(raw: str) -> Dict[str, Any]:
     raise ValueError(msg)
 
 
-_MERGE_PROMPT_DROP_KEYS = frozenset({"subcategory", "related_keywords"})
+# Drop retrieval-only and large fields from the merge prompt payload.
+# Keep 'responsibilities' (new atomic schema) and legacy 'Owner Responsibility'/'Reasoning'.
+# Drop 'related_keywords' from both obligation-level AND each atomic responsibility object.
+_MERGE_PROMPT_DROP_KEYS = frozenset({
+    "subcategory",
+    "related_keywords",
+    "source_ids",
+    "docId",
+})
 
 
 def merge_prompt_filtered_snapshot(filtered_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -2087,8 +2407,23 @@ def merge_prompt_filtered_snapshot(filtered_results: List[Dict[str, Any]]) -> Li
                     continue
                 slim_obs: List[Dict[str, Any]] = []
                 for ob in grp.get("obligations") or []:
-                    if isinstance(ob, dict):
-                        slim_obs.append({k: v for k, v in ob.items() if k not in _MERGE_PROMPT_DROP_KEYS})
+                    if not isinstance(ob, dict):
+                        continue
+                    slim_ob = {k: v for k, v in ob.items() if k not in _MERGE_PROMPT_DROP_KEYS}
+                    atomic = slim_ob.get("responsibilities")
+                    if isinstance(atomic, list) and atomic:
+                        slim_ob["responsibilities"] = [
+                            {
+                                k2: v2
+                                for k2, v2 in resp.items()
+                                if k2 not in ("related_keywords", "source_ids")
+                            }
+                            for resp in atomic
+                            if isinstance(resp, dict) and resp.get("text", "").strip()
+                        ]
+                        slim_ob.pop("Owner Responsibility", None)
+                        slim_ob.pop("Reasoning", None)
+                    slim_obs.append(slim_ob)
                 slim_groups.append({"category": grp.get("category"), "obligations": slim_obs})
             out.append({**base, "results": slim_groups, "consolidated_results": []})
             continue
@@ -2097,7 +2432,17 @@ def merge_prompt_filtered_snapshot(filtered_results: List[Dict[str, Any]]) -> Li
         slim: List[Dict[str, Any]] = []
         for ob in crs:
             if isinstance(ob, dict):
-                slim.append({k: v for k, v in ob.items() if k not in _MERGE_PROMPT_DROP_KEYS})
+                slim_ob = {k: v for k, v in ob.items() if k not in _MERGE_PROMPT_DROP_KEYS}
+                atomic = slim_ob.get("responsibilities")
+                if isinstance(atomic, list) and atomic:
+                    slim_ob["responsibilities"] = [
+                        {k2: v2 for k2, v2 in resp.items() if k2 not in ("related_keywords", "source_ids")}
+                        for resp in atomic
+                        if isinstance(resp, dict) and resp.get("text", "").strip()
+                    ]
+                    slim_ob.pop("Owner Responsibility", None)
+                    slim_ob.pop("Reasoning", None)
+                slim.append(slim_ob)
         out.append({**base, "consolidated_results": slim})
     return out
 
@@ -2668,14 +3013,23 @@ class ObligationQuerySystem:
         doc_base = doc_norm.rsplit(".", 1)[0] if "." in doc_norm else doc_norm
         return doc_norm in allowed or doc_base in allowed
 
-    def _query_individual_obligations_vector_store(self, user_query: str, n_results: int = 20, document_ids: Optional[List[str]] = None, max_distance: Optional[float] = None) -> List[Dict[str, Any]]:
+    def _query_individual_obligations_vector_store(
+        self, user_query: str, n_results: int = 50, document_ids: Optional[List[str]] = None
+    ) -> List[Dict[str, Any]]:
         """
         Query individual obligations vector store (new enhanced approach).
+
+        Uses Chroma top-k only (``n_results``); no distance threshold filtering.
         """
         try:
             from vector_store import query_individual_obligations
+
             chroma_path = str(Path(self.local_output_folder) / "chroma_db")
-            
+            self.logger.info(
+                "Individual obligation vector search: top_k=%d (no distance filter)",
+                n_results,
+            )
+
             all_results = []
             
             if document_ids:
@@ -2686,7 +3040,6 @@ class ObligationQuerySystem:
                         n_results=n_results,
                         document_name=doc_id,
                         chroma_path=chroma_path,
-                        max_distance=max_distance
                     )
                     all_results.extend(results)
             else:
@@ -2695,17 +3048,20 @@ class ObligationQuerySystem:
                     query_text=user_query,
                     n_results=n_results,
                     chroma_path=chroma_path,
-                    max_distance=max_distance
                 )
                 all_results.extend(results)
-            
-            # Sort by distance (best matches first)
+
+            all_results = _dedupe_individual_vector_hits(all_results)
+            # Sort by distance (best matches first), then cap to top_k across merged doc queries
             all_results.sort(key=lambda x: x.get('distance', 999))
-            
-            self.logger.info(f"Found {len(all_results)} individual obligations matching query")
-            
-            return all_results[:n_results]  # Return top results
-            
+            capped = all_results[:n_results]
+            self.logger.info(
+                "Found %d Chroma hit(s) after dedupe (top_k=%d); each row is one indexed duty when re-indexed with atomic flatten",
+                len(capped),
+                n_results,
+            )
+            return capped
+
         except ImportError:
             self.logger.warning("Individual obligations vector store not available")
             return []
@@ -2713,9 +3069,13 @@ class ObligationQuerySystem:
             self.logger.error(f"Individual obligations vector query failed: {e}")
             return []
 
-    async def _load_full_obligation_details_async(self, individual_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    async def _load_full_obligation_details_async(
+        self, individual_results: List[Dict[str, Any]], user_query: str = ""
+    ) -> List[Dict[str, Any]]:
         """
-        Load full obligation details from consolidated JSON files based on individual obligation results.
+        Resolve each vector hit to consolidated JSON, then **slim** to query-relevant duty lines
+        only (Responsible Party, Owner Responsibility, Reasoning, citations) for merge/rank — not
+        the entire parent obligation.
         """
         full_obligations = []
         
@@ -2758,13 +3118,18 @@ class ObligationQuerySystem:
                     )
                     
                     if full_obligation:
+                        dn = str(consolidated_data.get("document_name") or "").strip()
+                        if dn and not str(full_obligation.get("document_name") or "").strip():
+                            full_obligation["document_name"] = dn
                         # Add vector search metadata
-                        full_obligation['_vector_metadata'] = {
-                            'distance': result.get('distance'),
-                            'auto_keywords': result.get('document', ''),
-                            'chunk_index': chunk_index
+                        full_obligation["_vector_metadata"] = {
+                            "distance": result.get("distance"),
+                            "auto_keywords": result.get("document", ""),
+                            "chunk_index": chunk_index,
                         }
-                        full_obligations.append(full_obligation)
+                        slim = _slim_obligation_row_for_vector_hit(full_obligation, user_query)
+                        if slim.get("Owner Responsibility"):
+                            full_obligations.append(slim)
                         
             except Exception as e:
                 self.logger.warning(f"Failed to load details for document {doc_name}: {e}")
@@ -2781,6 +3146,7 @@ class ObligationQuerySystem:
         """
         def _finalize_row(ob: Dict[str, Any], category_label: str) -> Dict[str, Any]:
             o = copy.deepcopy(ob)
+            o.pop("related_keywords", None)
             label = (category_label or "").strip() or str(o.get("_processing_category") or o.get("category") or "").strip()
             if (source_category or "").strip():
                 o["source_category"] = (source_category or "").strip()
@@ -2865,6 +3231,7 @@ class ObligationQuerySystem:
 
         try:
             results = consolidated_data.get('results', [])
+            consolidated_results = consolidated_data.get("consolidated_results") or []
             source_category_norm = (source_category or "").strip().lower()
             obligation_index = vector_result.get("obligation_index_in_category", "")
             try:
@@ -2876,7 +3243,48 @@ class ObligationQuerySystem:
             except (TypeError, ValueError):
                 global_index = None
 
-            consolidated_results = consolidated_data.get("consolidated_results") or []
+            rid = str(vector_result.get("responsibility_id") or "").strip()
+
+            if rid and isinstance(results, list):
+                ordered = results
+                if source_category_norm:
+                    ordered = sorted(
+                        results,
+                        key=lambda cd: (
+                            0
+                            if (isinstance(cd, dict) and cd.get("category", "").strip().lower() == source_category_norm)
+                            else 1
+                        ),
+                    )
+                for category_data in ordered:
+                    if not isinstance(category_data, dict):
+                        continue
+                    category_name = category_data.get("category", "")
+                    obligations = category_data.get("obligations", [])
+                    matched = _match_responsibility_id_in_obligations_list(
+                        obligations, obligation_index, rid
+                    )
+                    if matched is not None:
+                        return _finalize_row(matched, category_name)
+
+            if rid and not results and consolidated_results:
+                for ob in consolidated_results:
+                    if not isinstance(ob, dict):
+                        continue
+                    resp_list = ob.get("responsibilities")
+                    if not isinstance(resp_list, list):
+                        continue
+                    for r in resp_list:
+                        if not isinstance(r, dict):
+                            continue
+                        if str(r.get("responsibility_id") or "").strip() == rid:
+                            one = copy.deepcopy(ob)
+                            one["responsibilities"] = [copy.deepcopy(r)]
+                            category_label = (
+                                str(ob.get("category") or source_category or "").strip() or "Other"
+                            )
+                            return _finalize_row(one, category_label)
+
             # #region agent log
             if not results and consolidated_results:
                 try:
@@ -2909,26 +3317,26 @@ class ObligationQuerySystem:
                     pass
             # #endregion
 
-            # Try to find by source category and index (prefer per-category index)
+            # Try to find by source category and index (prefer per-category index).
+            # When Chroma carries ``responsibility_id`` (atomic index), do not return the full parent here.
             for category_data in results:
                 category_name = category_data.get('category', '')
                 if category_name.strip().lower() == source_category_norm:
                     obligations = category_data.get('obligations', [])
                     if obligation_index is not None and 0 <= obligation_index < len(obligations):
-                        return _finalize_row(obligations[obligation_index], category_name)
+                        if not rid:
+                            return _finalize_row(obligations[obligation_index], category_name)
 
-            # Secondary pass: use global index across all categories (must match
-            # ``flatten_obligations_for_individual_indexing``: only dict obligations are indexed).
-            if global_index is not None:
-                counter = 0
-                for category_data in results:
-                    category_name = category_data.get("category", "")
-                    for ob in category_data.get('obligations', []):
-                        if not isinstance(ob, dict):
-                            continue
-                        if counter == global_index:
-                            return _finalize_row(ob, category_name)
-                        counter += 1
+            # Secondary pass: global chunk_index — atomic Chroma uses flatten order; legacy index uses parent-only order.
+            if global_index is not None and isinstance(results, list):
+                if rid:
+                    ob_flat, cat_flat = _resolve_obligation_by_global_flat_index(results, global_index)
+                else:
+                    ob_flat, cat_flat = _resolve_obligation_by_global_legacy_parent_index(
+                        results, global_index
+                    )
+                if ob_flat is not None:
+                    return _finalize_row(ob_flat, cat_flat)
 
             # Flat consolidated_results fallback (pagewise input): resolve by global index.
             if not results and consolidated_results and global_index is not None:
@@ -3086,7 +3494,7 @@ class ObligationQuerySystem:
     def _query_categories_vector_store(
         self,
         user_query: str,
-        n_results: int = 20,  # Increased from 10 to capture more categories
+        n_results: int = 50,
         document_ids: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
         """
@@ -3116,15 +3524,8 @@ class ObligationQuerySystem:
                     len(embed_query),
                 )
             
-            # Category-level distance threshold (more lenient since we're matching broader concepts)
-            max_dist_str = os.getenv("CATEGORY_MAX_DISTANCE", "2.0").strip()  # Increased from 1.6 to 2.0
-            try:
-                max_distance = float(max_dist_str) if max_dist_str else 2.0
-            except ValueError:
-                max_distance = 2.0
-                
-            self.logger.info(f"Category query: max_distance={max_distance}")
-            
+            self.logger.info("Category query: top_k=%d (no distance filter)", n_results)
+
             # Query all documents if no filter, otherwise filter by document names
             matching_categories = []
             
@@ -3137,16 +3538,14 @@ class ObligationQuerySystem:
                         n_results=n_results,
                         document_name=doc_name,
                         chroma_path=chroma_path,
-                        max_distance=max_distance,
                     )
                     matching_categories.extend(doc_categories)
             else:
                 # Query across all documents  
                 matching_categories = query_categories(
                     query_text=embed_query,
-                    n_results=n_results * 5,  # Increased multiplier for more candidates across all docs
+                    n_results=n_results,
                     chroma_path=chroma_path,
-                    max_distance=max_distance,
                 )
             
             # Filter by allowed documents if specified
@@ -3346,22 +3745,21 @@ class ObligationQuerySystem:
     def _query_vector_store(
         self,
         user_query: str,
-        n_results: int = 100,
+        n_results: int = 50,
         document_ids: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
         """
         Primary retrieval: embed the user query and run semantic search in Chroma against each
         obligation's embedded chunk text (see vector_store.obligation_to_keyword_chunk_text;
         default: related_keywords only when present).
-        Hits with distance <= VECTOR_MAX_DISTANCE; optional Responsible_Party filter for short
-        queries that mention only tenant or only landlord (matches lowercase/Title Case metadata).
-        Resolves full rows from consolidated JSON (document_name +
-        chunk_index). Then **topic-augment**: append any consolidated obligation for the same
-        document where ``_query_matches_obligation_topic`` (related_keywords + body) matches, so
-        low-ranked chunks are not the only path into merge. **Category expansion** (separate
-        step) then replaces each hit category with the full category from consolidated JSON.
-        Returns [] if Chroma is missing, errors, or finds
-        no hits — the pipeline then uses per-document LLM filter + merge.
+        Uses Chroma top-k (``n_results``) only; no distance threshold. Optional Responsible_Party
+        filter for short queries that mention only tenant or only landlord (matches lowercase/Title
+        Case metadata). Resolves full rows from consolidated JSON (document_name + chunk_index).
+        Then **topic-augment**: append any consolidated obligation for the same document where
+        ``_query_matches_obligation_topic`` (related_keywords + body) matches, so low-ranked chunks
+        are not the only path into merge. **Category expansion** (separate step) then replaces each
+        hit category with the full category from consolidated JSON. Returns [] if Chroma is missing,
+        errors, or finds no hits — the pipeline then uses per-document LLM filter + merge.
         """
         query_lower = user_query.lower()
         detected_party = None
@@ -3400,19 +3798,12 @@ class ObligationQuerySystem:
                     len(embed_query),
                 )
 
-            # Distance threshold: only results with distance <= VECTOR_MAX_DISTANCE (default 1.4)
-            max_dist_str = os.getenv("VECTOR_MAX_DISTANCE", "1.4").strip()
-            try:
-                max_distance = float(max_dist_str) if max_dist_str else 1.4
-            except ValueError:
-                max_distance = 1.4
-            self.logger.info(f"Vector query: max_distance={max_distance} (from VECTOR_MAX_DISTANCE)")
+            self.logger.info("Vector query: top_k=%d (no distance filter)", n_results)
             raw = query_obligations(
                 query_text=embed_query,
-                n_results=500,
+                n_results=n_results,
                 document_name=None,
                 chroma_path=chroma_path,
-                max_distance=max_distance,
                 responsible_party=detected_party,
             )
             allowed = self._document_id_allowset(document_ids)
@@ -3425,8 +3816,7 @@ class ObligationQuerySystem:
                 raw = filtered
             if not raw:
                 self.logger.info(
-                    "Vector store returned no obligations (re-index output/chroma_db after processing, "
-                    "or relax VECTOR_MAX_DISTANCE)."
+                    "Vector store returned no obligations (re-index output/chroma_db after processing)."
                 )
                 return []
             # Load consolidated JSONs to resolve full obligation by document_name + chunk_index
@@ -3496,8 +3886,9 @@ class ObligationQuerySystem:
                 doc_to_results,
                 logger=self.logger,
             )
-            top_k = max(n_results, 200) if _is_short_focused_query(user_query) else max(n_results, 150)
-            obligations = diversify_vector_obligations_for_merge_input(candidates, top_k)
+            # After Chroma top-k, topic augmentation can add rows; diversify without an extra top-k cap here.
+            max_merge_input = len(candidates)
+            obligations = diversify_vector_obligations_for_merge_input(candidates, max_merge_input)
             if skipped_stale_chroma:
                 self.logger.info(
                     "Skipped %d vector hit(s) whose document_name is not in loaded consolidated JSON "
@@ -3767,6 +4158,7 @@ Output the filtered JSON:"""
         
         return citations
     
+<<<<<<< Updated upstream
     def _build_filter_only_prompt(
         self, user_query: str, payload: List[Dict[str, Any]]
     ) -> str:
@@ -3819,15 +4211,35 @@ Output only the JSON array:"""
 
     def _build_merge_rank_prompt(self, user_query: str, filtered_results: List[Dict[str, Any]], category_mode: bool = False) -> str:
         """Build the merge-and-rank LLM prompt. Shared by /query, /query/stream, and /query/stream/raw so results are consistent."""
+=======
+    def _build_merge_rank_prompt(
+        self, user_query: str, filtered_results: List[Dict[str, Any]], category_mode: bool = False
+    ) -> str:
+        """Build the merge-and-rank LLM prompt. Handles both atomic (new) and legacy (array) schema."""
+>>>>>>> Stashed changes
         non_empty_results = [r for r in filtered_results if _filtered_fr_has_payload(r)]
         prompt_payload = merge_prompt_filtered_snapshot(non_empty_results)
         uq = json.dumps(user_query, ensure_ascii=False)
         ndocs = len(filtered_results)
-        return f"""You are an expert commercial contract analyst and context extraction engine.
 
-INPUT:
-Array of per-document objects containing categorized legal obligations.
+        has_atomic = any(
+            isinstance(ob.get("responsibilities"), list) and ob.get("responsibilities")
+            for fr in prompt_payload
+            for grp in (fr.get("results") or [])
+            for ob in (grp.get("obligations") or [])
+            if isinstance(ob, dict)
+        )
+
+        if has_atomic:
+            return f"""Filter atomic responsibilities for relevance and rank results by relevance.
+
+Filter at the responsibility level (one object per duty). Keep only responsibilities relevant to
+the query, payment mechanics, remedies, or penalties. Drop unrelated duties. Do NOT edit fields.
+If query is empty, return empty results.
+
+OUTPUT FORMAT (JSON only):
 {{
+<<<<<<< Updated upstream
   "results": [
     {{
       "category": "<string>",
@@ -3897,9 +4309,11 @@ STRUCTURE PRESERVATION:
 
 OUTPUT FORMAT:
 {{
+=======
+>>>>>>> Stashed changes
   "query": {uq},
   "total_documents_searched": {ndocs},
-  "total_obligations_found": <int>,
+  "total_obligations_found": <int: obligations with non-empty Owner Responsibility>,
   "total_categories": <int>,
   "results": [
     {{
@@ -3907,16 +4321,46 @@ OUTPUT FORMAT:
       "obligations": [
         {{
           "Responsible Party": "<party>",
-          "Owner Responsibility": ["<filtered line 1>"],
-          "Reasoning": ["<relevant reason A>"],
-          "citations": [<original citation objects>]
+          "Owner Responsibility": ["<kept responsibility text>"],
+          "Reasoning": ["<matching reasoning>"],
+          "citations": [{{"docId": "...", "pageNumbers": [...], "section": [...]}}]
         }}
       ]
     }}
   ]
 }}
 
-User query: {uq}
+RANKING:
+- Order categories and obligations from most relevant to least relevant.
+
+STRUCTURE RULES:
+- Preserve category names and Responsible Party.
+- Remove obligations with empty Owner Responsibility arrays.
+- Remove categories with no obligations.
+- citations should be the union of kept responsibilities' citations (dedupe by doc/page/section).
+
+INPUT:
+{json.dumps(prompt_payload, indent=2)}
+
+Output only the JSON object:"""
+
+        return f"""Filter obligation lines for relevance and rank results by relevance.
+
+Evaluate each string in "Owner Responsibility" independently; keep only relevant lines.
+If query is empty, return empty results. Do not edit fields; only include/exclude lines.
+Remove obligations with empty Owner Responsibility arrays and categories with no obligations.
+
+OUTPUT (JSON only):
+{{
+  "query": "{uq}",
+  "total_documents_searched": {ndocs},
+  "total_obligations_found": <int>,
+  "total_categories": <int>,
+  "results": [{{"category": "...", "obligations": [{{"Responsible Party": "...", "Owner Responsibility": ["..."], "Reasoning": ["..."], "citations": [...]}}]}}]
+}}
+
+RANKING:
+- Order categories and obligations from most relevant to least relevant.
 
 INPUT:
 {json.dumps(prompt_payload, indent=2)}
@@ -4087,6 +4531,7 @@ Output only the JSON object:"""
             async for chunk in parse_obligations_stream(token_stream):
                 if not isinstance(chunk, dict):
                     continue
+<<<<<<< Updated upstream
                 cat = str(chunk.get("category") or "").strip() or "Other"
                 obs_in = chunk.get("obligations")
                 if not isinstance(obs_in, list):
@@ -4106,6 +4551,32 @@ Output only the JSON object:"""
                 total_categories += 1
                 total_obligations += len(group.get("obligations") or [])
                 yield {"type": "category_group", "data": group}
+=======
+                payload_chunk: Dict[str, Any] = {"results": [chunk]}
+                normalize_query_response_shape(payload_chunk, merge_in)
+                normalized_results = payload_chunk.get("results") or []
+                if not normalized_results:
+                    continue
+                normalized_group = normalized_results[0]
+                streamed.append(normalized_group)
+                yield {"type": "category_group", "data": normalized_group}
+                await asyncio.sleep(0)
+
+            total_obligations = sum(
+                len(g.get("obligations") or []) for g in streamed if isinstance(g, dict)
+            )
+            payload_stream: Dict[str, Any] = {
+                "results": streamed,
+                "total_categories": len(streamed),
+                "total_obligations_found": total_obligations,
+            }
+            n_in = _count_obligations_in_filtered(merge_in)
+            if total_obligations == 0 and n_in > 0:
+                self.logger.info(
+                    "[STREAM] merge produced zero obligations after normalization (input had %d); leaving merged payload as-is (no retrieval fallback)",
+                    n_in,
+                )
+>>>>>>> Stashed changes
 
             yield {
                 "type": "metadata",
@@ -4301,7 +4772,6 @@ Output only the JSON object:"""
             convert_result_citations_to_structured(final_result, merge_in)
             self.logger.info(f"[TIMING] merge_and_rank: 5. citation_to_structured - {time.perf_counter() - t_step:.3f}s")
             
-            apply_query_coherence_to_payload(user_query, final_result)
             t_norm = time.perf_counter()
             normalize_query_response_shape(final_result, merge_in)
             self.logger.info(f"[TIMING] merge_and_rank: 6. normalize_shape - {time.perf_counter() - t_norm:.3f}s")
@@ -4391,7 +4861,6 @@ Output only the JSON object:"""
                 final_result["merge_note"] = f"{note} {skip_msg}".strip() if note else skip_msg
                 final_result["total_documents_searched"] = len(filtered_results)
                 final_result["processed_at"] = datetime.now().isoformat()
-                apply_query_scope_trim_to_results(user_query, final_result)
                 return final_result
 
             self.logger.info("[TIMING] merge_and_rank: start")
@@ -4419,8 +4888,6 @@ Output only the JSON object:"""
             # 6. Normalize response shape
             t_step = time.perf_counter()
             normalize_query_response_shape(final_result, merge_in)
-            apply_query_scope_trim_to_results(user_query, final_result)
-            apply_query_coherence_to_payload(user_query, final_result)
             self.logger.info(f"[TIMING] merge_and_rank: 6. normalize_shape - {time.perf_counter() - t_step:.3f}s")
 
             obligations_found = final_result.get("total_obligations_found", 0)
@@ -4481,13 +4948,15 @@ Output only the JSON object:"""
             
             individual_results = self._query_individual_obligations_vector_store(
                 user_query,
-                n_results=30,  # Get more candidates for better results
+                n_results=50,
                 document_ids=document_ids,
-                max_distance=2.0  # Filter for relevance
             )
             dt_individual_search = time.perf_counter() - t_individual_search
 
-            self.logger.info(f"[TIMING] Step: individual obligation semantic search - done in {dt_individual_search:.3f}s ({len(individual_results)} obligations)")
+            self.logger.info(
+                f"[TIMING] Step: individual obligation semantic search - done in {dt_individual_search:.3f}s "
+                f"({len(individual_results)} vector hit(s) after dedupe)"
+            )
             
             if not individual_results:
                 self.logger.info("No matching individual obligations found; falling back to category-based approach")
@@ -4495,12 +4964,16 @@ Output only the JSON object:"""
             
             # Step 2: Load full obligation details for the matched individuals
             t_load_details = time.perf_counter()
-            self.logger.info("[TIMING] Step: loading full obligation details - start")
+            self.logger.info("[TIMING] Step: resolve + slim vector hits for merge - start")
             
-            full_obligations = await self._load_full_obligation_details_async(individual_results)
+            full_obligations = await self._load_full_obligation_details_async(individual_results, user_query)
             dt_load_details = time.perf_counter() - t_load_details
 
-            self.logger.info(f"[TIMING] Step: loading full obligation details - done in {dt_load_details:.3f}s ({len(full_obligations)} full obligations)")
+            self.logger.info(
+                "[TIMING] Step: resolve + slim vector hits for merge - done in %.3fs (%d obligation row(s))",
+                dt_load_details,
+                len(full_obligations),
+            )
             
             # Step 3: Group by categories for LLM processing
             categorized_obligations = self._group_obligations_by_source_category(full_obligations)
@@ -4598,15 +5071,11 @@ Output only the JSON object:"""
                 self.logger.info("No matching categories found; falling back to original query method")
                 return await self.query(user_query, save_output, document_ids)
             
-            # Step 2: Filter categories by distance (keep most relevant ones)
-            # For "rent" queries, keep categories with distance <= 2.0 (adjust as needed)
-            distance_threshold = float(os.getenv("CATEGORY_RESULT_DISTANCE_THRESHOLD", "2.0"))
-            relevant_categories = [
-                cat for cat in category_matches 
-                if cat.get('distance', 999) <= distance_threshold
-            ]
-            
-            self.logger.info(f"Filtered categories by distance <= {distance_threshold}: {len(relevant_categories)}/{len(category_matches)} categories")
+            relevant_categories = list(category_matches)
+            self.logger.info(
+                "Using %d category match(es) from vector top-k (no distance filter)",
+                len(relevant_categories),
+            )
             if relevant_categories:
                 category_names = [cat.get('category_name', 'Unknown') for cat in relevant_categories]
                 self.logger.info(f"Relevant categories: {category_names}")
@@ -4774,7 +5243,7 @@ Output only the JSON object:"""
             # Step 1: Try vector store first (semantic search over obligation chunks)
             t_vector = time.perf_counter()
             self.logger.info("[TIMING] Step: vector store query - start")
-            vector_obligations = self._query_vector_store(user_query, n_results=100, document_ids=document_ids)
+            vector_obligations = self._query_vector_store(user_query, n_results=50, document_ids=document_ids)
             self.logger.info(f"[TIMING] Step: vector store query - done in {time.perf_counter() - t_vector:.3f}s ({len(vector_obligations)} results)")
             if not vector_obligations:
                 vector_obligations = self._merge_obligations_from_consolidated_topic_only(
@@ -4794,6 +5263,7 @@ Output only the JSON object:"""
                 filtered_results_for_merge = expand_grouped_vector_merge_to_full_categories(
                     filtered_results_for_merge,
                     self.load_consolidated_jsons(),
+                    user_query=user_query,
                     logger=self.logger,
                 )
                 # Build document_name_to_id for merge step (Citation -> doc_id)
@@ -5428,7 +5898,7 @@ async def query_obligations_stream_raw(request: Optional[QueryRequest] = Body(de
             yield f"[QUERY] {user_query}\n"
             _echo("[STEP 1] Vector search...\n")
             yield "[STEP 1] Vector search...\n"
-            vector_obligations = qs._query_vector_store(user_query, n_results=100, document_ids=req.document_ids)
+            vector_obligations = qs._query_vector_store(user_query, n_results=50, document_ids=req.document_ids)
             if not vector_obligations:
                 vector_obligations = qs._merge_obligations_from_consolidated_topic_only(
                     user_query, consolidated_files, req.document_ids
@@ -5443,6 +5913,7 @@ async def query_obligations_stream_raw(request: Optional[QueryRequest] = Body(de
                 filtered_results = expand_grouped_vector_merge_to_full_categories(
                     filtered_results,
                     consolidated_files,
+                    user_query=user_query,
                     logger=logging.getLogger(__name__),
                 )
             else:
@@ -5519,7 +5990,8 @@ async def query_obligations_stream(request: Optional[QueryRequest] = Body(defaul
     For raw token-by-token streaming, use POST /query/stream/raw.
 
     Each line is one JSON object followed by newline:
-    - {"type": "category_group", "data": {"category", "obligations"}}
+    - {"type": "category_group", "data": {"category", "obligations"}} — emitted only after merge LLM
+      has produced a complete category group (same filtering/normalization as POST /query).
     - {"type": "metadata", "data": {query, totals, processed_at}}
     - {"type": "error", "message": "..."}
     """
@@ -5550,6 +6022,7 @@ async def query_obligations_stream(request: Optional[QueryRequest] = Body(defaul
             if req.output_folder:
                 qs = ObligationQuerySystem(local_output_folder=req.output_folder, model=get_default_model())
 
+<<<<<<< Updated upstream
             query_text = user_query
             if not query_text or query_text.strip() == "":
                 query_text = "utilities including water, gas, heat, light, electricity, telephone service, HVAC, sprinkler system, electrical and plumbing systems"
@@ -5559,6 +6032,21 @@ async def query_obligations_stream(request: Optional[QueryRequest] = Body(defaul
                 logging.warning("[STREAM] vector_store module missing; using legacy query")
                 legacy_result = await qs.query_legacy(
                     query_text,
+=======
+            stream_query = user_query
+            if not stream_query or stream_query.strip() == "":
+                stream_query = (
+                    "utilities including water, gas, heat, light, electricity, telephone service, HVAC, "
+                    "sprinkler system, electrical and plumbing systems"
+                )
+                logging.info("[STREAM] No query provided - defaulting to utilities query")
+                force_logger.info("[STREAM] No query provided - defaulting to utilities query")
+
+            if not qs._vector_store_available():
+                force_logger.info("[STREAM] vector_store missing; using legacy query flow")
+                legacy_result = await qs.query_legacy(
+                    stream_query,
+>>>>>>> Stashed changes
                     save_output=req.save_output,
                     document_ids=req.document_ids,
                     use_category_mode_override=False,
@@ -5566,6 +6054,7 @@ async def query_obligations_stream(request: Optional[QueryRequest] = Body(defaul
                 for grp in legacy_result.get("results") or []:
                     line = json.dumps({"type": "category_group", "data": grp}) + "\n"
                     _write_stream_line(line)
+<<<<<<< Updated upstream
                     yield line
                 meta = {
                     "query": legacy_result.get("query", query_text),
@@ -5575,18 +6064,34 @@ async def query_obligations_stream(request: Optional[QueryRequest] = Body(defaul
                     "total_obligations_found": int(
                         legacy_result.get("total_obligations_found") or 0
                     ),
+=======
+                    force_logger.info(f"[STREAM EVENT] {line.strip()}")
+                    yield line
+                meta = {
+                    "query": legacy_result.get("query", stream_query),
+                    "total_documents_searched": int(legacy_result.get("total_documents_searched") or 0),
+                    "total_obligations_found": int(legacy_result.get("total_obligations_found") or 0),
+>>>>>>> Stashed changes
                     "total_categories": int(legacy_result.get("total_categories") or 0),
                     "processed_at": legacy_result.get("processed_at") or datetime.now().isoformat(),
                 }
                 if (legacy_result.get("merge_note") or "").strip():
+<<<<<<< Updated upstream
                     meta["merge_note"] = legacy_result.get("merge_note")
                 line = json.dumps({"type": "metadata", "data": meta}) + "\n"
                 _write_stream_line(line)
+=======
+                    meta["merge_note"] = (legacy_result.get("merge_note") or "").strip()
+                line = json.dumps({"type": "metadata", "data": meta}) + "\n"
+                _write_stream_line(line)
+                force_logger.info(f"[STREAM EVENT] {line.strip()}")
+>>>>>>> Stashed changes
                 yield line
                 return
 
             t_individual = time.perf_counter()
             individual_results = qs._query_individual_obligations_vector_store(
+<<<<<<< Updated upstream
                 query_text,
                 n_results=30,
                 document_ids=req.document_ids,
@@ -5691,6 +6196,86 @@ async def query_obligations_stream(request: Optional[QueryRequest] = Body(defaul
                 normalized_results,
                 document_name_to_id,
                 category_mode=False,
+=======
+                stream_query,
+                n_results=50,
+                document_ids=req.document_ids,
+            )
+            dt_individual = time.perf_counter() - t_individual
+            logging.info(
+                "[STREAM] Individual obligation search: %d vector hit(s) in %.2fs",
+                len(individual_results),
+                dt_individual,
+            )
+            force_logger.info(
+                f"[STREAM] Individual obligation search: {len(individual_results)} vector hit(s) in {dt_individual:.2f}s"
+            )
+
+            if not individual_results:
+                logging.info("[STREAM] No individual obligation matches; falling back to category query")
+                force_logger.info("[STREAM] No individual obligation matches; falling back to category query")
+                fallback_result = await qs.query_by_categories(
+                    stream_query,
+                    save_output=req.save_output,
+                    document_ids=req.document_ids,
+                )
+                for grp in fallback_result.get("results") or []:
+                    line = json.dumps({"type": "category_group", "data": grp}) + "\n"
+                    _write_stream_line(line)
+                    force_logger.info(f"[STREAM EVENT] {line.strip()}")
+                    yield line
+                meta = {
+                    "query": fallback_result.get("query", stream_query),
+                    "total_documents_searched": int(fallback_result.get("total_documents_searched") or 0),
+                    "total_obligations_found": int(fallback_result.get("total_obligations_found") or 0),
+                    "total_categories": int(fallback_result.get("total_categories") or 0),
+                    "processed_at": fallback_result.get("processed_at") or datetime.now().isoformat(),
+                }
+                if (fallback_result.get("merge_note") or "").strip():
+                    meta["merge_note"] = (fallback_result.get("merge_note") or "").strip()
+                line = json.dumps({"type": "metadata", "data": meta}) + "\n"
+                _write_stream_line(line)
+                force_logger.info(f"[STREAM EVENT] {line.strip()}")
+                yield line
+                return
+
+            full_obligations = await qs._load_full_obligation_details_async(individual_results, stream_query)
+            categorized_obligations = qs._group_obligations_by_source_category(full_obligations)
+
+            document_name_to_id = {}
+            for category in categorized_obligations:
+                for obligation in category.get("obligations", []):
+                    doc_name = obligation.get("document_name") or ""
+                    if doc_name and doc_name not in document_name_to_id:
+                        document_name_to_id[doc_name] = len(document_name_to_id) + 1
+
+            normalized_results = categorized_obligations
+            if categorized_obligations and not any(
+                isinstance(r, dict) and "results" in r for r in categorized_obligations
+            ):
+                normalized_results = [
+                    {
+                        "document_name": "individual_obligations",
+                        "results": categorized_obligations,
+                    }
+                ]
+
+            total_for_merge = _count_obligations_in_filtered(normalized_results)
+            logging.info(
+                "[STREAM] Merge and rank LLM call - start (input: %d obligations from %d doc(s))",
+                total_for_merge,
+                len(normalized_results),
+            )
+            force_logger.info(
+                f"[STREAM] Merge and rank LLM call - start (input: {total_for_merge} obligations from {len(normalized_results)} doc(s))"
+            )
+
+            obligation_stream_count = 0
+            async for event in qs.merge_and_rank_results_stream(
+                stream_query,
+                normalized_results,
+                document_name_to_id,
+>>>>>>> Stashed changes
             ):
                 if event.get("type") == "category_group":
                     obligation_stream_count += len(
@@ -5700,11 +6285,23 @@ async def query_obligations_stream(request: Optional[QueryRequest] = Body(defaul
                 _write_stream_line(line)
                 force_logger.info(f"[STREAM EVENT] {line.strip()}")
                 yield line
+<<<<<<< Updated upstream
 
             force_logger.info(
                 "[STREAM] Individual obligations pipeline complete (streamed %d obligations)",
                 obligation_stream_count,
             )
+=======
+                await asyncio.sleep(0)
+
+            logging.info(
+                "[STREAM] Merge and rank LLM call - complete (streamed %d obligations)",
+                obligation_stream_count,
+            )
+            force_logger.info(
+                f"[STREAM] Merge and rank LLM call - complete (streamed {obligation_stream_count} obligations)"
+            )
+>>>>>>> Stashed changes
             
         except Exception as e:
             logging.error(f"Error in streaming query: {e}", exc_info=True)
@@ -5715,7 +6312,16 @@ async def query_obligations_stream(request: Optional[QueryRequest] = Body(defaul
                 pass
             yield line
     
-    return StreamingResponse(event_generator(), media_type="application/x-ndjson")
+    return StreamingResponse(
+        event_generator(),
+        media_type="application/x-ndjson",
+        headers={
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
 
 
 @app.post("/process", response_model=ProcessResponse, tags=["Processing"])

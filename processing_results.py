@@ -673,6 +673,42 @@ def merge_duplicate_party_within_category(
     """Within each category group, merge obligations with the same Responsible Party."""
     fb = (default_doc or "").strip()
     out: List[Dict[str, Any]] = []
+    def _normalize_obligation_rows(ob: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(ob, dict):
+            return {"responsibilities": [], "reasonings": [], "citations": [], "resp_objs": []}
+        resp_objs = ob.get("responsibilities")
+        if isinstance(resp_objs, list) and resp_objs:
+            rows = []
+            texts: List[str] = []
+            reas: List[str] = []
+            cites: List[Dict[str, Any]] = []
+            for r in resp_objs:
+                if not isinstance(r, dict):
+                    continue
+                text = str(r.get("text") or "").strip()
+                if not text:
+                    continue
+                reasoning = str(r.get("reasoning") or "").strip()
+                citation = r.get("citation") if isinstance(r.get("citation"), dict) else {}
+                rows.append({"text": text, "reasoning": reasoning, "citation": citation})
+                texts.append(text)
+                reas.append(reasoning)
+                if citation:
+                    cites.append(citation)
+            if rows:
+                return {
+                    "responsibilities": texts,
+                    "reasonings": reas,
+                    "citations": cites,
+                    "resp_objs": rows,
+                }
+        return {
+            "responsibilities": _merge_str_lists([], ob.get("Owner Responsibility")),
+            "reasonings": _merge_str_lists([], ob.get("Reasoning")),
+            "citations": _normalize_citations_list(_get_citations_field(ob), fb),
+            "resp_objs": [],
+        }
+
     for grp in results or []:
         if not isinstance(grp, dict):
             continue
@@ -685,25 +721,34 @@ def merge_duplicate_party_within_category(
         for ob in obs_in:
             if not isinstance(ob, dict):
                 continue
+            norm_rows = _normalize_obligation_rows(ob)
             pk = _party_key(ob, party_metadata=party_metadata) or "__unknown__"
             if pk not in buckets:
                 o2 = dict(ob)
                 o2["Responsible Party"] = normalize_responsible_party_for_obligation(
                     ob, party_metadata=party_metadata
                 )
-                o2["Owner Responsibility"] = _merge_str_lists([], ob.get("Owner Responsibility"))
-                o2["Reasoning"] = _merge_str_lists([], ob.get("Reasoning"))
+                o2["Owner Responsibility"] = list(norm_rows.get("responsibilities") or [])
+                o2["Reasoning"] = list(norm_rows.get("reasonings") or [])
                 o2["related_keywords"] = _merge_str_lists([], ob.get("related_keywords"))
-                o2["citations"] = _normalize_citations_list(_get_citations_field(ob), fb)
+                o2["citations"] = _normalize_citations_list(norm_rows.get("citations"), fb)
+                resp_objs = norm_rows.get("resp_objs") or []
+                if resp_objs:
+                    o2["responsibilities"] = resp_objs
                 for k in ("Citation", "Citations", "DutyType", "financial_category", "financial_subcategory", "category", "subcategory"):
                     o2.pop(k, None)
                 buckets[pk] = o2
                 continue
             acc = buckets[pk]
-            acc["Owner Responsibility"] = _merge_str_lists(acc.get("Owner Responsibility"), ob.get("Owner Responsibility"))
-            acc["Reasoning"] = _merge_str_lists(acc.get("Reasoning"), ob.get("Reasoning"))
+            acc["Owner Responsibility"] = _merge_str_lists(
+                acc.get("Owner Responsibility"), norm_rows.get("responsibilities")
+            )
+            acc["Reasoning"] = _merge_str_lists(acc.get("Reasoning"), norm_rows.get("reasonings"))
             acc["related_keywords"] = _merge_str_lists(acc.get("related_keywords"), ob.get("related_keywords"))
-            acc["citations"] = _merge_citations_lists(acc.get("citations"), _get_citations_field(ob), fb)
+            acc["citations"] = _merge_citations_lists(acc.get("citations"), norm_rows.get("citations"), fb)
+            resp_objs = norm_rows.get("resp_objs") or []
+            if resp_objs:
+                acc["responsibilities"] = list(acc.get("responsibilities") or []) + resp_objs
         out.append({"category": cat, "obligations": list(buckets.values())})
     return out
 
@@ -780,7 +825,9 @@ def build_root_citations_api_shape(
 
 def flatten_processing_results_for_index(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
-    Stable flat rows for Chroma: taxonomy order of groups, then obligation order.
+    Stable flat rows for Chroma: one row per ATOMIC RESPONSIBILITY.
+    When the new 'responsibilities' array is present, each item becomes its own indexed row.
+    Falls back to legacy 'Owner Responsibility' array if 'responsibilities' is missing.
     DutyType = processing category (search metadata).
     """
     flat: List[Dict[str, Any]] = []
@@ -791,21 +838,89 @@ def flatten_processing_results_for_index(results: List[Dict[str, Any]]) -> List[
         for ob in grp.get("obligations") or []:
             if not isinstance(ob, dict):
                 continue
-            row = dict(ob)
-            row["DutyType"] = cat
-            if "related_keywords" not in row or not row.get("related_keywords"):
-                or_lines = row.get("Owner Responsibility")
-                row["related_keywords"] = broaden_related_keywords(
-                    category=cat,
-                    owner_responsibility=or_lines,
-                    base_keywords=[],
-                    max_items=64,
-                )
-            # Chroma path still reads legacy Citation in metadata — mirror citations
-            if row.get("citations") and not row.get("Citation"):
-                row["Citation"] = row["citations"]
-            flat.append(row)
+            party = ob.get("Responsible Party", "")
+            atomic = ob.get("responsibilities")
+
+            if isinstance(atomic, list) and atomic:
+                # NEW PATH: one row per atomic responsibility
+                for resp_obj in atomic:
+                    if not isinstance(resp_obj, dict):
+                        continue
+                    resp_text = str(resp_obj.get("text") or "").strip()
+                    if not resp_text:
+                        continue
+
+                    row = {
+                        "DutyType": cat,
+                        "Responsible Party": party,
+                        "responsibility_id": resp_obj.get("responsibility_id", ""),
+                        # Keep legacy field name so vector_store.py embedding functions still work
+                        "Owner Responsibility": [resp_text],
+                        "Reasoning": [resp_obj.get("reasoning", "")],
+                        "related_keywords": resp_obj.get("related_keywords")
+                        or broaden_related_keywords(
+                            category=cat,
+                            owner_responsibility=resp_text,
+                            base_keywords=[],
+                            max_items=64,
+                        ),
+                        "citations": _normalize_citations_from_atomic(resp_obj.get("citation"), cat),
+                        "Citation": _normalize_citations_from_atomic(resp_obj.get("citation"), cat),
+                        "responsibility_type": resp_obj.get("responsibility_type", []),
+                        "source_ids": resp_obj.get("source_ids", []),
+                        # Preserve full atomic object for payload reconstruction
+                        "_atomic_responsibility": resp_obj,
+                        "_category": cat,
+                    }
+                    flat.append(row)
+            else:
+                # LEGACY PATH: old array-style (backward compat for existing indexed docs)
+                row = dict(ob)
+                row["DutyType"] = cat
+                if "related_keywords" not in row or not row.get("related_keywords"):
+                    or_lines = row.get("Owner Responsibility")
+                    row["related_keywords"] = broaden_related_keywords(
+                        category=cat,
+                        owner_responsibility=or_lines,
+                        base_keywords=[],
+                        max_items=64,
+                    )
+                # Chroma path still reads legacy Citation in metadata — mirror citations
+                if row.get("citations") and not row.get("Citation"):
+                    row["Citation"] = row["citations"]
+                flat.append(row)
     return flat
+
+
+def _normalize_citations_from_atomic(citation: Any, fallback_doc: str = "") -> List[Dict[str, Any]]:
+    """
+    Convert an atomic citation object {docId, pageNumbers, section} into
+    the normalized [{pageNumbers:[...], section:[...]}] format used by ChromaDB metadata.
+    """
+    if not citation or not isinstance(citation, dict):
+        return [{"pageNumbers": [1], "section": ["Document"]}]
+
+    # Parse pageNumbers (may be comma-separated string like "3,4,5")
+    pn_raw = citation.get("pageNumbers", "")
+    if isinstance(pn_raw, str):
+        from citation_utils import _parse_page_numbers
+
+        pages = _parse_page_numbers(pn_raw) or [1]
+    elif isinstance(pn_raw, list):
+        pages = [int(p) for p in pn_raw if str(p).isdigit()] or [1]
+    else:
+        pages = [1]
+
+    # Parse section
+    sec_raw = citation.get("section", "")
+    if isinstance(sec_raw, str) and sec_raw.strip():
+        sections = [s.strip() for s in sec_raw.split(";") if s.strip()] or ["Document"]
+    elif isinstance(sec_raw, list):
+        sections = [str(s).strip() for s in sec_raw if str(s).strip()] or ["Document"]
+    else:
+        sections = ["Document"]
+
+    return [{"pageNumbers": pages, "section": sections}]
 
 
 def count_obligations_in_results(results: List[Dict[str, Any]]) -> int:
