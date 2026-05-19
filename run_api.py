@@ -11,6 +11,9 @@ from dotenv import load_dotenv
 # Load environment variables from repo root (cwd may differ under uvicorn reload / IDEs)
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
+# Unbuffered Python + prompt stream output in the server terminal (e.g. when hitting /query/stream from Postman).
+os.environ.setdefault("PYTHONUNBUFFERED", "1")
+
 # When using Gemini (not Azure): force API-key-only auth by unsetting ADC so the client uses GEMINI_API_KEY only.
 if not os.getenv("USE_AZURE_OPENAI", "").lower() in ("true", "1", "yes"):
     if os.getenv("GOOGLE_GENAI_USE_VERTEXAI", "false").lower() != "true":

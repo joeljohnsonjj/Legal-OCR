@@ -61,6 +61,19 @@ from gcs_document_versioning import (
 )
 
 
+def _semantic_search_top_k() -> int:
+    """
+    Max rows returned from Chroma semantic search for queries.
+    Set in ``.env`` as ``LEGAL_OCR_SEMANTIC_SEARCH_TOP_K`` (preferred) or ``VECTOR_SEARCH_TOP_K``.
+    """
+    raw = (os.getenv("LEGAL_OCR_SEMANTIC_SEARCH_TOP_K") or os.getenv("VECTOR_SEARCH_TOP_K") or "30").strip()
+    try:
+        k = int(raw)
+    except ValueError:
+        k = 30
+    return max(1, min(k, 500))
+
+
 # Post-merge: keep only Owner Responsibility lines that match the user's topic (substring + light stemming).
 _QUERY_SCOPE_STOPWORDS = frozenset(
     {
@@ -1513,6 +1526,20 @@ def enrich_nested_results_citations_from_merge_in(payload: Dict[str, Any], merge
                 ob["citations"] = json.loads(json.dumps(merged_cits))
 
 
+def recount_nested_category_totals_from_results(payload: Dict[str, Any]) -> None:
+    """
+    Set total_categories and total_obligations_found from nested results[].
+    Authoritative over LLM-written root totals (models often miscount).
+    """
+    gr = payload.get("results") or []
+    if not is_nested_category_query_results(gr):
+        return
+    payload["total_categories"] = len(gr)
+    payload["total_obligations_found"] = sum(
+        len(g.get("obligations") or []) for g in gr if isinstance(g, dict)
+    )
+
+
 def normalize_query_response_shape(
     payload: Dict[str, Any],
     merge_in: List[Dict[str, Any]],
@@ -1558,8 +1585,7 @@ def normalize_query_response_shape(
     if is_nested_category_query_results(gr):
         sanitize_reasoning_duplication_across_obligations(gr)
     strip_related_keywords_from_api_payload(payload)
-    payload["total_categories"] = len(gr)
-    payload["total_obligations_found"] = sum(len(g.get("obligations") or []) for g in gr if isinstance(g, dict))
+    recount_nested_category_totals_from_results(payload)
 
 
 def _merge_max_input_obligations() -> int:
@@ -2631,44 +2657,71 @@ class ObligationQuerySystem:
         doc_base = doc_norm.rsplit(".", 1)[0] if "." in doc_norm else doc_norm
         return doc_norm in allowed or doc_base in allowed
 
-    def _query_individual_obligations_vector_store(self, user_query: str, n_results: int = 20, document_ids: Optional[List[str]] = None, max_distance: Optional[float] = None) -> List[Dict[str, Any]]:
+    def _chroma_document_names_for_vector_filter(self, document_ids: Optional[List[str]]) -> Optional[List[str]]:
         """
-        Query individual obligations vector store (new enhanced approach).
+        Exact ``document_name`` strings from loaded consolidated JSON that match ``document_ids``.
+        ``None`` means no document filter (search all indexed documents).
         """
+        if not document_ids:
+            return None
+        allowed = self._document_id_allowset(document_ids)
+        if not allowed:
+            return []
+        out: List[str] = []
+        for entry in self.load_consolidated_jsons():
+            if not isinstance(entry, dict):
+                continue
+            data = entry.get("data") or {}
+            doc_name = (entry.get("document_name") or data.get("document_name") or "").strip()
+            if doc_name and self._doc_matches_allowset(doc_name, allowed):
+                out.append(doc_name)
+        seen: Set[str] = set()
+        uniq: List[str] = []
+        for d in out:
+            if d not in seen:
+                seen.add(d)
+                uniq.append(d)
+        return uniq
+
+    def _query_individual_obligations_vector_store(
+        self, user_query: str, document_ids: Optional[List[str]] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Semantic search only: one Chroma query returning at most ``top_k`` hits (env-driven).
+        No max-distance cutoff, no per-document merge of multiple top_k lists.
+        """
+        top_k = _semantic_search_top_k()
         try:
             from vector_store import query_individual_obligations
+
             chroma_path = str(Path(self.local_output_folder) / "chroma_db")
-            
-            all_results = []
-            
-            if document_ids:
-                # Query specific documents
-                for doc_id in document_ids:
-                    results = query_individual_obligations(
-                        query_text=user_query,
-                        n_results=n_results,
-                        document_name=doc_id,
-                        chroma_path=chroma_path,
-                        max_distance=max_distance
-                    )
-                    all_results.extend(results)
-            else:
-                # Query all documents
-                results = query_individual_obligations(
-                    query_text=user_query,
-                    n_results=n_results,
-                    chroma_path=chroma_path,
-                    max_distance=max_distance
-                )
-                all_results.extend(results)
-            
-            # Sort by distance (best matches first)
-            all_results.sort(key=lambda x: x.get('distance', 999))
-            
-            self.logger.info(f"Found {len(all_results)} individual obligations matching query")
-            
-            return all_results[:n_results]  # Return top results
-            
+            if not Path(chroma_path).exists():
+                self.logger.info("Vector store path does not exist; semantic search skipped")
+                return []
+
+            self.logger.info(
+                "Individual obligation semantic search: top_k=%d (LEGAL_OCR_SEMANTIC_SEARCH_TOP_K or VECTOR_SEARCH_TOP_K); "
+                "Chroma returns up to this many nearest neighbors by embedding distance (no extra distance filter).",
+                top_k,
+            )
+
+            doc_names = self._chroma_document_names_for_vector_filter(document_ids)
+            if document_ids and not doc_names:
+                self.logger.info("document_ids filter matched no consolidated documents; semantic search returns empty")
+                return []
+
+            raw = query_individual_obligations(
+                query_text=(user_query or "").strip(),
+                n_results=top_k,
+                document_name=None,
+                document_names=doc_names,
+                chroma_path=chroma_path,
+                max_distance=None,
+                responsible_party=None,
+            )
+            self.logger.info("Chroma semantic search returned %d hit(s) (cap top_k=%d)", len(raw), top_k)
+            return raw
+
         except ImportError:
             self.logger.warning("Individual obligations vector store not available")
             return []
@@ -3004,47 +3057,52 @@ class ObligationQuerySystem:
         
         return list(by_category.values())
 
-    async def _process_obligations_with_llm_async(self, user_query: str, categorized_obligations: List[Dict[str, Any]], mode: str = "individual_obligations") -> Dict[str, Any]:
+    async def build_merge_input_like_post_query(
+        self,
+        user_query: str,
+        document_ids: Optional[List[str]] = None,
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
         """
-        Process obligations with LLM for final filtering and ranking.
-        This method creates the document name mapping and calls the appropriate merge_and_rank method.
-        
-        Args:
-            user_query: The user's search query
-            categorized_obligations: List of categorized obligations from _group_obligations_by_source_category
-            mode: The processing mode ("individual_obligations" or "category_mode")
-            
-        Returns:
-            Formatted results from LLM processing
+        Same retrieval + merge-input shaping as POST /query (``query_by_individual_obligations``):
+        semantic Chroma top_k → load full rows from consolidated JSON → group by source category
+        → ``merge_and_rank_results`` input (synthetic ``individual_obligations`` document block).
+
+        Returns ``([], {})`` when there are no vector hits or nothing loadable for merge.
         """
-        # Create document name to ID mapping 
-        document_name_to_id = {}
+        individual_results = self._query_individual_obligations_vector_store(
+            user_query, document_ids=document_ids
+        )
+        if not individual_results:
+            return [], {}
+        full_obligations = await self._load_full_obligation_details_async(individual_results)
+        categorized_obligations = self._group_obligations_by_source_category(full_obligations)
+
+        document_name_to_id: Dict[str, str] = {}
         for category in categorized_obligations:
-            for obligation in category.get('obligations', []):
-                doc_name = obligation.get('document_name', '')
+            for obligation in category.get("obligations", []):
+                doc_name = obligation.get("document_name", "")
                 if doc_name and doc_name not in document_name_to_id:
-                    document_name_to_id[doc_name] = len(document_name_to_id) + 1
-        
-        # Call the appropriate merge and rank method
-        if mode == "category_mode":
-            final_result = await self.merge_and_rank_results_category_mode(
-                user_query, categorized_obligations, document_name_to_id
-            )
+                    document_name_to_id[doc_name] = str(len(document_name_to_id) + 1)
+
+        if categorized_obligations and not any(
+            isinstance(r, dict) and "results" in r for r in categorized_obligations
+        ):
+            normalized_results: List[Dict[str, Any]] = [
+                {"document_name": "individual_obligations", "results": categorized_obligations}
+            ]
         else:
-            # For individual obligations mode, ensure payload matches merge_and_rank expectations.
             normalized_results = categorized_obligations
-            if categorized_obligations and not any(
-                isinstance(r, dict) and "results" in r for r in categorized_obligations
-            ):
-                normalized_results = [{
-                    "document_name": "individual_obligations",
-                    "results": categorized_obligations,
-                }]
-            final_result = await self.merge_and_rank_results(
-                user_query, normalized_results, document_name_to_id
-            )
-            
-        return final_result
+
+        if document_ids:
+            for doc_id in document_ids:
+                d = (doc_id or "").strip()
+                if not d:
+                    continue
+                name = Path(d).name or d
+                document_name_to_id[name] = doc_id
+                document_name_to_id[name.lower()] = doc_id
+
+        return normalized_results, document_name_to_id
 
     def _query_categories_vector_store(
         self,
@@ -3309,90 +3367,49 @@ class ObligationQuerySystem:
     def _query_vector_store(
         self,
         user_query: str,
-        n_results: int = 100,
         document_ids: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
         """
-        Primary retrieval: embed the user query and run semantic search in Chroma against each
-        obligation's embedded chunk text (see vector_store.obligation_to_keyword_chunk_text;
-        default: related_keywords only when present).
-        Hits with distance <= VECTOR_MAX_DISTANCE; optional Responsible_Party filter for short
-        queries that mention only tenant or only landlord (matches lowercase/Title Case metadata).
-        Resolves full rows from consolidated JSON (document_name +
-        chunk_index). Then **topic-augment**: append any consolidated obligation for the same
-        document where ``_query_matches_obligation_topic`` (related_keywords + body) matches, so
-        low-ranked chunks are not the only path into merge. **Category expansion** (separate
-        step) then replaces each hit category with the full category from consolidated JSON.
-        Returns [] if Chroma is missing, errors, or finds
-        no hits — the pipeline then uses per-document LLM filter + merge.
-        """
-        query_lower = user_query.lower()
-        detected_party = None
-        word_count = len(query_lower.split())
-        # Short queries: optional party metadata filter in Chroma. Skip when both parties appear
-        # (ambiguous scope). Longer queries: never force a single party — topic stays semantic.
-        if word_count < 3:
-            if "tenant" in query_lower and "landlord" in query_lower:
-                self.logger.info(
-                    "Query mentions both tenant and landlord; skipping Responsible_Party metadata filter"
-                )
-            elif "tenant" in query_lower:
-                detected_party = "Tenant"
-                self.logger.info("Detected 'tenant' in query → filtering by Responsible_Party=Tenant")
-            elif "landlord" in query_lower:
-                detected_party = "Landlord"
-                self.logger.info("Detected 'landlord' in query → filtering by Responsible_Party=Landlord")
-        elif "tenant" in query_lower or "landlord" in query_lower:
-            self.logger.info(
-                f"Query has {word_count} words; skipping automatic Responsible_Party filter "
-                f"(party keywords still in embedding for semantic retrieval)"
-            )
+        Semantic search only: Chroma ``individual_obligations`` collection, at most ``top_k`` rows
+        (``LEGAL_OCR_SEMANTIC_SEARCH_TOP_K`` or ``VECTOR_SEARCH_TOP_K`` in ``.env``).
 
+        No query expansion, VECTOR_MAX_DISTANCE cutoff, Responsible_Party metadata filter,
+        topic augmentation, or diversify — ranking is Chroma's nearest-neighbor order on the
+        embedded obligation text. Each hit is resolved to a merge-shaped row via consolidated
+        JSON using ``document_name`` + ``chunk_index``.
+        """
+        top_k = _semantic_search_top_k()
+        self.logger.info(
+            "Semantic vector search (merge pipeline): top_k=%d (LEGAL_OCR_SEMANTIC_SEARCH_TOP_K or VECTOR_SEARCH_TOP_K); "
+            "Chroma-only retrieval, no distance/party/topic extras.",
+            top_k,
+        )
         try:
-            from vector_store import query_obligations
+            from vector_store import query_individual_obligations
+
             chroma_path = str(Path(self.local_output_folder) / "chroma_db")
             if not Path(chroma_path).exists():
-                self.logger.info("Vector store path does not exist; skipping semantic retrieval (index after processing)")
+                self.logger.info("Vector store path does not exist; skipping semantic retrieval")
                 return []
 
-            embed_query = _expand_query_for_vector_retrieval(user_query)
-            if embed_query != (user_query or "").strip():
-                self.logger.info(
-                    "Vector query expanded for retrieval: %r -> longer synonym phrase (%d chars)",
-                    user_query,
-                    len(embed_query),
-                )
+            doc_names = self._chroma_document_names_for_vector_filter(document_ids)
+            if document_ids and not doc_names:
+                self.logger.info("document_ids matched no consolidated documents; semantic search returns empty")
+                return []
 
-            # Distance threshold: only results with distance <= VECTOR_MAX_DISTANCE (default 1.4)
-            max_dist_str = os.getenv("VECTOR_MAX_DISTANCE", "1.4").strip()
-            try:
-                max_distance = float(max_dist_str) if max_dist_str else 1.4
-            except ValueError:
-                max_distance = 1.4
-            self.logger.info(f"Vector query: max_distance={max_distance} (from VECTOR_MAX_DISTANCE)")
-            raw = query_obligations(
-                query_text=embed_query,
-                n_results=500,
+            raw = query_individual_obligations(
+                query_text=(user_query or "").strip(),
+                n_results=top_k,
                 document_name=None,
+                document_names=doc_names,
                 chroma_path=chroma_path,
-                max_distance=max_distance,
-                responsible_party=detected_party,
+                max_distance=None,
+                responsible_party=None,
             )
-            allowed = self._document_id_allowset(document_ids)
-            if document_ids and allowed is not None:
-                filtered = []
-                for r in raw:
-                    doc_name = (r.get("document_name") or "").strip()
-                    if self._doc_matches_allowset(doc_name, allowed):
-                        filtered.append(r)
-                raw = filtered
+            self.logger.info("Chroma semantic search returned %d hit(s) (cap top_k=%d)", len(raw), top_k)
             if not raw:
-                self.logger.info(
-                    "Vector store returned no obligations (re-index output/chroma_db after processing, "
-                    "or relax VECTOR_MAX_DISTANCE)."
-                )
                 return []
-            # Load consolidated JSONs to resolve full obligation by document_name + chunk_index
+
             loaded = self.load_consolidated_jsons()
             doc_to_results: Dict[str, List[Dict[str, Any]]] = {}
             for entry in loaded:
@@ -3401,11 +3418,11 @@ class ObligationQuerySystem:
                 results = obligations_from_consolidated_json(data)
                 if doc_name:
                     doc_to_results[doc_name] = results
+
             skipped_stale_chroma = 0
-            candidates: List[Tuple[float, Dict[str, Any]]] = []
+            obligations: List[Dict[str, Any]] = []
             for r in raw:
                 doc_name = (r.get("document_name") or "").strip()
-                # Ignore Chroma rows for documents no longer present in output (stale index entries).
                 if doc_to_results and doc_name not in doc_to_results:
                     skipped_stale_chroma += 1
                     continue
@@ -3413,10 +3430,6 @@ class ObligationQuerySystem:
                     idx = int(r.get("chunk_index") or 0)
                 except (TypeError, ValueError):
                     idx = 0
-                try:
-                    dist_f = float(r.get("distance")) if r.get("distance") is not None else 1e9
-                except (TypeError, ValueError):
-                    dist_f = 1e9
                 results = doc_to_results.get(doc_name)
                 if results and 0 <= idx < len(results):
                     full_ob = results[idx]
@@ -3427,10 +3440,8 @@ class ObligationQuerySystem:
                             idx,
                             doc_name,
                         )
-                    ob_dict = _consolidated_obligation_to_merge_dict(full_ob, doc_name)
-                    candidates.append((dist_f, ob_dict))
+                    obligations.append(_consolidated_obligation_to_merge_dict(full_ob, doc_name))
                 else:
-                    # Fallback: build from metadata when consolidated lookup fails
                     citation = r.get("Citation") or ""
                     if doc_name:
                         citation = f"Document: {doc_name} | {citation}"
@@ -3439,37 +3450,25 @@ class ObligationQuerySystem:
                         idx,
                         doc_name,
                     )
-                    candidates.append(
-                        (
-                            dist_f,
-                            {
-                                "document_name": doc_name,
-                                "DutyType": r.get("DutyType") or "",
-                                "Responsible Party": r.get("Responsible_Party") or "",
-                                "Owner Responsibility": [r.get("document") or ""] if r.get("document") else [],
-                                "Reasoning": [],
-                                "Citation": citation,
-                                "category": "Other",
-                            },
-                        )
+                    obligations.append(
+                        {
+                            "document_name": doc_name,
+                            "DutyType": r.get("DutyType") or "",
+                            "Responsible Party": r.get("Responsible_Party") or "",
+                            "Owner Responsibility": [r.get("document") or ""] if r.get("document") else [],
+                            "Reasoning": [],
+                            "Citation": citation,
+                            "category": "Other",
+                        }
                     )
-            candidates = augment_vector_candidates_with_topic_matches(
-                candidates,
-                user_query,
-                doc_to_results,
-                logger=self.logger,
-            )
-            top_k = max(n_results, 200) if _is_short_focused_query(user_query) else max(n_results, 150)
-            obligations = diversify_vector_obligations_for_merge_input(candidates, top_k)
             if skipped_stale_chroma:
                 self.logger.info(
-                    "Skipped %d vector hit(s) whose document_name is not in loaded consolidated JSON "
-                    "(remove output/chroma_db or re-process all documents to clear stale Chroma rows).",
+                    "Skipped %d Chroma row(s) whose document_name is not in loaded consolidated JSON.",
                     skipped_stale_chroma,
                 )
             return obligations
         except Exception as e:
-            self.logger.warning(f"Vector store query failed; pipeline will use LLM filter if needed: {e}")
+            self.logger.warning("Vector store query failed: %s", e)
             return []
 
     def _merge_obligations_from_consolidated_topic_only(
@@ -3759,36 +3758,56 @@ Array of per-document objects containing categorized legal obligations.
 OBJECTIVE:
 Return a comprehensive set of obligations relevant to the user's query. You must capture the ENTIRE functional ecosystem of the queried concept, including related rights, remedies, financial penalties, and execution mechanics.
 
+RESPONSIBLE PARTY — COMPLETENESS (DO NOT DROP BY PARTY):
+- Copy each surviving obligation's **Responsible Party** string **exactly** from the INPUT (same spelling/capitalization). Never blank it, merge two parties into one obligation, or split one party across invented rows.
+- For every **Responsible Party** value that appears on **any** INPUT obligation you judge relevant to the query (even one kept line), **re-scan** the INPUT for **all other obligations with that same Responsible Party**. Keep any obligation where **at least one** "Owner Responsibility" line is **an operational companion** to the query topic (see below). Prefer **false inclusion** of a marginal same-party line over **false exclusion** of a duty that implements the same commercial thread.
+- **Operational companions** (KEEP when the same party already has clearly query-related duties): notice and cure periods, delivery/acceptance conditions, cooperation duties, billing mechanics, true-ups, caps/floors, security or credit support, defaults and remedies, setoff/withholding, timing of performance, exclusivity or carve-outs, and cross-references that only make sense together with the main duty—**even if** the query keywords do not appear verbatim in that line, when **Reasoning** (or the parallel line in the same obligation) ties that line to the query subject.
+
+RELATED LINES — USE REASONING BEFORE DELETING:
+- When deciding on an "Owner Responsibility" line whose literal text is thin on query keywords, read the paired **Reasoning** entry (same index when aligned, otherwise nearest semantic match). If Reasoning shows the line implements payment, risk, timing, or enforcement for the **same subject** as the query, **KEEP** the line.
+- **Same obligation object:** If you KEEP any line in an obligation's "Owner Responsibility" array, re-evaluate the other lines in that **same** object: KEEP a line if it is a prerequisite, consequence, exception, or quantification of the kept line(s) for the same commercial subject (do not strip "notice then pay" down to only one half).
+
 RELEVANCE GUARDRAILS (STRICT):
 1. **Null/Empty Query:** If the user query is "null", "none", empty, or consists only of whitespace, you MUST return a JSON object with an empty `results` array.
-2. **Atomic Filtering:** Evaluate every single string inside "Owner Responsibility" independently. If one line is relevant, KEEP it. If the next line in the same object is NOT relevant, you MUST DROP it. Do not keep a line just because it is bundled with a relevant one.
-3. **Boilerplate vs. Specificity:** Do not keep generic lease obligations (e.g., general maintenance, HVAC, or insurance) unless they specifically mention the query or its direct functional synonyms.
+2. **Atomic Filtering:** Evaluate every single string inside "Owner Responsibility" independently **unless** the RESPONSIBLE PARTY / REASONING / same-obligation companion rules above say to KEEP it. If one line is relevant, KEEP it. If the next line in the same object is NOT relevant and is not a companion, you MUST DROP it. Do not keep a line just because it is bundled with a relevant one **unless** it qualifies as a companion under the rules above.
+3. **Boilerplate vs. Specificity:** Do not keep generic lease obligations (e.g., general maintenance, HVAC, or insurance) **unless** they specifically mention the query or its direct functional synonyms **or** they are **operational companions** (as defined above) to a kept query-related line for the same party or same obligation object.
+4. **Instrument-level boilerplate:** Exclude obligations that only restate generic commercial-lease *legal mechanics* of the instrument (including without limitation: binding on heirs, successors, representatives, or assigns; governing law or jurisdiction; merger of the lease and amendments; entire-agreement or integrated-writing treatment; severability; general interpretation; counterpart execution; routine notice formalities) unless the user query **explicitly** names that legal-mechanics topic **or** the obligation line **directly** imposes duties, limits, costs, timing, or risk allocation about the **same substantive subject** as the query. Vague thematic overlap, shared vocabulary, or broad source-category labels are never sufficient.
+5. **Catch-all categories:** After filtering, omit any INPUT category that has zero surviving obligations. Do **not** create or expand a broad bucket (including `"Other"`) with lines that failed the relevance tests above; reserve `"Other"` only for lines that **pass** those tests yet still lack a tighter label than the source provided.
 
 RELEVANCE RULE (THE "ECOSYSTEM" APPROACH):
-Keep an "Owner Responsibility" line ONLY if it touches ANY of the following as it relates specifically to the query:
+Keep an "Owner Responsibility" line if it touches ANY of the following as it relates specifically to the query (including via Reasoning or same-party companion rules):
   1. Direct Subject: Mentions the query or its direct synonyms.
   2. Mechanics & Operations: How the concept is performed, paid, calculated, or enforced.
   3. Rights, Remedies & Offsets: Legal rights (e.g., abatement, withholding) triggered by the concept.
   4. Penalties & Defaults: Consequences of failing the obligation (e.g., late fees, interest).
 
+QUERY SUBJECT — ANY USER QUERY (NOT LITERAL-ONLY MATCHING):
+- Do **not** treat the user query as only an exact literal substring. Apply **morphological variants**, **defined lease terms**, and **industry-standard synonyms** for the **same substantive subject** the user is asking about.
+- **Infer the substantive subject** from the query (e.g. money, performance, access, compliance, insurance, alterations, timing, remedies — whatever the wording implies). A line is on-topic if it **implements, conditions, quantifies, carves out, notices, or enforces** that subject, even when the line uses different words than the query.
+- **Same obligation object — coherent thread:** If you KEEP **any** "Owner Responsibility" line in a given obligation's array for this query, KEEP **every other line in that same array** that belongs to the **same commercial or operational thread** as the kept line(s): prerequisites and consequences, related charges or true-ups, remedies and defaults **tied to that thread**, cooperation or notice steps **required for that thread**, and cross-references that **only make sense** with the kept subject. DELETE a line in that same array only when it is **clearly a different substantive subject** with **no** thread link to what you kept (not merely because the line also names other lease concepts).
+- **Collateral concepts:** Do **not** drop a line only because it also mentions assignment, subletting, termination, default, insurance, operating expenses, or similar — when the line still **materially advances** the query subject, KEEP it.
+
 FILTERING STRATEGY (THE ALGORITHMIC CHECKLIST):
 Apply this test to every string in the "Owner Responsibility" array:
 1. Is the query "null"? -> DELETE ALL.
-2. Does this specific line explicitly contain the query or a term functionally inseparable from it? -> If YES, KEEP.
-3. Does this specific line describe the payment, interest, or penalty logic for the query? -> If YES, KEEP.
-4. Is this line about a different topic (e.g., HVAC, plumbing, or security) even if it's in a 'Rent' category? -> If YES, DELETE.
-5. If the string answers NO to questions 2 and 3 -> DELETE IT.
+2. Does this line match the query topic by: (a) the query or normal **word variants/inflections** of its terms, OR (b) **synonyms or defined lease vocabulary** for the same substantive subject, OR (c) **same-obligation coherent-thread** linkage to another line in this object you already kept (see QUERY SUBJECT above)? -> If YES, KEEP.
+3. Does this line describe **money, timing, performance, risk, rights, remedies, or penalties** for that same substantive subject (including after default, on transfer, or at lease end when still about that subject)? -> If YES, KEEP.
+4. Does **Reasoning** (or a kept line in the same obligation) establish this line is an **operational companion** for the query topic, or does the **same Responsible Party** already have a kept query-related obligation and this line implements the same thread? -> If YES, KEEP.
+5. Is this line about a **clearly unrelated** substantive subject with **no** thread or companion link under steps 2–4 (not merely because the category label is broad or the line names other lease topics)? -> If YES, DELETE.
+6. If the string answers NO to questions 2, 3, and 4 -> DELETE IT (unless the **same obligation coherent-thread** rule above requires KEEP).
+7. Is this line instrument-level boilerplate under RELEVANCE GUARDRAILS item 4 without satisfying that item's exception? -> If YES, DELETE.
 
 CRITICAL RULE FOR RUN-ON SENTENCES:
-If a single string contains both relevant and irrelevant info (e.g., a sentence covering both Rent and Janitorial services), KEEP the whole string. But if they are separate strings in the array, you MUST filter them individually.
+If a single string contains both relevant and irrelevant info (e.g. one sentence mixing two distinct duties), KEEP the whole string. But if they are separate strings in the array, you MUST filter them individually (unless companion rules apply).
 
 REASONING HANDLING:
 - Retain ONLY the "Reasoning" lines that logically support the "Owner Responsibility" lines you chose to KEEP. 
-- If you delete a responsibility line about HVAC, you MUST delete the reasoning line about HVAC.
+- If you delete a responsibility line, delete paired reasoning that only supported that line.
 
 STRUCTURE PRESERVATION:
-- Keep category names, parties, and citations EXACTLY as provided.
+- Keep category names, **Responsible Party** values, and citations EXACTLY as provided for every retained obligation.
 - If an obligation's "Owner Responsibility" array becomes empty after filtering, remove that entire obligation object.
+- Omit from the output `results` any INPUT category whose obligations were all removed by filtering; never repurpose or refill a category (including broad residual labels) with unrelated survivors.
 
 OUTPUT FORMAT:
 {{
@@ -3810,6 +3829,8 @@ OUTPUT FORMAT:
     }}
   ]
 }}
+
+AGGREGATE FIELDS (REQUIRED): After filtering, set "total_obligations_found" to the exact number of obligation objects in "results" (the sum of each category's "obligations" array lengths). Set "total_categories" to the number of category objects in the top-level "results" array. These counts must match the JSON you emit — do not estimate or round.
 
 User query: {uq}
 
@@ -3908,6 +3929,7 @@ Output only the JSON object:"""
             async for chunk in parse_obligations_stream(token_stream):
                 if isinstance(chunk, dict):
                     streamed.append(chunk)
+                    yield {"type": "category_group", "data": chunk}
 
             payload_stream: Dict[str, Any] = {"results": streamed, "query": user_query}
             apply_query_coherence_to_payload(user_query, payload_stream)
@@ -3919,10 +3941,6 @@ Output only the JSON object:"""
                     "[STREAM] merge produced zero obligations after coherence/normalize (input had %d); leaving merged payload as-is (no retrieval fallback)",
                     n_in,
                 )
-
-            for grp in payload_stream.get("results") or []:
-                if isinstance(grp, dict):
-                    yield {"type": "category_group", "data": grp}
 
             yield {
                 "type": "metadata",
@@ -4017,9 +4035,11 @@ Output only the JSON object:"""
                 final_result["total_documents_searched"] = len(filtered_results)
                 final_result["processed_at"] = datetime.now().isoformat()
                 num_results = int(final_result.get("total_obligations_found") or 0)
+                n_in_skip = _count_obligations_in_filtered(merge_in)
                 self.logger.info(
-                    "[TIMING] merge_and_rank: total - %.3fs (%d obligations, merge LLM skipped)",
+                    "[TIMING] merge_and_rank: total - %.3fs (merge_input=%d, output=%d; merge LLM skipped)",
                     time.perf_counter() - t0,
+                    n_in_skip,
                     num_results,
                 )
                 return final_result
@@ -4027,7 +4047,11 @@ Output only the JSON object:"""
             # 2. Build full merge+rank+filter prompt (no code merge; LLM does filtering, merging, ranking)
             t_step = time.perf_counter()
             merge_prompt = self._build_merge_rank_prompt(user_query, merge_in)
-            self.logger.info(f"[TIMING] merge_and_rank: 2. build_prompt - {time.perf_counter() - t_step:.3f}s")
+            self.logger.info(
+                "[TIMING] merge_and_rank: 2. build_prompt - %.3fs (%d chars; few obligations still mean a long fixed instruction block + full JSON input)",
+                time.perf_counter() - t_step,
+                len(merge_prompt),
+            )
             self.logger.info(f"Merge and rank (LLM) for query: '{user_query}'")
             
             # 3. Call LLM API asynchronously (filter + merge + rank in one call)
@@ -4038,7 +4062,11 @@ Output only the JSON object:"""
                 response_mime_type="application/json",
                 max_output_tokens=_merge_rank_max_output_tokens(),
             )
-            self.logger.info(f"[TIMING] merge_and_rank: 3. llm_api_call - {time.perf_counter() - t_step:.3f}s")
+            t_llm = time.perf_counter() - t_step
+            self.logger.info(
+                "[TIMING] merge_and_rank: 3. llm_api_call - %.3fs (dominates total; mostly provider/model, not row count)",
+                t_llm,
+            )
             
             # 4. Parse JSON (tolerant) or empty shape on failure (no retrieval fallback)
             t_step = time.perf_counter()
@@ -4080,7 +4108,12 @@ Output only the JSON object:"""
             final_result["total_documents_searched"] = len(filtered_results)
             final_result["processed_at"] = datetime.now().isoformat()
             num_results = int(final_result.get("total_obligations_found") or 0)
-            self.logger.info(f"[TIMING] merge_and_rank: total - {time.perf_counter() - t0:.3f}s ({num_results} obligations)")
+            self.logger.info(
+                "[TIMING] merge_and_rank: total - %.3fs (merge_input=%d obligations -> output total_obligations_found=%d; compare step 3 llm_api_call)",
+                time.perf_counter() - t0,
+                n_in,
+                num_results,
+            )
             return final_result
             
         except Exception as e:
@@ -4167,7 +4200,11 @@ Output only the JSON object:"""
             # 2. Build merge prompt (CATEGORY MODE)
             t_step = time.perf_counter()
             merge_prompt = self._build_merge_rank_prompt(user_query, merge_in, category_mode=True)
-            self.logger.info(f"[TIMING] merge_and_rank: 2. build_prompt - {time.perf_counter() - t_step:.3f}s")
+            self.logger.info(
+                "[TIMING] merge_and_rank: 2. build_prompt - %.3fs (%d chars)",
+                time.perf_counter() - t_step,
+                len(merge_prompt),
+            )
             self.logger.info(f"Merge and rank (LLM CATEGORY MODE) for query: '{user_query}'")
             
             # 3. Call LLM API asynchronously (filter + merge + rank in one call)
@@ -4178,7 +4215,10 @@ Output only the JSON object:"""
                 response_mime_type="application/json",
                 max_output_tokens=_merge_rank_max_output_tokens(),
             )
-            self.logger.info(f"[TIMING] merge_and_rank: 3. llm_api_call - {time.perf_counter() - t_step:.3f}s")
+            self.logger.info(
+                "[TIMING] merge_and_rank: 3. llm_api_call - %.3fs (dominates total; mostly provider/model)",
+                time.perf_counter() - t_step,
+            )
 
             # 4. Parse JSON (tolerant) or empty shape on failure (no retrieval fallback)
             t_step = time.perf_counter()
@@ -4211,8 +4251,14 @@ Output only the JSON object:"""
             apply_query_coherence_to_payload(user_query, final_result)
             self.logger.info(f"[TIMING] merge_and_rank: 6. normalize_shape - {time.perf_counter() - t_step:.3f}s")
 
-            obligations_found = final_result.get("total_obligations_found", 0)
-            self.logger.info(f"[TIMING] merge_and_rank: total - {time.perf_counter() - t_start:.3f}s ({obligations_found} obligations)")
+            obligations_found = int(final_result.get("total_obligations_found") or 0)
+            n_in_cat = _count_obligations_in_filtered(merge_in)
+            self.logger.info(
+                "[TIMING] merge_and_rank: total - %.3fs (merge_input=%d obligations -> output=%d)",
+                time.perf_counter() - t_start,
+                n_in_cat,
+                obligations_found,
+            )
 
             return final_result
 
@@ -4244,13 +4290,14 @@ Output only the JSON object:"""
             self.logger.info("[TIMING] Individual obligation-based query - start")
 
             if not self._vector_store_available():
-                self.logger.warning("vector_store module missing; using consolidated JSON LLM filter")
-                return await self.query_legacy(
-                    user_query,
-                    save_output,
-                    document_ids,
-                    use_category_mode_override=False,
-                )
+                self.logger.error("vector_store module missing; semantic search is required")
+                return {
+                    "query": user_query,
+                    "results": {},
+                    "search_method": "individual_obligations",
+                    "error": "vector_store module not available",
+                    "processed_at": datetime.now().isoformat(),
+                }
             
             # Default query handling
             if not user_query or user_query.strip() == "":
@@ -4262,48 +4309,68 @@ Output only the JSON object:"""
             if document_ids:
                 self.logger.info(f"Filtering by document_ids: {document_ids}")
             self.logger.info("=" * 80)
-            
-            # Step 1: Query individual obligations via semantic search
-            t_individual_search = time.perf_counter()
-            self.logger.info("[TIMING] Step: individual obligation semantic search - start")
-            
-            individual_results = self._query_individual_obligations_vector_store(
-                user_query,
-                n_results=30,  # Get more candidates for better results
-                document_ids=document_ids,
-                max_distance=2.0  # Filter for relevance
+            try:
+                from force_terminal_logger import force_logger
+
+                force_logger.info(
+                    "[QUERY] Semantic search top_k=%d (set LEGAL_OCR_SEMANTIC_SEARCH_TOP_K or VECTOR_SEARCH_TOP_K in .env)",
+                    _semantic_search_top_k(),
+                )
+            except Exception:
+                pass
+
+            # Retrieval + merge input (same pipeline as POST /query)
+            t_retrieval = time.perf_counter()
+            self.logger.info("[TIMING] Step: build merge input (vector + load + group) - start")
+
+            merge_in, document_name_to_id = await self.build_merge_input_like_post_query(
+                user_query, document_ids=document_ids
             )
-            dt_individual_search = time.perf_counter() - t_individual_search
+            dt_retrieval = time.perf_counter() - t_retrieval
+            self.logger.info(
+                "[TIMING] Step: build merge input - done in %.3fs (%d document block(s) for merge)",
+                dt_retrieval,
+                len(merge_in),
+            )
 
-            self.logger.info(f"[TIMING] Step: individual obligation semantic search - done in {dt_individual_search:.3f}s ({len(individual_results)} obligations)")
-            
-            if not individual_results:
-                self.logger.info("No matching individual obligations found; falling back to category-based approach")
-                return await self.query_by_categories(user_query, save_output, document_ids)
-            
-            # Step 2: Load full obligation details for the matched individuals
-            t_load_details = time.perf_counter()
-            self.logger.info("[TIMING] Step: loading full obligation details - start")
-            
-            full_obligations = await self._load_full_obligation_details_async(individual_results)
-            dt_load_details = time.perf_counter() - t_load_details
+            if not merge_in:
+                self.logger.info(
+                    "No Chroma semantic hits (top_k=%d only; no category or consolidated fallback).",
+                    _semantic_search_top_k(),
+                )
+                return {
+                    "query": user_query,
+                    "results": {
+                        "query": user_query,
+                        "total_documents_searched": 0,
+                        "total_obligations_found": 0,
+                        "total_categories": 0,
+                        "results": [],
+                        "processed_at": datetime.now().isoformat(),
+                    },
+                    "search_method": "individual_obligations",
+                    "total_found": 0,
+                    "after_llm_filtering": 0,
+                    "query_time_seconds": time.perf_counter() - query_start,
+                    "metadata": {
+                        "semantic_top_k": _semantic_search_top_k(),
+                        "document_filters": document_ids,
+                        "retrieval_time_seconds": dt_retrieval,
+                        "note": "Empty semantic retrieval; LLM merge not run.",
+                    },
+                }
 
-            self.logger.info(f"[TIMING] Step: loading full obligation details - done in {dt_load_details:.3f}s ({len(full_obligations)} full obligations)")
-            
-            # Step 3: Group by categories for LLM processing
-            categorized_obligations = self._group_obligations_by_source_category(full_obligations)
-            
-            # Step 4: Process with LLM for final filtering and ranking
+            # Merge / rank (same LLM step as streaming endpoints)
             t_llm_processing = time.perf_counter()
-            self.logger.info("[TIMING] Step: LLM filtering and ranking - start")
+            self.logger.info("[TIMING] Step: merge_and_rank (LLM) - start")
 
-            formatted_results = await self._process_obligations_with_llm_async(
-                user_query, categorized_obligations, "individual_obligations"
+            formatted_results = await self.merge_and_rank_results(
+                user_query, merge_in, document_name_to_id
             )
             dt_llm_processing = time.perf_counter() - t_llm_processing
 
             self.logger.info(
-                "[TIMING] Step: LLM filtering and ranking - done in %.3fs",
+                "[TIMING] Step: merge_and_rank (LLM) - done in %.3fs",
                 dt_llm_processing,
             )
             
@@ -4319,22 +4386,26 @@ Output only the JSON object:"""
                 "query": user_query,
                 "results": formatted_results,
                 "search_method": "individual_obligations",
-                "total_found": len(individual_results),
+                "total_found": _count_obligations_in_filtered(merge_in),
                 "after_llm_filtering": int(formatted_results.get("total_obligations_found") or 0),
                 "query_time_seconds": query_elapsed,
                 "metadata": {
-                    "individual_search_time": dt_individual_search,
-                    "load_details_time": dt_load_details,
+                    "retrieval_time_seconds": dt_retrieval,
                     "llm_processing_time": dt_llm_processing,
                     "document_filters": document_ids,
+                    "semantic_top_k": _semantic_search_top_k(),
                 },
             }
             
         except Exception as e:
             self.logger.error(f"Individual obligation query failed: {e}", exc_info=True)
-            # Fallback to category-based approach
-            self.logger.info("Falling back to category-based query due to error")
-            return await self.query_by_categories(user_query, save_output, document_ids)
+            return {
+                "query": user_query,
+                "results": {},
+                "search_method": "individual_obligations",
+                "error": str(e),
+                "processed_at": datetime.now().isoformat(),
+            }
 
     async def query_by_categories(self, user_query: str, save_output: bool = True, document_ids: Optional[List[str]] = None) -> Dict[str, Any]:
         """
@@ -4559,22 +4630,11 @@ Output only the JSON object:"""
                 self.logger.info(f"Filtering by document_ids: {document_ids}")
             self.logger.info("=" * 80)
             
-            # Step 1: Try vector store first (semantic search over obligation chunks)
+            # Step 1: Semantic vector search (top_k only; no consolidated topic fallback)
             t_vector = time.perf_counter()
             self.logger.info("[TIMING] Step: vector store query - start")
-            vector_obligations = self._query_vector_store(user_query, n_results=100, document_ids=document_ids)
+            vector_obligations = self._query_vector_store(user_query, document_ids=document_ids)
             self.logger.info(f"[TIMING] Step: vector store query - done in {time.perf_counter() - t_vector:.3f}s ({len(vector_obligations)} results)")
-            if not vector_obligations:
-                vector_obligations = self._merge_obligations_from_consolidated_topic_only(
-                    user_query,
-                    self.load_consolidated_jsons(),
-                    document_ids,
-                )
-                if vector_obligations:
-                    self.logger.info(
-                        "Using consolidated topic fallback (%d rows); Chroma had no usable hits",
-                        len(vector_obligations),
-                    )
             
             if vector_obligations:
                 # Group vector hits by document and extraction category (nested results[] for merge)
@@ -4607,187 +4667,23 @@ Output only the JSON object:"""
                 self.logger.info(f"Query complete: Found {final_result.get('total_obligations_found', 0)} obligations (vector + merge/rank)")
                 return final_result
             
-            # Step 2: Fallback to consolidated JSON + LLM filter + merge
-            self.logger.info("No vector results; using consolidated JSON + LLM filter")
-            consolidated_files = self.load_consolidated_jsons()
-            
-            if not consolidated_files:
-                return {
-                    "query": user_query,
-                    "total_documents_searched": 0,
-                    "total_obligations_found": 0,
-                    "total_categories": 0,
-                    "results": [],
-                    "processed_at": datetime.now().isoformat(),
-                    "error": "No consolidated JSON files or vector store results found"
-                }
-            
-            # Filter by document_ids if provided
-            if document_ids:
-                t_doc_filter = time.perf_counter()
-                self.logger.info("[TIMING] Step: filter by document_ids - start")
-                def extract_doc_name_from_url(url: str) -> str:
-                    """Extract document name from URL, handling encoding and query params"""
-                    try:
-                        parsed = urlparse(url)
-                        path = parsed.path
-                        filename = path.split('/')[-1]
-                        filename = unquote(filename)
-                        if '?' in filename:
-                            filename = filename.split('?')[0]
-                        return filename
-                    except Exception as e:
-                        self.logger.warning(f"Error extracting doc name from URL {url}: {e}")
-                        return url
-                
-                # Accept filenames or paths; normalize to document name for matching
-                normalized_doc_ids = {}
-                for doc_id in document_ids:
-                    d = (doc_id or "").strip()
-                    if not d:
-                        continue
-                    name = Path(d).name or d
-                    normalized_doc_ids[name.lower()] = doc_id
-                self.logger.info(f"Filtering by {len(normalized_doc_ids)} document(s)")
-                
-                filtered_files = []
-                seen_documents = set()  # Track documents we've already added to prevent duplicates
-                
-                for file_info in consolidated_files:
-                    document_name = file_info.get("document_name", "")
-                    file_path = file_info.get("file_path", "")
-                    
-                    # Normalize document name for comparison (lowercase, remove extra spaces)
-                    normalized_doc_name = document_name.lower().strip()
-                    
-                    # Skip if we've already processed this document
-                    if normalized_doc_name in seen_documents:
-                        self.logger.warning(f"Skipping duplicate document: {document_name} (already processed)")
-                        continue
-                    
-                    # SECURITY: Only allow exact matches after normalization
-                    # This prevents partial/fuzzy matching that could allow unauthorized access
-                    matched = False
-                    matched_doc_id = None
-                    match_reason = None
-                    
-                    for norm_name, original_doc_id in normalized_doc_ids.items():
-                        # SECURITY: Only exact match allowed (after normalization)
-                        # This ensures the provided URL's filename exactly matches the document name
-                        if norm_name == normalized_doc_name:
-                            matched = True
-                            matched_doc_id = original_doc_id
-                            match_reason = "exact match"
-                            break
-                        
-                        # SECURITY: Also allow exact match without extension (handles .pdf vs no extension)
-                        # But only if the base names are exactly equal
-                        doc_name_no_ext = norm_name.rsplit('.', 1)[0] if '.' in norm_name else norm_name
-                        doc_name_normalized_no_ext = normalized_doc_name.rsplit('.', 1)[0] if '.' in normalized_doc_name else normalized_doc_name
-                        
-                        if doc_name_no_ext == doc_name_normalized_no_ext and doc_name_no_ext:
-                            matched = True
-                            matched_doc_id = original_doc_id
-                            match_reason = f"exact match (without extension): '{doc_name_no_ext}'"
-                            break
-                    
-                    if matched:
-                        # Store the matched doc_id with the file_info for later use
-                        file_info["matched_doc_id"] = matched_doc_id
-                        filtered_files.append(file_info)
-                        seen_documents.add(normalized_doc_name)
-                        self.logger.info(f"Matched document: '{document_name}' -> '{matched_doc_id}' (reason: {match_reason})")
-                    else:
-                        self.logger.debug(f"No match for document: '{document_name}' (checked against {len(normalized_doc_ids)} validated document IDs)")
-                
-                if not filtered_files:
-                    self.logger.warning(
-                        f"SECURITY: No documents matched the provided document_ids. "
-                        f"This may indicate unauthorized access attempt or incorrect URLs."
-                    )
-                    self.logger.info(f"Requested document IDs: {document_ids}")
-                    self.logger.info(f"Available documents: {[f.get('document_name') for f in consolidated_files]}")
-                    return {
-                        "query": user_query,
-                        "total_documents_searched": 0,
-                        "total_obligations_found": 0,
-                        "total_categories": 0,
-                        "results": [],
-                        "processed_at": datetime.now().isoformat(),
-                        "error": f"No documents found matching the provided document_ids. Please ensure you provide full URLs pointing to the Documents folder."
-                    }
-                
-                consolidated_files = filtered_files
-                self.logger.info(
-                    f"SECURITY: Filtered to {len(consolidated_files)} document(s) matching "
-                    f"{len(document_ids)} validated document ID(s)"
-                )
-                if len(consolidated_files) != len(document_ids):
-                    self.logger.warning(
-                        f"SECURITY: Mismatch - {len(document_ids)} document ID(s) requested, "
-                        f"but {len(consolidated_files)} document(s) matched. "
-                        f"Some documents may not exist or URLs may be incorrect."
-                    )
-                self.logger.info(f"Matched documents: {[f.get('document_name') for f in consolidated_files]}")
-                self.logger.info(f"[TIMING] Step: filter by document_ids - done in {time.perf_counter() - t_doc_filter:.3f}s")
-            
-            # Create mapping of document_name to document_id for citation restructuring
-            t_map = time.perf_counter()
-            self.logger.info("[TIMING] Step: build document_name_to_id - start")
-            document_name_to_id = {}
-            if document_ids:
-                # Use the matched_doc_id stored in file_info
-                for file_info in consolidated_files:
-                    doc_name = file_info.get("document_name", "")
-                    matched_doc_id = file_info.get("matched_doc_id")
-                    if matched_doc_id:
-                        document_name_to_id[doc_name] = matched_doc_id
-                        self.logger.info(f"Mapped document name '{doc_name}' to doc_id '{matched_doc_id}'")
-            self.logger.info(f"[TIMING] Step: build document_name_to_id - done in {time.perf_counter() - t_map:.3f}s")
-            
-            # Step 2: Process each consolidated JSON in PARALLEL
-            # OPTIMIZATION: Use asyncio.gather to filter all documents concurrently
-            t_filter_all = time.perf_counter()
-            self.logger.info(f"[TIMING] Step: filter all documents (parallel) - start ({len(consolidated_files)} docs)")
-            self.logger.info(f"Filtering {len(consolidated_files)} documents in parallel...")
-            
-            filter_tasks = [
-                self.filter_obligations_by_query(
-                    user_query,
-                    file_info["data"],
-                    file_info["document_name"]
-                )
-                for file_info in consolidated_files
-            ]
-            
-            # Wait for all filtering to complete in parallel
-            filtered_results = await asyncio.gather(*filter_tasks)
-            self.logger.info(f"[TIMING] Step: filter all documents (parallel) - done in {time.perf_counter() - t_filter_all:.3f}s")
-            
-            # Step 3: Merge and rank all results with document_id mapping
-            t_merge = time.perf_counter()
-            self.logger.info("[TIMING] Step: merge_and_rank - start")
-            final_result = await self.merge_and_rank_results(user_query, filtered_results, document_name_to_id)
-            self.logger.info(f"[TIMING] Step: merge_and_rank - done in {time.perf_counter() - t_merge:.3f}s")
-            
-            # Add timestamp
-            final_result["processed_at"] = datetime.now().isoformat()
-            
-            # Save output if requested
-            if save_output:
-                t_save = time.perf_counter()
-                self.logger.info("[TIMING] Step: save_query_result - start")
-                self._save_query_result(user_query, final_result)
-                self.logger.info(f"[TIMING] Step: save_query_result - done in {time.perf_counter() - t_save:.3f}s")
-            
+            self.logger.info(
+                "No semantic vector hits (top_k=%d only; no consolidated/LLM retrieval fallback).",
+                _semantic_search_top_k(),
+            )
             total_elapsed = time.perf_counter() - query_start
-            self.logger.info("=" * 80)
-            self.logger.info(f"[TIMING] Query total - done in {total_elapsed:.3f}s")
-            self.logger.info(f"Query complete: Found {final_result.get('total_obligations_found', 0)} relevant obligations")
-            self.logger.info("=" * 80)
-            
-            return final_result
-            
+            return {
+                "query": user_query,
+                "total_documents_searched": 0,
+                "total_obligations_found": 0,
+                "total_categories": 0,
+                "results": [],
+                "processed_at": datetime.now().isoformat(),
+                "semantic_top_k": _semantic_search_top_k(),
+                "message": "No Chroma semantic matches within configured top_k.",
+                "query_time_seconds": total_elapsed,
+            }
+
         except Exception as e:
             self.logger.error(f"Error processing query: {e}", exc_info=True)
             return {
@@ -5176,10 +5072,13 @@ async def query_obligations_post(request: Optional[QueryRequest] = Body(default=
 @app.post("/query/stream/raw", tags=["Query"])
 async def query_obligations_stream_raw(request: Optional[QueryRequest] = Body(default=None)):
     """
-    Stream RAW LLM tokens as they're generated during merge and rank.
-    Shows the actual token-by-token generation from GPT-4o-mini.
-    
-    Returns raw text stream showing LLM generating the JSON response in real-time.
+    Merge/rank with the same prompt as POST /query. LLM tokens are written to the **server console**
+    only (not the HTTP response body), so wrong root totals never appear in the client stream.
+
+    The HTTP body receives: progress lines (STEP 1/2, separators), a ``[COMPLETE]`` line, then **one**
+    pretty-printed JSON object after ``parse_llm_json_object`` + ``normalize_query_response_shape``,
+    so ``total_obligations_found``, ``total_categories``, and ``total_documents_searched`` match
+    ``results[]`` and match POST /query shaping where applicable.
     """
     if query_system_instance is None:
         raise HTTPException(status_code=503, detail="Query system not initialized")
@@ -5189,81 +5088,62 @@ async def query_obligations_stream_raw(request: Optional[QueryRequest] = Body(de
     
     async def raw_token_generator():
         try:
-            # Load and filter documents
             qs = query_system_instance
             if req.output_folder:
                 qs = ObligationQuerySystem(local_output_folder=req.output_folder, model=get_default_model())
-            consolidated_files = qs.load_consolidated_jsons()
-            
-            if req.document_ids:
-                consolidated_files = [
-                    f for f in consolidated_files
-                    if any(doc_id in f["document_name"] or doc_id in f["file_name"] for doc_id in req.document_ids)
-                ]
-            
+
             def _echo(chunk: str):
                 sys.stdout.write(chunk)
                 sys.stdout.flush()
                 return chunk
-            
-            if not consolidated_files:
-                _echo("[ERROR] No documents found\n")
-                yield "[ERROR] No documents found\n"
+
+            if not qs.load_consolidated_jsons():
+                logging.warning("[STREAM/raw] no consolidated documents")
+                _echo("[ERROR] No consolidated documents found\n")
+                yield "[ERROR] No consolidated documents found\n"
                 return
-            
-            # Step 1: Vector search for filtering (same as main query())
+
+            tk = _semantic_search_top_k()
+            logging.info("[STREAM/raw] pipeline=POST /query top_k=%d", tk)
             _echo(f"[QUERY] {user_query}\n")
             yield f"[QUERY] {user_query}\n"
-            _echo("[STEP 1] Vector search...\n")
-            yield "[STEP 1] Vector search...\n"
-            vector_obligations = qs._query_vector_store(user_query, n_results=100, document_ids=req.document_ids)
-            if not vector_obligations:
-                vector_obligations = qs._merge_obligations_from_consolidated_topic_only(
-                    user_query, consolidated_files, req.document_ids
-                )
-            _echo(f"[STEP 1] Found {len(vector_obligations)} vector results\n")
-            yield f"[STEP 1] Found {len(vector_obligations)} vector results\n"
-            
-            if vector_obligations:
-                _echo("[STEP 2] Using vector results for filtering (no LLM filter)\n")
-                yield "[STEP 2] Using vector results for filtering (no LLM filter)\n"
-                filtered_results = grouped_merge_input_from_vector_obligations(vector_obligations)
-                filtered_results = expand_grouped_vector_merge_to_full_categories(
-                    filtered_results,
-                    consolidated_files,
-                    logger=logging.getLogger(__name__),
-                )
-            else:
-                _echo("[STEP 2] No vector results; LLM filtering each document...\n")
-                yield "[STEP 2] No vector results; LLM filtering each document...\n"
-                filter_tasks = [
-                    qs.filter_obligations_by_query(user_query, f["data"], f["document_name"])
-                    for f in consolidated_files
-                ]
-                filtered_results = await asyncio.gather(*filter_tasks)
-            _echo("[STEP 2] Filtering complete\n")
-            yield "[STEP 2] Filtering complete\n"
-            
-            non_empty_fr = [r for r in filtered_results if _filtered_fr_has_payload(r)]
+
+            _echo(f"[STEP 1] Building merge input (vector → consolidated → group), top_k={tk}...\n")
+            yield f"[STEP 1] Building merge input (vector → consolidated → group), top_k={tk}...\n"
+
+            merge_blocks, _document_name_to_id = await qs.build_merge_input_like_post_query(
+                user_query, req.document_ids
+            )
+            if not merge_blocks:
+                msg = f"[STEP 1] No semantic hits (top_k={tk}). Done.\n"
+                logging.info("[STREAM/raw] no semantic hits top_k=%d", tk)
+                _echo(msg)
+                yield msg
+                return
+
+            non_empty_fr = [r for r in merge_blocks if _filtered_fr_has_payload(r)]
             merge_in, _ = cap_merge_filtered_results(
                 non_empty_fr,
                 _merge_max_input_obligations_for_query(user_query, document_blocks=len(non_empty_fr)),
             )
-            
-            _echo("[STEP 3] Merging and ranking (streaming LLM tokens)...\n")
-            yield "[STEP 3] Merging and ranking (streaming LLM tokens)...\n"
-            _echo("="*80 + "\n")
-            yield "="*80 + "\n"
-            _echo("RAW LLM OUTPUT (watch it generate in real-time):\n")
-            yield "RAW LLM OUTPUT (watch it generate in real-time):\n"
-            _echo("="*80 + "\n")
-            yield "="*80 + "\n"
-            
-            # Same merge/rank prompt as /query and /query/stream so results are consistent
+            n_in = _count_obligations_in_filtered(merge_in)
+            logging.info("[STREAM/raw] merge_input obligations=%d (after cap)", n_in)
+            _echo(f"[STEP 1] Merge input ready ({n_in} obligation(s) after cap)\n")
+            yield f"[STEP 1] Merge input ready ({n_in} obligation(s) after cap)\n"
+
+            _echo("[STEP 2] Merge/rank LLM — generating merge JSON (token stream mirrored to server console only)...\n")
+            yield "[STEP 2] Merge/rank LLM — generating merge JSON (token stream mirrored to server console only)...\n"
+            _echo("=" * 80 + "\n")
+            yield "=" * 80 + "\n"
+            _echo("MERGE JSON (single corrected payload below; root totals match results[]):\n")
+            yield "MERGE JSON (single corrected payload below; root totals match results[]):\n"
+            _echo("=" * 80 + "\n")
+            yield "=" * 80 + "\n"
+
             merge_prompt = qs._build_merge_rank_prompt(user_query, merge_in)
-            
-            # Stream raw tokens (and echo to terminal so you see stream when using Postman)
+
             token_count = 0
+            merge_json_buf: List[str] = []
             async for token in generate_content_stream(
                 prompt=merge_prompt,
                 model=qs.model,
@@ -5272,21 +5152,52 @@ async def query_obligations_stream_raw(request: Optional[QueryRequest] = Body(de
                 max_output_tokens=_merge_rank_max_output_tokens(),
             ):
                 token_count += 1
+                merge_json_buf.append(token)
                 sys.stdout.write(token)
                 sys.stdout.flush()
-                yield token
-                
+                if token_count % 200 == 0:
+                    logging.info("[STREAM/raw] streamed_tokens=%d", token_count)
+
                 if token_count % 100 == 0:
                     progress = f"\n[{token_count} tokens]\n"
                     sys.stdout.write(progress)
                     sys.stdout.flush()
-                    yield progress
-            
-            tail = "\n" + "="*80 + "\n" + f"[COMPLETE] Generated {token_count} tokens\n" + "="*80 + "\n"
+
+            tail = "\n" + "=" * 80 + "\n" + f"[COMPLETE] Generated {token_count} tokens\n" + "=" * 80 + "\n"
             sys.stdout.write(tail)
             sys.stdout.flush()
+            logging.info("[STREAM/raw] complete tokens=%d", token_count)
             yield tail
-            
+
+            raw_joined = "".join(merge_json_buf)
+            try:
+                parsed_merge = parse_llm_json_object(raw_joined)
+                parsed_merge.setdefault("query", user_query)
+                parsed_merge["total_documents_searched"] = len(merge_in)
+                convert_result_citations_to_structured(parsed_merge, merge_in)
+                normalize_query_response_shape(parsed_merge, merge_in)
+                parsed_merge["processed_at"] = datetime.now().isoformat()
+                corrected = json.dumps(parsed_merge, indent=2, ensure_ascii=False) + "\n"
+                sys.stdout.write(corrected)
+                sys.stdout.flush()
+                yield corrected
+                logging.info(
+                    "[STREAM/raw] emitted reconciled merge JSON obligations=%s categories=%s",
+                    parsed_merge.get("total_obligations_found"),
+                    parsed_merge.get("total_categories"),
+                )
+            except Exception as ex:
+                skip_obj = {
+                    "error": "parse_or_normalize_failed",
+                    "message": str(ex),
+                    "raw_merge_text_head": raw_joined[:2500],
+                }
+                skip_msg = "\n" + json.dumps(skip_obj, indent=2, ensure_ascii=False) + "\n"
+                sys.stdout.write(skip_msg)
+                sys.stdout.flush()
+                yield skip_msg
+                logging.warning("[STREAM/raw] merge JSON reconcile failed: %s", ex)
+
         except Exception as e:
             err = f"\n[ERROR] {str(e)}\n"
             import traceback
@@ -5303,8 +5214,8 @@ async def query_obligations_stream(request: Optional[QueryRequest] = Body(defaul
     """
     NDJSON stream of merge results: each parsed category group, then metadata with counts.
 
-    Uses the same merge/rank prompt and filtering as POST /query and /query/stream/raw.
-    For raw token-by-token streaming, use POST /query/stream/raw.
+    Uses the same pipeline as POST /query: ``build_merge_input_like_post_query`` then
+    ``merge_and_rank_results_stream`` (semantic top_k → consolidated rows → merge/rank LLM).
 
     Each line is one JSON object followed by newline:
     - {"type": "category_group", "data": {"category", "obligations"}}
@@ -5319,12 +5230,11 @@ async def query_obligations_stream(request: Optional[QueryRequest] = Body(defaul
     
     async def event_generator():
         try:
-            from force_terminal_logger import force_logger
             if hasattr(sys.stdout, "reconfigure"):
                 sys.stdout.reconfigure(line_buffering=True)
 
             def _write_stream_line(line: str):
-                """Write stream output directly to terminal (and flush)."""
+                """Mirror NDJSON to the server process stdout only (response body is the source of truth)."""
                 try:
                     sys.stdout.write(line)
                     sys.stdout.flush()
@@ -5332,100 +5242,70 @@ async def query_obligations_stream(request: Optional[QueryRequest] = Body(defaul
                         sys.__stdout__.write(line)
                         sys.__stdout__.flush()
                 except Exception:
-                    force_logger.info(line.strip())
+                    pass
 
             qs = query_system_instance
             if req.output_folder:
                 qs = ObligationQuerySystem(local_output_folder=req.output_folder, model=get_default_model())
-            
-            consolidated_files = qs.load_consolidated_jsons()
-            
-            if req.document_ids:
-                consolidated_files = [
-                    f for f in consolidated_files
-                    if any(doc_id in f["document_name"] or doc_id in f["file_name"] for doc_id in req.document_ids)
-                ]
-            
-            if not consolidated_files:
-                force_logger.info("[STREAM] No documents found for query")
-                yield json.dumps({"type": "error", "message": "No documents found"}) + "\n"
+
+            if not qs.load_consolidated_jsons():
+                logging.warning("[STREAM] No consolidated documents found")
+                yield json.dumps({"type": "error", "message": "No consolidated documents found"}) + "\n"
                 return
-            
-            document_name_to_id = {}
-            for file_info in consolidated_files:
-                doc_name = file_info["document_name"]
-                doc_id = file_info.get("data", {}).get("document_id") or doc_name
-                document_name_to_id[doc_name] = doc_id
-            if req.document_ids:
-                for doc_id in req.document_ids:
-                    d = (doc_id or "").strip()
-                    if d:
-                        name = Path(d).name or d
-                        document_name_to_id[name] = doc_id
-                        document_name_to_id[name.lower()] = doc_id
-            
-            # Step 1: Vector search for filtering (same as main query())
-            t_vector = time.perf_counter()
-            vector_obligations = qs._query_vector_store(user_query, n_results=100, document_ids=req.document_ids)
-            if not vector_obligations:
-                vector_obligations = qs._merge_obligations_from_consolidated_topic_only(
-                    user_query, consolidated_files, req.document_ids
-                )
-                if vector_obligations:
-                    logging.info("[STREAM] Consolidated topic fallback (%d rows); Chroma empty", len(vector_obligations))
-            elapsed_vector = time.perf_counter() - t_vector
+
+            tk = _semantic_search_top_k()
             logging.info(
-                "[STREAM] Retrieval: %d obligation row(s) after vector + optional consolidated fallback (%.2fs)",
-                len(vector_obligations),
-                elapsed_vector,
-            )
-            force_logger.info(
-                f"[STREAM] Retrieval complete: {len(vector_obligations)} obligation row(s) "
-                f"after vector + optional consolidated fallback ({elapsed_vector:.2f}s)"
+                "[STREAM] pipeline=POST /query | top_k=%d (LEGAL_OCR_SEMANTIC_SEARCH_TOP_K)",
+                tk,
             )
 
-            if vector_obligations:
-                # Vector path: group by document + extraction category for merge (nested results[])
-                logging.info(f"[STREAM] Using vector results for filtering (no per-document LLM filter)")
-                force_logger.info("[STREAM] Using vector results for filtering (no per-document LLM filter)")
-                filtered_results = grouped_merge_input_from_vector_obligations(vector_obligations)
-                filtered_results = expand_grouped_vector_merge_to_full_categories(
-                    filtered_results,
-                    consolidated_files,
-                    logger=logging.getLogger(__name__),
-                )
-            else:
-                # Fallback: LLM filter each document then merge/rank
-                logging.info(f"[STREAM] No vector results; using LLM filter per document")
-                force_logger.info("[STREAM] No vector results; using LLM filter per document")
-                filter_tasks = [
-                    qs.filter_obligations_by_query(
-                        user_query,
-                        file_info["data"],
-                        file_info["document_name"]
-                    )
-                    for file_info in consolidated_files
-                ]
-                filtered_results = await asyncio.gather(*filter_tasks)
-            
-            total_for_merge = _count_obligations_in_filtered(filtered_results)
-            logging.info(f"[STREAM] Merge and rank LLM call - start (input: {total_for_merge} obligations from {len(filtered_results)} doc(s))")
-            force_logger.info(
-                f"[STREAM] Merge and rank LLM call - start (input: {total_for_merge} obligations from {len(filtered_results)} doc(s))"
+            t_vector = time.perf_counter()
+            merge_in, document_name_to_id = await qs.build_merge_input_like_post_query(
+                user_query, req.document_ids
             )
-            
-            # Step 2: Stream merge and rank results (echo to terminal so you see stream when using Postman)
+            elapsed_vector = time.perf_counter() - t_vector
+
+            if not merge_in:
+                logging.info(
+                    "[STREAM] no semantic hits top_k=%d (%.2fs)",
+                    tk,
+                    elapsed_vector,
+                )
+                yield json.dumps(
+                    {
+                        "type": "error",
+                        "message": f"No semantic vector hits (top_k={tk}).",
+                    }
+                ) + "\n"
+                return
+
+            n_in = _count_obligations_in_filtered(merge_in)
+            logging.info(
+                "[STREAM] merge_input ready obligations=%d blocks=%d (%.2fs)",
+                n_in,
+                len(merge_in),
+                elapsed_vector,
+            )
+
+            total_for_merge = n_in
+            logging.info(
+                "[STREAM] merge_rank_llm_start obligations=%d blocks=%d",
+                total_for_merge,
+                len(merge_in),
+            )
+
             obligation_stream_count = 0
-            async for event in qs.merge_and_rank_results_stream(user_query, filtered_results, document_name_to_id):
+            async for event in qs.merge_and_rank_results_stream(user_query, merge_in, document_name_to_id):
                 if event.get("type") == "category_group":
                     obligation_stream_count += len((event.get("data") or {}).get("obligations") or [])
-                line = json.dumps(event) + "\n"
+                line = json.dumps(event, separators=(",", ":"), ensure_ascii=False) + "\n"
                 _write_stream_line(line)
-                force_logger.info(f"[STREAM EVENT] {line.strip()}")
                 yield line
-            
-            logging.info(f"[STREAM] Merge and rank LLM call - complete (streamed {obligation_stream_count} obligations)")
-            force_logger.info(f"[STREAM] Merge and rank LLM call - complete (streamed {obligation_stream_count} obligations)")
+
+            logging.info(
+                "[STREAM] merge_rank_llm_done streamed_obligations=%d",
+                obligation_stream_count,
+            )
             
         except Exception as e:
             logging.error(f"Error in streaming query: {e}", exc_info=True)

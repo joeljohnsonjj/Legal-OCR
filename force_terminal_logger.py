@@ -15,28 +15,19 @@ class ForceTerminalLogger:
             sys.stdout.reconfigure(line_buffering=True)
     
     def _write_message(self, level: str, message: str):
-        """Write message using multiple methods to ensure it shows"""
+        """Write one line to the terminal (avoid duplicate print + stdout)."""
         if not self.enabled:
             return
-            
+
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         formatted_msg = f"[{timestamp}] {level}: {message}"
-        
+
         try:
-            # Method 1: Direct print with flush (safest for Unicode)
             print(formatted_msg, flush=True)
-            
-            # Method 2: sys.stdout with encoding handling
-            sys.stdout.write(f"{formatted_msg}\n")
-            sys.stdout.flush()
-            
         except UnicodeEncodeError:
-            # Fallback: Remove emojis and special characters
-            safe_message = message.encode('ascii', 'ignore').decode('ascii')
+            safe_message = message.encode("ascii", "ignore").decode("ascii")
             safe_formatted = f"[{timestamp}] {level}: {safe_message}"
             print(safe_formatted, flush=True)
-            sys.stdout.write(f"{safe_formatted}\n")
-            sys.stdout.flush()
         
     def info(self, message: str):
         """Log info message"""

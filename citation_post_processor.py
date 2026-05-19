@@ -29,10 +29,34 @@ def calculate_similarity(text1: str, text2: str) -> float:
     norm2 = normalize_text(text2)
     return SequenceMatcher(None, norm1, norm2).ratio()
 
+def _party_category_lookup_keys(
+    party_canon: str,
+    party_raw: str,
+    category: str,
+) -> List[str]:
+    """
+    Build one or two index keys so consolidated obligations match whether
+    ``Responsible Party`` is a role label, a legal name, or both.
+    """
+    cat_norm = normalize_text(category)
+    keys: List[str] = []
+    k_canon = f"{normalize_text(party_canon)}|{cat_norm}"
+    keys.append(k_canon)
+    raw = (party_raw or "").strip()
+    if raw:
+        k_raw = f"{normalize_text(raw)}|{cat_norm}"
+        if k_raw not in keys:
+            keys.append(k_raw)
+    return keys
+
+
 def extract_pagewise_responsibility_citations(pagewise_data: Dict[str, Any]) -> Dict[str, List[Dict]]:
     """
     Extract pagewise responsibilities with citations, grouped by (party, category).
     Returns: { "<party_norm>|<category_norm>": [ { text_norm, original_text, page, section }, ... ] }
+
+    Each row is indexed under both canonical party (for role-style rows) and raw
+    ``Responsible Party`` (for legal-name rows) so downstream merge can match either.
     """
     responsibility_citations: Dict[str, List[Dict[str, Any]]] = {}
     party_meta = pagewise_data.get("party_metadata")
@@ -51,6 +75,8 @@ def extract_pagewise_responsibility_citations(pagewise_data: Dict[str, Any]) -> 
                 party_canon = normalize_responsible_party_for_obligation(
                     obligation, party_metadata=party_meta
                 )
+                party_raw = str(obligation.get("Responsible Party") or "").strip()
+                lookup_keys = _party_category_lookup_keys(party_canon, party_raw, category)
                 responsibilities = obligation.get("Owner Responsibility", [])
                 citations = obligation.get("citations", [])
                 
@@ -64,10 +90,6 @@ def extract_pagewise_responsibility_citations(pagewise_data: Dict[str, Any]) -> 
                     else:
                         continue
                     
-                    party_norm = normalize_text(party_canon)
-                    cat_norm = normalize_text(category)
-                    key = f"{party_norm}|{cat_norm}"
-                    responsibility_citations.setdefault(key, [])
                     if isinstance(citation, dict):
                         pages_from_pn = _parse_page_numbers(
                             citation.get("pageNumbers") or citation.get("page_numbers")
@@ -81,27 +103,27 @@ def extract_pagewise_responsibility_citations(pagewise_data: Dict[str, Any]) -> 
                                 ]
                             for page_i in pages_from_pn:
                                 for sec_one in section_vals:
-                                    responsibility_citations[key].append(
-                                        {
-                                            "page": page_i,
-                                            "section": str(sec_one).strip() or "Document",
-                                            "original_text": str(responsibility or "").strip(),
-                                            "text_norm": normalize_text(str(responsibility or "")),
-                                        }
-                                    )
+                                    row = {
+                                        "page": page_i,
+                                        "section": str(sec_one).strip() or "Document",
+                                        "original_text": str(responsibility or "").strip(),
+                                        "text_norm": normalize_text(str(responsibility or "")),
+                                    }
+                                    for key in lookup_keys:
+                                        responsibility_citations.setdefault(key, []).append(row.copy())
                             continue
                         try:
                             page_i = int(citation.get("page", 1))
                         except (TypeError, ValueError):
                             page_i = 1
-                        responsibility_citations[key].append(
-                            {
-                                "page": page_i,
-                                "section": str(citation.get("section", "Document") or "Document").strip() or "Document",
-                                "original_text": str(responsibility or "").strip(),
-                                "text_norm": normalize_text(str(responsibility or "")),
-                            }
-                        )
+                        row = {
+                            "page": page_i,
+                            "section": str(citation.get("section", "Document") or "Document").strip() or "Document",
+                            "original_text": str(responsibility or "").strip(),
+                            "text_norm": normalize_text(str(responsibility or "")),
+                        }
+                        for key in lookup_keys:
+                            responsibility_citations.setdefault(key, []).append(row.copy())
     
     return responsibility_citations
 

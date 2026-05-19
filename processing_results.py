@@ -215,19 +215,22 @@ def normalize_party_fields_in_groups(
     *,
     party_metadata: Optional[Dict[str, Any]] = None,
 ) -> None:
-    """In-place: normalize Responsible Party on every obligation in category groups."""
+    """In-place: trim Responsible Party only (no role canonicalization)."""
+    _ = party_metadata  # reserved for API compatibility
     for g in groups or []:
         if not isinstance(g, dict):
             continue
         for ob in g.get("obligations") or []:
             if isinstance(ob, dict):
-                ob["Responsible Party"] = normalize_responsible_party_for_obligation(
-                    ob, party_metadata=party_metadata
-                )
+                s = str(ob.get("Responsible Party") or "").strip()
+                ob["Responsible Party"] = s if s else PARTY_UNSPECIFIED
 
 
 def _party_key(ob: Dict[str, Any], *, party_metadata: Optional[Dict[str, Any]] = None) -> str:
-    return normalize_responsible_party_for_obligation(ob, party_metadata=party_metadata)
+    """Case-insensitive bucketing key; display name stays as first-seen ``Responsible Party``."""
+    _ = party_metadata
+    s = str(ob.get("Responsible Party") or "").strip()
+    return s.casefold() if s else ""
 
 
 def _merge_str_lists(a: Any, b: Any) -> List[str]:
@@ -688,9 +691,8 @@ def merge_duplicate_party_within_category(
             pk = _party_key(ob, party_metadata=party_metadata) or "__unknown__"
             if pk not in buckets:
                 o2 = dict(ob)
-                o2["Responsible Party"] = normalize_responsible_party_for_obligation(
-                    ob, party_metadata=party_metadata
-                )
+                raw_party = str(ob.get("Responsible Party") or "").strip()
+                o2["Responsible Party"] = raw_party if raw_party else PARTY_UNSPECIFIED
                 o2["Owner Responsibility"] = _merge_str_lists([], ob.get("Owner Responsibility"))
                 o2["Reasoning"] = _merge_str_lists([], ob.get("Reasoning"))
                 o2["related_keywords"] = _merge_str_lists([], ob.get("related_keywords"))

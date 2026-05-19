@@ -22,6 +22,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -443,6 +444,62 @@ def clear_chroma_cache():
         logger.info("ChromaDB client cache cleared")
 
 
+_ALLOWED_CHROMA_PERSIST_NAMES = frozenset({"chroma_db", "chroma_db_legacy"})
+
+
+def _assert_safe_chroma_persist_dir(path: Path) -> Path:
+    """Refuse paths that are not dedicated Chroma folders (avoids deleting the repo or source files)."""
+    resolved = path.resolve()
+    if resolved.name not in _ALLOWED_CHROMA_PERSIST_NAMES:
+        raise ValueError(
+            f"Refusing to remove {resolved!r}: the folder name must be one of "
+            f"{sorted(_ALLOWED_CHROMA_PERSIST_NAMES)}. "
+            "Use the directory that ends with chroma_db (e.g. output/chroma_db), not the project root."
+        )
+    return resolved
+
+
+def wipe_chroma_persistent_folder(
+    chroma_path: Optional[str] = None,
+    *,
+    also_legacy: bool = True,
+) -> List[str]:
+    """
+    Delete ChromaDB on-disk data. Clears the in-process client cache first.
+
+    **Processing new documents does not wipe the whole database.** For each document, the
+    indexer removes existing rows for that ``document_name`` and upserts the new vectors;
+    other documents stay in the store until you delete the folders or call this function.
+
+    When ``chroma_path`` is omitted, removes ``<OUTPUT_FOLDER>/chroma_db`` (default
+    ``output/chroma_db``) relative to the current working directory — same layout as
+    ``ObligationQuerySystem`` / ``process_legal_documents`` (``out_dir / "chroma_db"``).
+
+    Only directories whose final name is ``chroma_db`` or ``chroma_db_legacy`` are removed.
+    """
+    removed: List[str] = []
+    clear_chroma_cache()
+
+    if chroma_path:
+        targets = [_assert_safe_chroma_persist_dir(Path(chroma_path))]
+    else:
+        out = Path(os.getenv("OUTPUT_FOLDER", "output")).expanduser().resolve()
+        targets = [_assert_safe_chroma_persist_dir(out / "chroma_db")]
+        if also_legacy:
+            leg = out / "chroma_db_legacy"
+            if leg.is_dir():
+                targets.append(_assert_safe_chroma_persist_dir(leg))
+
+    for t in targets:
+        if t.is_dir():
+            shutil.rmtree(t)
+            removed.append(str(t))
+            logger.info("Removed Chroma persistence folder: %s", t)
+        else:
+            logger.info("Chroma persistence folder already absent: %s", t)
+    return removed
+
+
 def get_embedding_function():
     """
     Return ChromaDB embedding function.
@@ -787,6 +844,7 @@ def query_individual_obligations(
     query_text: str,
     n_results: int = 20,
     document_name: Optional[str] = None,
+    document_names: Optional[List[str]] = None,
     chroma_path: Optional[str] = None,
     collection_name: str = "individual_obligations",
     max_distance: Optional[float] = None,
@@ -799,7 +857,8 @@ def query_individual_obligations(
     Args:
         query_text: User's search query
         n_results: Maximum number of individual obligations to return
-        document_name: Optional filter by document
+        document_name: Optional filter by a single document_name (exact metadata match)
+        document_names: Optional filter to any of these exact document_name metadata values
         chroma_path: Path to ChromaDB storage
         collection_name: ChromaDB collection name for individual obligations
         max_distance: Maximum distance threshold for results
@@ -816,17 +875,29 @@ def query_individual_obligations(
             metadata={"description": "Individual legal obligations with auto-generated keywords"},
         )
         
-        # Build where filter: combine document_name and responsible_party if provided
-        where = None
         party_where = _party_metadata_where_clause(responsible_party) if responsible_party else {}
-        if document_name and party_where:
-            where = {"$and": [{"document_name": document_name}, party_where]}
+
+        doc_clause: Optional[Dict[str, Any]] = None
+        if document_names is not None:
+            uniq = [str(d).strip() for d in document_names if str(d).strip()]
+            if not uniq:
+                return []
+            doc_clause = (
+                {"document_name": uniq[0]} if len(uniq) == 1 else {"document_name": {"$in": uniq}}
+            )
         elif document_name:
-            where = {"document_name": document_name}
+            doc_clause = {"document_name": document_name}
+
+        if doc_clause and party_where:
+            where: Optional[Dict[str, Any]] = {"$and": [doc_clause, party_where]}
+        elif doc_clause:
+            where = doc_clause
         elif party_where:
             where = party_where
-        
-        # When using distance threshold, fetch more candidates then filter
+        else:
+            where = None
+
+        # When using distance threshold, fetch more candidates then filter; otherwise top ``n_results`` only.
         fetch_n = 500 if max_distance is not None else n_results
         
         results = collection.query(
@@ -836,65 +907,33 @@ def query_individual_obligations(
             include=["documents", "metadatas", "distances"],
         )
         
-        obligations = []
+        obligations: List[Dict[str, Any]] = []
         if results and results["ids"] and results["ids"][0]:
             for i, obligation_id in enumerate(results["ids"][0]):
                 meta = (results["metadatas"][0][i] or {}) if results["metadatas"] else {}
                 dist = (results["distances"][0][i]) if results.get("distances") and results["distances"][0] else None
-                
-                # Apply distance threshold if specified
+
                 if max_distance is not None and dist is not None and dist > max_distance:
                     continue
-                
+
                 doc = (results["documents"][0][i]) if results.get("documents") and results["documents"][0] else ""
                 _cit_meta = meta.get("Citation", "") or ""
-                # #region agent log
-                if len(obligations) < 5:
-                    try:
-                        import json as _agent_json, time as _agent_time
+                obligations.append(
+                    {
+                        "id": obligation_id,
+                        "document_name": meta.get("document_name", ""),
+                        "DutyType": meta.get("DutyType", ""),
+                        "Responsible_Party": meta.get("Responsible_Party", ""),
+                        "Citation": _cit_meta,
+                        "source_category": meta.get("source_category", ""),
+                        "obligation_index_in_category": meta.get("obligation_index_in_category", ""),
+                        "chunk_index": meta.get("chunk_index", ""),
+                        "distance": dist,
+                        "document": doc,
+                    }
+                )
 
-                        with open(
-                            r"c:\Users\AmithKrishnan(G1)XIN\Downloads\Legal-OCR\debug-fe1e15.log",
-                            "a",
-                            encoding="utf-8",
-                        ) as _agent_f:
-                            _agent_f.write(
-                                _agent_json.dumps(
-                                    {
-                                        "sessionId": "fe1e15",
-                                        "hypothesisId": "H1",
-                                        "location": "vector_store.query_individual_obligations",
-                                        "message": "chroma hit Citation metadata sample",
-                                        "data": {
-                                            "doc_name": (meta.get("document_name") or "")[:160],
-                                            "citation_head": str(_cit_meta)[:220],
-                                            "looks_like_python_repr": str(_cit_meta).lstrip().startswith("[{"),
-                                            "chunk_index": str(meta.get("chunk_index", ""))[:24],
-                                            "source_category": str(meta.get("source_category", ""))[:120],
-                                        },
-                                        "timestamp": int(_agent_time.time() * 1000),
-                                    },
-                                    ensure_ascii=False,
-                                )
-                                + "\n"
-                            )
-                    except Exception:
-                        pass
-                # #endregion
-                obligations.append({
-                    "id": obligation_id,
-                    "document_name": meta.get("document_name", ""),
-                    "DutyType": meta.get("DutyType", ""),
-                    "Responsible_Party": meta.get("Responsible_Party", ""),
-                    "Citation": _cit_meta,
-                    "source_category": meta.get("source_category", ""),
-                    "obligation_index_in_category": meta.get("obligation_index_in_category", ""),
-                    "chunk_index": meta.get("chunk_index", ""),
-                    "distance": dist,
-                    "document": doc,  # The auto-generated keywords that were embedded
-                })
-        
-        return obligations[:n_results]  # Apply final limit
+        return obligations[:n_results]
         
     except Exception as e:
         logger.error(f"Individual obligation vector query error: {e}", exc_info=True)
@@ -969,3 +1008,14 @@ def query_obligations(
     except Exception as e:
         logger.error(f"Vector query error: {e}", exc_info=True)
         return []
+
+
+if __name__ == "__main__":
+    import sys
+
+    _arg = sys.argv[1] if len(sys.argv) > 1 else None
+    _removed = wipe_chroma_persistent_folder(_arg)
+    if _removed:
+        print("Removed:", "\n".join(_removed))
+    else:
+        print("Nothing to remove (folders were already missing).")

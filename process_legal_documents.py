@@ -31,8 +31,6 @@ from processing_results import (
     count_obligations_in_results,
     flatten_processing_results_for_index,
     merge_duplicate_party_within_category,
-    normalize_party_fields_in_groups,
-    normalize_responsible_party_value,
     normalize_results_categories,
     _merge_str_lists,
 )
@@ -695,6 +693,9 @@ class GeminiAnalyzer:
 
         # Initialize party metadata tracking
         self.party_metadata = {}
+        # Per-page (or per-section) raw party extractions before LLM merge (avoids last-write-wins on disk)
+        self._party_metadata_snapshots: List[Dict[str, Any]] = []
+        self._party_metadata_llm_finalized: bool = False
         _use_azure = os.getenv("USE_AZURE_OPENAI", "").lower() in ("true", "1", "yes")
         if _use_azure:
             if not os.getenv("AZURE_OPENAI_ENDPOINT") or not (os.getenv("AZURE_OPENAI_API_KEY") or os.getenv("AZURE_OPENAI_KEY") or os.getenv("OPENAI_API_KEY")):
@@ -716,7 +717,141 @@ class GeminiAnalyzer:
         to prevent party information from one document leaking into another.
         """
         self.party_metadata = {}
+        self._party_metadata_snapshots = []
+        self._party_metadata_llm_finalized = False
         self.logger.info("Party metadata reset for new document")
+
+    def _heuristic_party_metadata_from_snapshots(self) -> Dict[str, Dict[str, str]]:
+        """Best-effort merge of snapshots for prompts before/without successful LLM consolidation."""
+        by_label: Dict[str, List[Any]] = {}
+        for snap in self._party_metadata_snapshots:
+            if not isinstance(snap, dict):
+                continue
+            pn = snap.get("page_num", 0)
+            for party in snap.get("parties") or []:
+                if not isinstance(party, dict):
+                    continue
+                ref = str(party.get("reference_label") or "").strip()
+                if not ref:
+                    continue
+                an = str(party.get("actual_name") or "").strip()
+                ai = str(party.get("additional_info") or "").strip()
+                by_label.setdefault(ref, []).append((an, ai, pn))
+        out: Dict[str, Dict[str, str]] = {}
+        ref_l_map = {ref: ref.lower() for ref in by_label}
+        for ref, rows in by_label.items():
+            ref_l = ref_l_map[ref]
+            best_an = ""
+            for an, _ai, _pn in rows:
+                if not an:
+                    continue
+                is_role_only = an.strip().lower() == ref_l
+                cur_is_role_only = (not best_an) or (best_an.strip().lower() == ref_l)
+                better = False
+                if not best_an:
+                    better = True
+                elif not is_role_only and cur_is_role_only:
+                    better = True
+                elif is_role_only == (best_an.strip().lower() == ref_l) and len(an) > len(best_an):
+                    better = True
+                if better:
+                    best_an = an
+            extras: List[str] = []
+            for _an, ai, _pn in rows:
+                if ai and ai not in extras:
+                    extras.append(ai)
+            out[ref] = {
+                "actual_name": best_an,
+                "additional_info": "; ".join(extras)[:4000],
+            }
+        return out
+
+    def _apply_parties_list_to_party_metadata(self, parties: List[Dict[str, Any]]) -> None:
+        """Replace ``party_metadata`` from a merged ``parties`` array (reference_label -> dict)."""
+        self.party_metadata = {}
+        for party in parties or []:
+            if not isinstance(party, dict):
+                continue
+            ref_label = str(party.get("reference_label") or "").strip()
+            if not ref_label:
+                continue
+            self.party_metadata[ref_label] = {
+                "actual_name": str(party.get("actual_name") or "").strip(),
+                "additional_info": str(party.get("additional_info") or "").strip(),
+            }
+
+    @retry_with_exponential_backoff(max_retries=5, initial_delay=5.0, exponential_base=2.0)
+    def _consolidate_party_metadata_snapshots_llm(self) -> None:
+        """Merge all per-page party JSON extractions into one authoritative ``party_metadata`` via LLM."""
+        if not self._party_metadata_snapshots:
+            self.party_metadata = {}
+            self._party_metadata_llm_finalized = True
+            return
+        ordered = sorted(
+            self._party_metadata_snapshots,
+            key=lambda s: int(s.get("page_num") or 0) if isinstance(s, dict) else 0,
+        )
+        payload = json.dumps(ordered, ensure_ascii=False, indent=2)
+        merge_prompt = f"""You merge several JSON extractions of party definitions from different pages of the same legal document.
+Each snapshot is: {{"page_num": <int>, "parties": [{{"reference_label", "actual_name", "additional_info"}}, ...]}}
+
+INPUT (all snapshots, oldest to newest):
+{payload}
+
+Rules:
+- Output ONE merged "parties" list: one entry per distinct contract role (reference_label).
+- "actual_name" must be the full legal name as written in the document when ANY snapshot provides it. Do NOT output only the role word (e.g. "Tenant", "Landlord") as actual_name if a real entity or person name appears in any snapshot for that role.
+- If snapshots disagree, prefer extractions that include a concrete legal name; use later page_num only when it clearly corrects an error.
+- Merge "additional_info" into a single concise line without duplicating the legal name.
+
+Return ONLY valid JSON in this exact shape (no markdown fences):
+{{"parties": [{{"actual_name": "...", "reference_label": "...", "additional_info": "..."}}]}}"""
+
+        self.logger.info(
+            "Consolidating party metadata from %d snapshot(s) via LLM...",
+            len(self._party_metadata_snapshots),
+        )
+        try:
+            response = self._generate_content(
+                prompt=merge_prompt,
+                temperature=0.1,
+                response_mime_type="application/json",
+            )
+            result_text = (response.text or "").strip()
+            if result_text.startswith("```json"):
+                result_text = result_text[7:]
+            if result_text.startswith("```"):
+                result_text = result_text[3:]
+            if result_text.endswith("```"):
+                result_text = result_text[:-3]
+            result_text = result_text.strip()
+            merged = json.loads(result_text)
+            parties = merged.get("parties") if isinstance(merged, dict) else None
+            if isinstance(parties, list) and parties:
+                self._apply_parties_list_to_party_metadata(parties)
+                self._party_metadata_llm_finalized = True
+                self.logger.info("Party metadata consolidated: %d role(s)", len(self.party_metadata))
+                return
+            self.logger.warning("LLM party merge returned no parties; using heuristic merge")
+        except json.JSONDecodeError as e:
+            self.logger.warning("LLM party merge JSON error: %s; using heuristic merge", e)
+        except Exception as e:
+            err = str(e).lower()
+            if any(k in err for k in ("rate limit", "quota", "resource exhausted", "429", "throttl")):
+                raise
+            self.logger.warning("LLM party merge failed: %s; using heuristic merge", e)
+        self.party_metadata = self._heuristic_party_metadata_from_snapshots()
+        self._party_metadata_llm_finalized = True
+
+    def finalize_party_metadata_if_needed(self) -> None:
+        """After the last party-scanned page/section, merge snapshots if we never hit the in-stream threshold."""
+        if self._party_metadata_llm_finalized:
+            return
+        if not self._party_metadata_snapshots:
+            self.party_metadata = {}
+            self._party_metadata_llm_finalized = True
+            return
+        self._consolidate_party_metadata_snapshots_llm()
     
     def _generate_content(
         self,
@@ -738,14 +873,17 @@ class GeminiAnalyzer:
         )
     
     @retry_with_exponential_backoff(max_retries=5, initial_delay=5.0, exponential_base=2.0)
-    def extract_party_metadata(self, page_num: int, page_text: str) -> Dict[str, Any]:
+    def extract_party_metadata(
+        self, page_num: int, page_text: str, *, max_party_pages: int = 5
+    ) -> Dict[str, Any]:
         """
         Extract party definitions and identifiers from a page
         
         Args:
             page_num: Page number
             page_text: Text content of the page
-            
+            max_party_pages: After this many snapshots, run LLM merge (see LEGAL_OCR_PARTY_METADATA_PAGES).
+        
         Returns:
             Dictionary containing party metadata
         """
@@ -763,6 +901,11 @@ Common patterns to look for:
 - "John Doe ('Guarantor')"
 - "LANDLORD: XYZ Properties, LLC"
 - "between H-E-B, L.P. (hereinafter 'Grantee')"
+
+CRITICAL — Field meanings (do not swap):
+- "actual_name" MUST be the full legal name of the entity **as written in the document** (e.g. "Fidelity Funding Company, a Nevada corporation" or at minimum the distinct company/person name). It must NOT be the contract-defined role word alone ("Landlord", "Tenant", "Lessee") unless the document literally names the party only that way.
+- "reference_label" MUST be the quoted or defined role label from the lease (e.g. "Landlord", "Tenant") used elsewhere in the instrument.
+- "additional_info" is optional context (entity type, state of incorporation); do not put the legal name only here while leaving actual_name as the role label.
 
 Output a JSON object with the following structure:
 {{
@@ -804,18 +947,43 @@ Extract party metadata as JSON:"""
             result_text = result_text.strip()
             
             metadata = json.loads(result_text)
-            
-            # Update cumulative party metadata
-            if "parties" in metadata and metadata["parties"]:
-                for party in metadata["parties"]:
-                    ref_label = party.get("reference_label", "").strip()
-                    if ref_label:
-                        self.party_metadata[ref_label] = {
-                            "actual_name": party.get("actual_name", ""),
-                            "additional_info": party.get("additional_info", "")
-                        }
-                        self.logger.info(f"  Found party: {ref_label} -> {party.get('actual_name', '')}")
-            
+            parties_list = metadata.get("parties") if isinstance(metadata, dict) else None
+            if not isinstance(parties_list, list):
+                parties_list = []
+
+            # Snapshot for later LLM merge (replace same page_num on retry to avoid duplicates)
+            snap = {
+                "page_num": int(page_num),
+                "parties": [dict(p) for p in parties_list if isinstance(p, dict)],
+            }
+            self._party_metadata_snapshots = [
+                s for s in self._party_metadata_snapshots if isinstance(s, dict) and s.get("page_num") != page_num
+            ]
+            self._party_metadata_snapshots.append(snap)
+
+            for party in parties_list:
+                if not isinstance(party, dict):
+                    continue
+                ref_label = str(party.get("reference_label") or "").strip()
+                if ref_label:
+                    self.logger.info(
+                        "  Found party (page %s): %s -> %s",
+                        page_num,
+                        ref_label,
+                        party.get("actual_name", ""),
+                    )
+
+            try:
+                cap = max(1, min(50, int(max_party_pages)))
+            except (TypeError, ValueError):
+                cap = 5
+            if self._party_metadata_llm_finalized:
+                pass
+            elif len(self._party_metadata_snapshots) >= cap:
+                self._consolidate_party_metadata_snapshots_llm()
+            else:
+                self.party_metadata = self._heuristic_party_metadata_from_snapshots()
+
             return metadata
             
         except json.JSONDecodeError as e:
@@ -846,6 +1014,7 @@ Extract party metadata as JSON:"""
         extract_parties: bool = True,
         *,
         document_name: str = "",
+        party_metadata_max_pages: int = 5,
     ) -> List[Dict[str, Any]]:
         """
         Analyze a single page: returns a list of {{ "category", "obligations" }} blocks per the extraction prompt.
@@ -853,7 +1022,9 @@ Extract party metadata as JSON:"""
         result_text = ""
         try:
             if extract_parties:
-                self.extract_party_metadata(page_num, page_text)
+                self.extract_party_metadata(
+                    page_num, page_text, max_party_pages=party_metadata_max_pages
+                )
 
             metadata_context = ""
             if self.party_metadata:
@@ -953,6 +1124,7 @@ CRITICAL: Respond with ONLY valid JSON: a JSON array of category objects exactly
         extract_parties: bool = False,
         *,
         document_name: str = "",
+        party_metadata_max_pages: int = 5,
     ) -> List[Dict[str, Any]]:
         """
         Section-based extraction: same JSON shape as analyze_page (list of category blocks).
@@ -961,7 +1133,11 @@ CRITICAL: Respond with ONLY valid JSON: a JSON array of category objects exactly
         display_num = (section_number or "").strip() or "(unnumbered)"
         try:
             if extract_parties and section_content.strip():
-                self.extract_party_metadata(1, f"Section {section_number}. {section_title}\n\n{section_content}")
+                self.extract_party_metadata(
+                    1,
+                    f"Section {section_number}. {section_title}\n\n{section_content}",
+                    max_party_pages=party_metadata_max_pages,
+                )
             metadata_context = ""
             if self.party_metadata:
                 metadata_context = (
@@ -2040,6 +2216,7 @@ Input obligations (id + responsibility text):
             # Create batch-specific prompt
             batch_prompt = f"""Consolidate these {len(batch['responsibilities'])} responsibilities for {party} in "{category_name}" category.
 ONLY merge items that are 90%+ similar. Keep distinct obligations separate.
+All items are for Responsible Party "{party}" — use that **exact** string (from pagewise extraction) in the output; do not rewrite to generic roles.
 
 INPUT RESPONSIBILITIES FOR {party.upper()} (Batch {batch_num}):
 """
@@ -2309,10 +2486,9 @@ IMPORTANT - CITATION HANDLING:
         consolidated_results = []
 
         def _normalize_party_for_grouping(party_raw: Any) -> str:
-            """Must match canonical roles (normalized upstream per obligation when possible)."""
-            return normalize_responsible_party_value(
-                party_raw, party_metadata=self.party_metadata
-            )
+            """Use Responsible Party as extracted (trimmed only); no canonical role rewriting."""
+            s = str(party_raw or "").strip()
+            return s if s else "Unknown"
 
         def _coerce_citation_to_page_section(cite: Any) -> Dict[str, Any]:
             """
@@ -3131,7 +3307,7 @@ STRICT Preservation Guidelines:
 - When in doubt, ALWAYS keep separate
 
 Output Format Requirements:
-- Responsible Party: use exactly as given (e.g., "Tenant", "Landlord", "Prevailing Party (Landlord or Tenant)")
+- Responsible Party: For every output row, copy the **exact** `Responsible Party` string from the corresponding input row(s) (pagewise extraction). Preserve full legal entity names, contract-defined labels, and spelling as in the input. Do **not** substitute generic role words such as "Tenant" or "Landlord" unless the input literally used only those words.
 - Owner Responsibility: array with typically 1 responsibility per obligation (avoid grouping unless truly identical)
 - Reasoning: array of explanations matching each responsibility 
 - docId: "{document_name}"
@@ -3141,6 +3317,7 @@ Citation Handling:
 - Each Owner Responsibility must have a corresponding citation at the same index
 - Preserve original page numbers and section names
 - Do not merge citations unless obligations are truly identical
+- For every citation, carry over "page" only from the input row(s) that support that responsibility: never omit a page that the source cited, and never add or fabricate page numbers.
 
 {metadata_context}
 
@@ -3562,7 +3739,7 @@ KEEP SEPARATE ALWAYS:
 
 OUTPUT FORMAT:
 Return a JSON array where each element has:
-- "Responsible Party": exact party name
+- "Responsible Party": exact same party string as in the input obligations (from pagewise extraction); preserve legal names and labels, not generic roles unless the input used only those.
 - "Owner Responsibility": array of responsibility statements
 - "Reasoning": array explaining each responsibility  
 - "docId": "{document_name}"
@@ -3772,7 +3949,7 @@ MERGING STYLE:
 - Better to have more responsibilities than lose legal meaning
 
 OUTPUT FORMAT - JSON array where each element has:
-- "Responsible Party": exact party name
+- "Responsible Party": exact same string as in the input (pagewise extraction); preserve legal entity names, not generic roles unless the input used only those.
 - "Owner Responsibility": array of CONCISE responsibility statements
 - "Reasoning": array explaining each responsibility
 - "docId": "{document_name}"  
@@ -3970,6 +4147,7 @@ NEVER MERGE:
 - Regular obligations vs special circumstances (holdover, default, purchase)
 
 OUTPUT: JSON array with "Responsible Party", "Owner Responsibility" (array), "Reasoning" (array), "docId", "citations" (array)
+- "Responsible Party" must match the input rows' party strings from pagewise extraction (full names as given); do not normalize to generic "Tenant"/"Landlord" unless the input did.
 
 Input:
 {json.dumps(responsibilities[:15], indent=1)}
@@ -4802,7 +4980,7 @@ Rules:
 2. Preserve all unique obligations.
 3. Each element must have: "Responsible Party", "Owner Responsibility" (array of strings), "Reasoning" (array of strings), "Citation" (string), "docId", and "related_keywords" (array of strings).
 4. DutyType: short, precise label (e.g. Rent Payment, Security Deposit, Property Tax Payment).
-5. Responsible Party: use as given or from metadata below.
+5. Responsible Party: Copy **exactly** from each input obligation's `Responsible Party` (pagewise extraction): use the actual legal entity or contract label as shown in the JSON below. Do not replace with generic "Tenant" or "Landlord" unless the input already used only those words.
 6. When merging, combine citations (e.g., "Page 3, Section A; Page 7, Section B").
 7. related_keywords: for each obligation, add an array of 8–20 search keywords/phrases. You MUST include the DutyType itself (and normalised variations, e.g. "Rent Payment" → "rent payment", "rent") in this array. Add synonyms and related concepts so semantic search can find this obligation. Example: for DutyType "Property Insurance", related_keywords must include "Property Insurance" or "property insurance", plus e.g. ["insurance", "property insurance", "liability", "coverage", "premium", "tenant insurance"].
 8. Maintain legal accuracy. Output ONLY a valid JSON array, no other text.
@@ -5070,6 +5248,11 @@ class LegalDocumentProcessor:
             sorted_pages = sorted(page_texts.keys())
             page_delay = float(os.getenv("PAGE_PROCESSING_DELAY", "3.5"))
             use_sections = (os.getenv("LEGAL_OCR_USE_SECTION_EXTRACTION", "").lower() in ("1", "true", "yes"))
+            try:
+                n_party_meta_pages = int(os.getenv("LEGAL_OCR_PARTY_METADATA_PAGES", "5"))
+            except ValueError:
+                n_party_meta_pages = 5
+            n_party_meta_pages = max(1, min(50, n_party_meta_pages))
             all_category_groups: List[Dict[str, Any]] = []
             sections: List[Dict[str, Any]] = []
             section_results: Dict[str, Any] = {}
@@ -5105,10 +5288,12 @@ class LegalDocumentProcessor:
                         continue
                     extract_parties = i == 0
                     groups = self.gemini_analyzer.analyze_section(
-                        sec_num, sec_title, content, extract_parties=extract_parties, document_name=doc_name
-                    )
-                    normalize_party_fields_in_groups(
-                        groups, party_metadata=self.gemini_analyzer.party_metadata
+                        sec_num,
+                        sec_title,
+                        content,
+                        extract_parties=extract_parties,
+                        document_name=doc_name,
+                        party_metadata_max_pages=n_party_meta_pages,
                     )
                     n_in = _count_inner_obligation_rows(groups)
                     self.logger.info(
@@ -5129,14 +5314,9 @@ class LegalDocumentProcessor:
                 self.logger.info(
                     "Obligation extraction: page-wise (default). Set LEGAL_OCR_USE_SECTION_EXTRACTION=true for section-based."
                 )
-                try:
-                    n_party_meta_pages = int(os.getenv("LEGAL_OCR_PARTY_METADATA_PAGES", "5"))
-                except ValueError:
-                    n_party_meta_pages = 5
-                n_party_meta_pages = max(1, min(50, n_party_meta_pages))
                 self.logger.info(
                     f"Party metadata extraction on first {n_party_meta_pages} non-empty pages "
-                    f"(override with LEGAL_OCR_PARTY_METADATA_PAGES); matches analyze_page guidance."
+                    f"(override with LEGAL_OCR_PARTY_METADATA_PAGES); first batch merged via LLM when full."
                 )
                 page_results: Dict[str, List[Dict[str, Any]]] = {}
                 n_pages = len(sorted_pages)
@@ -5152,10 +5332,11 @@ class LegalDocumentProcessor:
                     # Scan party definitions on the first N pages (default 5), same intent as analyze_page docstring.
                     extract_parties = pages_party_scanned < n_party_meta_pages
                     groups = self.gemini_analyzer.analyze_page(
-                        page_num, text, extract_parties=extract_parties, document_name=doc_name
-                    )
-                    normalize_party_fields_in_groups(
-                        groups, party_metadata=self.gemini_analyzer.party_metadata
+                        page_num,
+                        text,
+                        extract_parties=extract_parties,
+                        document_name=doc_name,
+                        party_metadata_max_pages=n_party_meta_pages,
                     )
                     page_results[str(page_num)] = [dict(g) for g in groups if isinstance(g, dict)]
                     all_category_groups.extend(page_results[str(page_num)])
@@ -5169,6 +5350,8 @@ class LegalDocumentProcessor:
                         pages_party_scanned += 1
                     if idx < n_pages - 1:
                         time.sleep(page_delay)
+
+            self.gemini_analyzer.finalize_party_metadata_if_needed()
 
             bundle = self.gemini_analyzer.consolidate_results_to_json(all_category_groups, document_name=doc_name)
             processing_results = bundle.get("results") or []
@@ -5251,6 +5434,7 @@ class LegalDocumentProcessor:
                 # Preferred: compute combined citations from pagewise by matching each consolidated
                 # responsibility to pagewise responsibilities (ensures pageNumbers are present).
                 pagewise_index = None
+                party_meta_cite: Optional[Dict[str, Any]] = None
                 if pagewise_path_str and not use_sections:
                     try:
                         from citation_post_processor import (
@@ -5260,6 +5444,9 @@ class LegalDocumentProcessor:
                         )
                         with open(pagewise_path_str, "r", encoding="utf-8") as pf:
                             _pw = json.load(pf)
+                        pm = _pw.get("party_metadata")
+                        if isinstance(pm, dict):
+                            party_meta_cite = pm
                         pagewise_index = extract_pagewise_responsibility_citations(_pw)
                     except Exception as e:
                         self.logger.warning(f"Could not build pagewise citation index: {e}")
@@ -5278,16 +5465,43 @@ class LegalDocumentProcessor:
                         combined = []
                         if pagewise_index is not None:
                             try:
-                                party_norm = _norm_text(str(ob.get("Responsible Party") or "Unknown"))
+                                from processing_results import (
+                                    normalize_responsible_party_for_obligation,
+                                )
+
+                                pm_use = party_meta_cite
+                                if not isinstance(pm_use, dict):
+                                    pm_use = _final.get("party_metadata")
+                                if not isinstance(pm_use, dict):
+                                    pm_use = None
+                                party_raw = str(ob.get("Responsible Party") or "").strip()
+                                party_norms: List[str] = []
+                                if party_raw:
+                                    party_norms.append(_norm_text(party_raw))
+                                party_canon = normalize_responsible_party_for_obligation(
+                                    ob, party_metadata=pm_use
+                                )
+                                cn = _norm_text(
+                                    str(party_canon or "").strip() or "Unknown"
+                                )
+                                if cn not in party_norms:
+                                    party_norms.append(cn)
+                                if not party_norms:
+                                    party_norms.append(_norm_text("Unknown"))
+
                                 cat_norm = _norm_text(cat)
                                 refs: List[Dict[str, Any]] = []
                                 for r in ob.get("Owner Responsibility") or []:
-                                    cites = find_contributing_citations(
-                                        str(r or "").strip(),
-                                        party_norm,
-                                        cat_norm,
-                                        pagewise_index,
-                                    )
+                                    cites: List[Dict[str, Any]] = []
+                                    for pn in party_norms:
+                                        cites = find_contributing_citations(
+                                            str(r or "").strip(),
+                                            pn,
+                                            cat_norm,
+                                            pagewise_index,
+                                        )
+                                        if cites:
+                                            break
                                     if cites:
                                         refs.extend(cites)
                                 # Convert refs -> compact per-doc combined format.
