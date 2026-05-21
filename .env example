@@ -33,3 +33,9 @@ VECTOR_MAX_DISTANCE=2.0
 # API_HOST=0.0.0.0
 # API_PORT=8000
 # API_RELOAD=false
+#
+# Long page extraction: raise output token cap if JSON is truncated or parse fails
+# LEGAL_OCR_ANALYZE_PAGE_MAX_OUTPUT_TOKENS=16384
+# (optional) LEGAL_OCR_ANALYZE_SECTION_MAX_OUTPUT_TOKENS=16384
+# Provider-wide defaults still apply when unset: GEMINI_MAX_OUTPUT_TOKENS, BEDROCK_MAX_TOKENS,
+# AZURE_OPENAI_MAX_TOKENS / OPENAI_MAX_OUTPUT_TOKENS

@@ -53,6 +53,25 @@ def _configured_llm_label() -> str:
     return "Gemini API"
 
 
+def _analyze_extraction_max_output_tokens() -> Optional[int]:
+    """
+    Optional cap for obligation extraction (analyze_page / analyze_section).
+
+    Set LEGAL_OCR_ANALYZE_PAGE_MAX_OUTPUT_TOKENS (or LEGAL_OCR_ANALYZE_SECTION_MAX_OUTPUT_TOKENS)
+    to raise the limit when JSON is truncated or empty. If unset, each provider uses its own
+    default (e.g. GEMINI_MAX_OUTPUT_TOKENS, BEDROCK_MAX_TOKENS, AZURE_OPENAI_MAX_TOKENS / OPENAI_MAX_OUTPUT_TOKENS).
+    """
+    for key in ("LEGAL_OCR_ANALYZE_PAGE_MAX_OUTPUT_TOKENS", "LEGAL_OCR_ANALYZE_SECTION_MAX_OUTPUT_TOKENS"):
+        raw = (os.getenv(key) or "").strip()
+        if not raw:
+            continue
+        try:
+            return max(256, int(raw))
+        except ValueError:
+            continue
+    return None
+
+
 def _resolve_workspace_path(path_str: Optional[str], env_key: str, default: str) -> Path:
     """Resolve DOCS_FOLDER/OUTPUT_FOLDER relative to repo root, not the process CWD."""
     raw = (path_str or os.getenv(env_key) or default).strip()
@@ -1052,7 +1071,7 @@ Extract party metadata as JSON:"""
 --- DOCUMENT FILE NAME (use as docId in every citation block) ---
 {doc_label}
 
-CRITICAL: Respond with ONLY valid JSON: a JSON array of category objects exactly as specified in the instructions above (no markdown fences, no commentary before or after the JSON).
+CRITICAL: Respond with ONLY valid JSON: a single JSON object matching the "Strict JSON Output Format" above (top-level object with a "results" array of category objects, plus docId/citations as in that example). Do not use a top-level JSON array. No markdown fences, no commentary before or after the JSON.
 
 --- PAGE {page_num} TEXT ---
 
@@ -1062,10 +1081,12 @@ CRITICAL: Respond with ONLY valid JSON: a JSON array of category objects exactly
             self.logger.info(message)
             force_logger.info(message)  # Force terminal output
 
+            max_out = _analyze_extraction_max_output_tokens()
             response = self._generate_content(
                 prompt=full_prompt,
                 temperature=0.1,
                 response_mime_type="application/json",
+                max_output_tokens=max_out,
                 require_json_object=True,
             )
 
@@ -1163,17 +1184,19 @@ CRITICAL: Respond with ONLY valid JSON: a JSON array of category objects exactly
 --- DOCUMENT FILE NAME (use as docId in every citation block) ---
 {doc_label}
 
-CRITICAL: Respond with ONLY valid JSON: a JSON array of category objects exactly as specified in the instructions above (no markdown fences, no commentary).
+CRITICAL: Respond with ONLY valid JSON: a single JSON object matching the "Strict JSON Output Format" above (top-level object with a "results" array of category objects, plus docId/citations as in that example). Do not use a top-level JSON array. No markdown fences, no commentary.
 
 --- SECTION {section_number}. {section_title} ---
 
 {section_content}"""
 
             self.logger.info(f"Analyzing section {display_num} with LLM...")
+            max_out = _analyze_extraction_max_output_tokens()
             response = self._generate_content(
                 prompt=full_prompt,
                 temperature=0.1,
                 response_mime_type="application/json",
+                max_output_tokens=max_out,
                 require_json_object=True,
             )
             result_text = (response.text or "").strip()

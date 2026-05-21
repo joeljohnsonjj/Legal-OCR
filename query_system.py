@@ -4299,11 +4299,6 @@ Output only the JSON object:"""
                     "processed_at": datetime.now().isoformat(),
                 }
             
-            # Default query handling
-            if not user_query or user_query.strip() == "":
-                user_query = "utilities including water, gas, heat, light, electricity, telephone service, HVAC, sprinkler system, electrical and plumbing systems"
-                self.logger.info("No query provided - defaulting to utilities query")
-            
             self.logger.info("=" * 80)
             self.logger.info(f"Processing query (INDIVIDUAL OBLIGATIONS MODE): '{user_query}'")
             if document_ids:
@@ -4429,11 +4424,6 @@ Output only the JSON object:"""
                     document_ids,
                     use_category_mode_override=False,
                 )
-            
-            # Default query handling
-            if not user_query or user_query.strip() == "":
-                user_query = "utilities including water, gas, heat, light, electricity, telephone service, HVAC, sprinkler system, electrical and plumbing systems"
-                self.logger.info("No query provided - defaulting to utilities query")
             
             self.logger.info("=" * 80)
             self.logger.info(f"Processing query (CATEGORY MODE): '{user_query}'")
@@ -4587,7 +4577,7 @@ Output only the JSON object:"""
         - Eliminates noise from irrelevant obligations within categories
         
         Args:
-            user_query: User's search query (if empty, returns utility-related obligations)
+            user_query: User's search query (empty or whitespace-only: no default substitution; retrieval/merge follow empty-query rules)
             save_output: Whether to save the output to a JSON file
             document_ids: Optional list of document URLs to filter by
             
@@ -4619,11 +4609,6 @@ Output only the JSON object:"""
                 self.logger.info("Using category-level semantic matching")
                 return await self.query_by_categories(user_query, save_output, document_ids)
         
-            # If no query provided, default to utilities query
-            if not user_query or user_query.strip() == "":
-                user_query = "utilities including water, gas, heat, light, electricity, telephone service, HVAC, sprinkler system, electrical and plumbing systems"
-                self.logger.info("No query provided - defaulting to utilities query")
-            
             self.logger.info("=" * 80)
             self.logger.info(f"Processing query: '{user_query}'")
             if document_ids:
@@ -4726,7 +4711,10 @@ Output only the JSON object:"""
 # Pydantic models for request/response
 class QueryRequest(BaseModel):
     """Request model for query endpoint"""
-    query: Optional[str] = Field(default="", description="Search query for legal obligations (if empty, returns utility-related obligations)")
+    query: Optional[str] = Field(
+        default="",
+        description="Search query for legal obligations (empty is passed through; no implicit utilities default)",
+    )
     document_ids: Optional[List[str]] = Field(
         default=None, 
         description="Optional list of document identifiers to filter by. Each can be a full URL or a document filename that matches the consolidated document name (e.g. 'Commercial Lease Agreement.pdf'). If omitted, all consolidated documents are searched."
@@ -5021,9 +5009,8 @@ async def query_obligations_post(request: Optional[QueryRequest] = Body(default=
     Searches through all consolidated JSON files and returns relevant obligations
     ranked by relevance and monetary value.
 
-    If no query is provided (empty string), returns all utility-related obligations including:
-    water, gas, heat, light, electricity, telephone service, HVAC, sprinkler system,
-    electrical and plumbing systems.
+    An empty or whitespace-only ``query`` is not replaced; behavior matches other query
+    endpoints (e.g. vector retrieval may return no hits; merge prompt empty-query rules apply).
 
     If document_ids are provided, only searches those specific documents.
     document_ids can be URLs or filenames that match consolidated document names.
