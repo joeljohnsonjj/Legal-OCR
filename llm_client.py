@@ -15,17 +15,52 @@ def _use_azure_openai() -> bool:
     return os.getenv("USE_AZURE_OPENAI", "").lower() in ("true", "1", "yes")
 
 
+def _raw_llm_or_bedrock_model() -> str:
+    """Non-empty model string from LLM_MODEL or BEDROCK_MODEL_ID (trimmed, not lowercased)."""
+    return (os.getenv("LLM_MODEL") or os.getenv("BEDROCK_MODEL_ID") or "").strip()
+
+
+def _looks_like_bedrock_foundation_model_id(model_raw: str) -> bool:
+    """
+    True when ``model_raw`` looks like an AWS Bedrock base model id (no ``bedrock/`` prefix).
+    Users often set only ``BEDROCK_MODEL_ID=anthropic.claude-...`` or ``LLM_MODEL=anthropic...``;
+    without this, routing incorrectly fell through to Gemini and required GEMINI_API_KEY.
+    """
+    s = (model_raw or "").strip().lower()
+    if not s or s.startswith("bedrock/"):
+        return False
+    prefixes = (
+        "anthropic.",
+        "us.anthropic.",
+        "eu.anthropic.",
+        "apac.anthropic.",
+        "meta.",
+        "amazon.",
+        "mistral.",
+        "cohere.",
+        "ai21.",
+    )
+    return any(s.startswith(p) for p in prefixes)
+
+
 def use_bedrock_llm() -> bool:
     """
     True when Bedrock should be used. Disabled if USE_AZURE_OPENAI is true (Azure takes precedence).
-    Otherwise: LLM_MODEL starts with bedrock/ or USE_BEDROCK=true.
+
+    Bedrock is selected when any of:
+    - ``USE_BEDROCK`` is true/1/yes
+    - ``LLM_MODEL`` starts with ``bedrock/``
+    - ``LLM_MODEL`` or ``BEDROCK_MODEL_ID`` looks like a Bedrock foundation model id (e.g. ``anthropic.claude-3-haiku-...``)
     """
     if _use_azure_openai():
         return False
-    lm = os.getenv("LLM_MODEL", "").strip().lower()
-    if lm.startswith("bedrock/"):
+    if os.getenv("USE_BEDROCK", "").lower() in ("true", "1", "yes"):
         return True
-    return os.getenv("USE_BEDROCK", "").lower() in ("true", "1", "yes")
+    raw = _raw_llm_or_bedrock_model()
+    rl = raw.lower()
+    if rl.startswith("bedrock/"):
+        return True
+    return _looks_like_bedrock_foundation_model_id(raw)
 
 
 def _bedrock_model_id() -> str:

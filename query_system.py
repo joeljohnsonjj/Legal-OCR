@@ -900,32 +900,6 @@ def citation_string_to_structured(citation: Any) -> List[Dict[str, Any]]:
         return []
     structured = _parse_chroma_stored_citation_field(s)
     if structured is not None:
-        # #region agent log
-        try:
-            import time as _agent_time
-
-            with open(
-                r"c:\Users\AmithKrishnan(G1)XIN\Downloads\Legal-OCR\debug-fe1e15.log",
-                "a",
-                encoding="utf-8",
-            ) as _agent_f:
-                _agent_f.write(
-                    json.dumps(
-                        {
-                            "sessionId": "fe1e15",
-                            "hypothesisId": "H4",
-                            "location": "query_system.citation_string_to_structured",
-                            "message": "parsed Chroma JSON/repr citation metadata",
-                            "data": {"n_items": len(structured)},
-                            "timestamp": int(_agent_time.time() * 1000),
-                        },
-                        ensure_ascii=False,
-                    )
-                    + "\n"
-                )
-        except Exception:
-            pass
-        # #endregion
         out: List[Dict[str, Any]] = []
         for c in structured:
             if not isinstance(c, dict):
@@ -1654,6 +1628,39 @@ def _count_obligations_in_filtered(filtered_results: List[Dict[str, Any]]) -> in
         else:
             n += len(r.get("consolidated_results") or [])
     return n
+
+
+def _merge_input_distinct_source_document_count(merge_in: List[Dict[str, Any]]) -> int:
+    """
+    Distinct source PDFs in merge input. ``len(merge_in)`` is wrong when a single synthetic
+    block ``individual_obligations`` wraps rows from multiple leases.
+    """
+    names: Set[str] = set()
+    for fr in merge_in or []:
+        if not isinstance(fr, dict):
+            continue
+        outer = (fr.get("document_name") or "").strip()
+        if outer and outer.lower() != "individual_obligations":
+            names.add(outer)
+        for grp in fr.get("results") or []:
+            if not isinstance(grp, dict):
+                continue
+            for ob in grp.get("obligations") or []:
+                if not isinstance(ob, dict):
+                    continue
+                dn = (ob.get("document_name") or "").strip()
+                if dn and dn.lower() != "individual_obligations":
+                    names.add(dn)
+                for cit in ob.get("citations") or []:
+                    if isinstance(cit, dict):
+                        did = (cit.get("docId") or "").strip()
+                        if did:
+                            names.add(did)
+    if names:
+        return len(names)
+    if _count_obligations_in_filtered(merge_in) == 0:
+        return 0
+    return len(merge_in)
 
 
 def _document_name_from_vector_obligation(ob: Dict[str, Any]) -> str:
@@ -2547,37 +2554,6 @@ class ObligationQuerySystem:
                                     if normalized:
                                         ob_copy["citations"] = normalized
                                 flat.append(ob_copy)
-                    # #region agent log
-                    try:
-                        import json as _agent_json, time as _agent_time
-
-                        sample_keys = sorted(list(flat[0].keys()))[:8] if flat else []
-                        with open(
-                            r"c:\Users\AmithKrishnan(G1)XIN\Downloads\Legal-OCR\debug-fe1e15.log",
-                            "a",
-                            encoding="utf-8",
-                        ) as _agent_f:
-                            _agent_f.write(
-                                _agent_json.dumps(
-                                    {
-                                        "sessionId": "fe1e15",
-                                        "hypothesisId": "H6",
-                                        "location": "query_system.load_consolidated_jsons",
-                                        "message": "pagewise flattened to obligations",
-                                        "data": {
-                                            "doc_name": str(doc_name)[:160],
-                                            "flat_count": len(flat),
-                                            "sample_keys": sample_keys,
-                                        },
-                                        "timestamp": int(_agent_time.time() * 1000),
-                                    },
-                                    ensure_ascii=False,
-                                )
-                                + "\n"
-                            )
-                    except Exception:
-                        pass
-                    # #endregion
                     data = {
                         "document_name": doc_name,
                         "consolidated_results": flat,
@@ -2810,39 +2786,6 @@ class ObligationQuerySystem:
             """Last resort when metadata does not line up with consolidated JSON."""
             duty = (vector_result.get("DutyType") or "").strip()
             cit = vector_result.get("Citation") or ""
-            # #region agent log
-            try:
-                import json as _agent_json, time as _agent_time
-
-                _cs = str(cit)[:200] if cit is not None else ""
-                with open(
-                    r"c:\Users\AmithKrishnan(G1)XIN\Downloads\Legal-OCR\debug-fe1e15.log",
-                    "a",
-                    encoding="utf-8",
-                ) as _agent_f:
-                    _agent_f.write(
-                        _agent_json.dumps(
-                            {
-                                "sessionId": "fe1e15",
-                                "hypothesisId": "H2",
-                                "location": "query_system._find_obligation._synthetic_unresolved",
-                                "message": "synthetic fallback citation shape",
-                                "data": {
-                                    "cit_type": type(cit).__name__,
-                                    "cit_head": _cs,
-                                    "looks_like_repr": bool(
-                                        isinstance(cit, str) and cit.lstrip().startswith("[{")
-                                    ),
-                                },
-                                "timestamp": int(_agent_time.time() * 1000),
-                            },
-                            ensure_ascii=False,
-                        )
-                        + "\n"
-                    )
-            except Exception:
-                pass
-            # #endregion
             owner: List[str] = []
             cit_for_row: Any = cit
             parsed_meta = _parse_chroma_stored_citation_field(cit)
@@ -2893,37 +2836,6 @@ class ObligationQuerySystem:
                 global_index = None
 
             consolidated_results = consolidated_data.get("consolidated_results") or []
-            # #region agent log
-            if not results and consolidated_results:
-                try:
-                    import json as _agent_json, time as _agent_time
-
-                    with open(
-                        r"c:\Users\AmithKrishnan(G1)XIN\Downloads\Legal-OCR\debug-fe1e15.log",
-                        "a",
-                        encoding="utf-8",
-                    ) as _agent_f:
-                        _agent_f.write(
-                            _agent_json.dumps(
-                                {
-                                    "sessionId": "fe1e15",
-                                    "hypothesisId": "H5",
-                                    "location": "query_system._find_obligation_in_consolidated_data",
-                                    "message": "consolidated results empty; using flat consolidated_results",
-                                    "data": {
-                                        "doc_name": str(consolidated_data.get("document_name") or "")[:160],
-                                        "flat_count": len(consolidated_results),
-                                        "chunk_index_raw": str(vector_result.get("chunk_index", ""))[:40],
-                                    },
-                                    "timestamp": int(_agent_time.time() * 1000),
-                                },
-                                ensure_ascii=False,
-                            )
-                            + "\n"
-                        )
-                except Exception:
-                    pass
-            # #endregion
 
             # Try to find by source category and index (prefer per-category index)
             for category_data in results:
@@ -2996,42 +2908,6 @@ class ObligationQuerySystem:
                     category_label = str(ob.get("category") or source_category or "").strip() or "Other"
                     return _finalize_row(ob, category_label)
 
-            # #region agent log
-            try:
-                import json as _agent_json, time as _agent_time
-
-                _n_cat = len(results) if isinstance(results, list) else 0
-                with open(
-                    r"c:\Users\AmithKrishnan(G1)XIN\Downloads\Legal-OCR\debug-fe1e15.log",
-                    "a",
-                    encoding="utf-8",
-                ) as _agent_f:
-                    _agent_f.write(
-                        _agent_json.dumps(
-                            {
-                                "sessionId": "fe1e15",
-                                "hypothesisId": "H3",
-                                "location": "query_system._find_obligation_in_consolidated_data",
-                                "message": "no consolidated match; using synthetic row",
-                                "data": {
-                                    "source_category": (source_category or "")[:200],
-                                    "source_category_norm": source_category_norm[:200],
-                                    "obligation_index": obligation_index,
-                                    "global_index": global_index,
-                                    "chunk_index_raw": str(vector_result.get("chunk_index", ""))[:40],
-                                    "duty_type": (vector_result.get("DutyType") or "")[:120],
-                                    "party": (vector_result.get("Responsible_Party") or "")[:120],
-                                    "consolidated_top_level_categories": _n_cat,
-                                },
-                                "timestamp": int(_agent_time.time() * 1000),
-                            },
-                            ensure_ascii=False,
-                        )
-                        + "\n"
-                    )
-            except Exception:
-                pass
-            # #endregion
             return _synthetic_unresolved()
 
         except Exception as e:
@@ -3734,7 +3610,7 @@ Output the filtered JSON:"""
         non_empty_results = [r for r in filtered_results if _filtered_fr_has_payload(r)]
         prompt_payload = merge_prompt_filtered_snapshot(non_empty_results)
         uq = json.dumps(user_query, ensure_ascii=False)
-        ndocs = len(filtered_results)
+        ndocs = _merge_input_distinct_source_document_count(filtered_results)
         return f"""You are an expert commercial contract analyst and context extraction engine.
 
 INPUT:
@@ -3853,7 +3729,9 @@ Output only the JSON object:"""
                     "type": "metadata",
                     "data": {
                         "query": user_query,
-                        "total_documents_searched": len(filtered_results),
+                        "total_documents_searched": _merge_input_distinct_source_document_count(
+                            filtered_results
+                        ),
                         "total_obligations_found": 0,
                         "total_categories": 0,
                         "processed_at": datetime.now().isoformat(),
@@ -3877,7 +3755,7 @@ Output only the JSON object:"""
                     "type": "metadata",
                     "data": {
                         "query": user_query,
-                        "total_documents_searched": len(filtered_results),
+                        "total_documents_searched": _merge_input_distinct_source_document_count(merge_in),
                         "total_obligations_found": 0,
                         "total_categories": 0,
                         "processed_at": datetime.now().isoformat(),
@@ -3893,7 +3771,7 @@ Output only the JSON object:"""
                 payload_stream = build_rank_response_without_llm_merge(
                     user_query,
                     merge_in,
-                    documents_searched_count=len(filtered_results),
+                    documents_searched_count=_merge_input_distinct_source_document_count(merge_in),
                     merge_fallback=False,
                 )
                 note = (payload_stream.get("merge_note") or "").strip()
@@ -3904,7 +3782,7 @@ Output only the JSON object:"""
                         yield {"type": "category_group", "data": grp}
                 meta: Dict[str, Any] = {
                     "query": user_query,
-                    "total_documents_searched": len(filtered_results),
+                    "total_documents_searched": _merge_input_distinct_source_document_count(merge_in),
                     "total_obligations_found": int(payload_stream.get("total_obligations_found") or 0),
                     "total_categories": int(payload_stream.get("total_categories") or 0),
                     "processed_at": datetime.now().isoformat(),
@@ -3946,7 +3824,7 @@ Output only the JSON object:"""
                 "type": "metadata",
                 "data": {
                     "query": user_query,
-                    "total_documents_searched": len(filtered_results),
+                    "total_documents_searched": _merge_input_distinct_source_document_count(merge_in),
                     "total_obligations_found": int(payload_stream.get("total_obligations_found") or 0),
                     "total_categories": int(payload_stream.get("total_categories") or 0),
                     "processed_at": datetime.now().isoformat(),
@@ -3987,7 +3865,7 @@ Output only the JSON object:"""
                 self.logger.info("No relevant obligations found across all documents")
                 return {
                     "query": user_query,
-                    "total_documents_searched": len(filtered_results),
+                    "total_documents_searched": _merge_input_distinct_source_document_count(filtered_results),
                     "total_obligations_found": 0,
                     "total_categories": 0,
                     "results": [],
@@ -4011,7 +3889,7 @@ Output only the JSON object:"""
                 )
                 return {
                     "query": user_query,
-                    "total_documents_searched": len(filtered_results),
+                    "total_documents_searched": _merge_input_distinct_source_document_count(merge_in),
                     "total_obligations_found": 0,
                     "total_categories": 0,
                     "results": [],
@@ -4026,13 +3904,13 @@ Output only the JSON object:"""
                 final_result = build_rank_response_without_llm_merge(
                     user_query,
                     merge_in,
-                    documents_searched_count=len(filtered_results),
+                    documents_searched_count=_merge_input_distinct_source_document_count(merge_in),
                     merge_fallback=False,
                 )
                 note = (final_result.get("merge_note") or "").strip()
                 skip_msg = "Testing: merge/rank LLM skipped (SKIP_MERGE_AND_RANK)."
                 final_result["merge_note"] = f"{note} {skip_msg}".strip() if note else skip_msg
-                final_result["total_documents_searched"] = len(filtered_results)
+                final_result["total_documents_searched"] = _merge_input_distinct_source_document_count(merge_in)
                 final_result["processed_at"] = datetime.now().isoformat()
                 num_results = int(final_result.get("total_obligations_found") or 0)
                 n_in_skip = _count_obligations_in_filtered(merge_in)
@@ -4081,7 +3959,7 @@ Output only the JSON object:"""
                 )
                 final_result = _empty_merge_rank_result(
                     user_query,
-                    documents_searched_count=len(filtered_results),
+                    documents_searched_count=_merge_input_distinct_source_document_count(merge_in),
                     merge_note=f"Merge response could not be parsed as JSON: {e}",
                 )
             self.logger.info(f"[TIMING] merge_and_rank: 4. parse_response - {time.perf_counter() - t_step:.3f}s")
@@ -4105,7 +3983,7 @@ Output only the JSON object:"""
                     n_in,
                 )
 
-            final_result["total_documents_searched"] = len(filtered_results)
+            final_result["total_documents_searched"] = _merge_input_distinct_source_document_count(merge_in)
             final_result["processed_at"] = datetime.now().isoformat()
             num_results = int(final_result.get("total_obligations_found") or 0)
             self.logger.info(
@@ -4120,7 +3998,7 @@ Output only the JSON object:"""
             self.logger.error(f"Error merging and ranking results: {e}")
             return {
                 "query": user_query,
-                "total_documents_searched": len(filtered_results),
+                "total_documents_searched": _merge_input_distinct_source_document_count(filtered_results),
                 "total_obligations_found": 0,
                 "total_categories": 0,
                 "results": [],
@@ -4140,7 +4018,7 @@ Output only the JSON object:"""
             if not non_empty_results:
                 return {
                     "query": user_query,
-                    "total_documents_searched": len(filtered_results),
+                    "total_documents_searched": _merge_input_distinct_source_document_count(filtered_results),
                     "total_obligations_found": 0,
                     "total_categories": 0,
                     "results": [],
@@ -4164,7 +4042,7 @@ Output only the JSON object:"""
                 )
                 return {
                     "query": user_query,
-                    "total_documents_searched": len(filtered_results),
+                    "total_documents_searched": _merge_input_distinct_source_document_count(merge_in),
                     "total_obligations_found": 0,
                     "total_categories": 0,
                     "results": [],
@@ -4179,13 +4057,13 @@ Output only the JSON object:"""
                 final_result = build_rank_response_without_llm_merge(
                     user_query,
                     merge_in,
-                    documents_searched_count=len(filtered_results),
+                    documents_searched_count=_merge_input_distinct_source_document_count(merge_in),
                     merge_fallback=False,
                 )
                 note = (final_result.get("merge_note") or "").strip()
                 skip_msg = "Testing: category merge/rank LLM skipped (SKIP_MERGE_AND_RANK)."
                 final_result["merge_note"] = f"{note} {skip_msg}".strip() if note else skip_msg
-                final_result["total_documents_searched"] = len(filtered_results)
+                final_result["total_documents_searched"] = _merge_input_distinct_source_document_count(merge_in)
                 final_result["processed_at"] = datetime.now().isoformat()
                 apply_query_scope_trim_to_results(user_query, final_result)
                 return final_result
@@ -4233,7 +4111,7 @@ Output only the JSON object:"""
                 )
                 final_result = _empty_merge_rank_result(
                     user_query,
-                    documents_searched_count=len(filtered_results),
+                    documents_searched_count=_merge_input_distinct_source_document_count(merge_in),
                     merge_note=f"Merge response could not be parsed as JSON: {e}",
                 )
             self.logger.info(f"[TIMING] merge_and_rank: 4. parse_response - {time.perf_counter() - t_step:.3f}s")
@@ -4260,13 +4138,15 @@ Output only the JSON object:"""
                 obligations_found,
             )
 
+            final_result["total_documents_searched"] = _merge_input_distinct_source_document_count(merge_in)
+
             return final_result
 
         except Exception as e:
             self.logger.error(f"Category merge and rank error: {e}", exc_info=True)
             return {
                 "query": user_query,
-                "total_documents_searched": len(filtered_results),
+                "total_documents_searched": _merge_input_distinct_source_document_count(filtered_results),
                 "total_obligations_found": 0,
                 "total_categories": 0,
                 "results": [],
@@ -5062,10 +4942,9 @@ async def query_obligations_stream_raw(request: Optional[QueryRequest] = Body(de
     Merge/rank with the same prompt as POST /query. LLM tokens are written to the **server console**
     only (not the HTTP response body), so wrong root totals never appear in the client stream.
 
-    The HTTP body receives: progress lines (STEP 1/2, separators), a ``[COMPLETE]`` line, then **one**
-    pretty-printed JSON object after ``parse_llm_json_object`` + ``normalize_query_response_shape``,
-    so ``total_obligations_found``, ``total_categories``, and ``total_documents_searched`` match
-    ``results[]`` and match POST /query shaping where applicable.
+    The HTTP body receives: progress lines (STEP 1/2, separators), streamed merge JSON tokens,
+    a ``[COMPLETE]`` line, then **one** pretty-printed JSON object after ``parse_llm_json_object`` +
+    ``normalize_query_response_shape``, so root totals match ``results[]`` and POST /query shaping.
     """
     if query_system_instance is None:
         raise HTTPException(status_code=503, detail="Query system not initialized")
@@ -5118,6 +4997,8 @@ async def query_obligations_stream_raw(request: Optional[QueryRequest] = Body(de
             _echo(f"[STEP 1] Merge input ready ({n_in} obligation(s) after cap)\n")
             yield f"[STEP 1] Merge input ready ({n_in} obligation(s) after cap)\n"
 
+            merge_prompt = qs._build_merge_rank_prompt(user_query, merge_in)
+
             _echo("[STEP 2] Merge/rank LLM — generating merge JSON (token stream mirrored to server console only)...\n")
             yield "[STEP 2] Merge/rank LLM — generating merge JSON (token stream mirrored to server console only)...\n"
             _echo("=" * 80 + "\n")
@@ -5126,8 +5007,6 @@ async def query_obligations_stream_raw(request: Optional[QueryRequest] = Body(de
             yield "MERGE JSON (single corrected payload below; root totals match results[]):\n"
             _echo("=" * 80 + "\n")
             yield "=" * 80 + "\n"
-
-            merge_prompt = qs._build_merge_rank_prompt(user_query, merge_in)
 
             token_count = 0
             merge_json_buf: List[str] = []
@@ -5160,7 +5039,7 @@ async def query_obligations_stream_raw(request: Optional[QueryRequest] = Body(de
             try:
                 parsed_merge = parse_llm_json_object(raw_joined)
                 parsed_merge.setdefault("query", user_query)
-                parsed_merge["total_documents_searched"] = len(merge_in)
+                parsed_merge["total_documents_searched"] = _merge_input_distinct_source_document_count(merge_in)
                 convert_result_citations_to_structured(parsed_merge, merge_in)
                 normalize_query_response_shape(parsed_merge, merge_in)
                 parsed_merge["processed_at"] = datetime.now().isoformat()
