@@ -5101,26 +5101,17 @@ async def _query_stream_raw_body(req: QueryRequest) -> AsyncIterator[str]:
 
         if not qs.load_consolidated_jsons():
             logging.warning("[STREAM/raw] no consolidated documents")
-            _echo("[ERROR] No consolidated documents found\n")
-            yield "[ERROR] No consolidated documents found\n"
             return
 
         tk = _semantic_search_top_k()
         logging.info("[STREAM/raw] pipeline=POST /query top_k=%d", tk)
-        _echo(f"[QUERY] {user_query}\n")
-        yield f"[QUERY] {user_query}\n"
-
-        _echo(f"[STEP 1] Building merge input (vector → consolidated → group), top_k={tk}...\n")
-        yield f"[STEP 1] Building merge input (vector → consolidated → group), top_k={tk}...\n"
 
         merge_blocks, _document_name_to_id = await qs.build_merge_input_like_post_query(
             user_query, req.document_ids
         )
         if not merge_blocks:
-            msg = f"[STEP 1] No semantic hits (top_k={tk}). Done.\n"
+            msg = f"No semantic hits (top_k={tk}). Done.\n"
             logging.info("[STREAM/raw] no semantic hits top_k=%d", tk)
-            _echo(msg)
-            yield msg
             return
 
         non_empty_fr = [r for r in merge_blocks if _filtered_fr_has_payload(r)]
@@ -5130,17 +5121,6 @@ async def _query_stream_raw_body(req: QueryRequest) -> AsyncIterator[str]:
         )
         n_in = _count_obligations_in_filtered(merge_in)
         logging.info("[STREAM/raw] merge_input obligations=%d (after cap)", n_in)
-        _echo(f"[STEP 1] Merge input ready ({n_in} obligation(s) after cap)\n")
-        yield f"[STEP 1] Merge input ready ({n_in} obligation(s) after cap)\n"
-
-        _echo("[STEP 2] Merge/rank LLM — streaming merge JSON to client and console...\n")
-        yield "[STEP 2] Merge/rank LLM — streaming merge JSON to client and console...\n"
-        _echo("=" * 80 + "\n")
-        yield "=" * 80 + "\n"
-        _echo("MERGE JSON (streamed tokens first — incomplete until [COMPLETE]; reconciled JSON follows):\n")
-        yield "MERGE JSON (streamed tokens first — incomplete until [COMPLETE]; reconciled JSON follows):\n"
-        _echo("=" * 80 + "\n")
-        yield "=" * 80 + "\n"
 
         merge_prompt = qs._build_merge_rank_prompt(user_query, merge_in)
 
@@ -5159,20 +5139,10 @@ async def _query_stream_raw_body(req: QueryRequest) -> AsyncIterator[str]:
             sys.stdout.flush()
             yield token
             await asyncio.sleep(0)
-            if token_count % 200 == 0:
-                logging.info("[STREAM/raw] streamed_tokens=%d", token_count)
 
-            if token_count % 100 == 0:
-                progress = f"\n[{token_count} tokens]\n"
-                sys.stdout.write(progress)
-                sys.stdout.flush()
-                yield progress
-                await asyncio.sleep(0)
-
-        tail = "\n" + "=" * 80 + "\n" + f"[COMPLETE] Generated {token_count} tokens\n" + "=" * 80 + "\n"
+        tail = "\n"
         sys.stdout.write(tail)
         sys.stdout.flush()
-        logging.info("[STREAM/raw] complete tokens=%d", token_count)
         yield tail
 
         raw_joined = "".join(merge_json_buf)
