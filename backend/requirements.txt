@@ -31,8 +31,9 @@ json-repair>=0.30.0
 
 # FastAPI dependencies (new)
 fastapi>=0.104.0
-uvicorn[standard]>=0.24.0
+uvicorn[standard]>=0.29.0
 pydantic>=2.0.0
+python-multipart>=0.0.6
 
 # HTTP requests (for health checks and streaming)
 requests>=2.31.0
@@ -53,7 +54,7 @@ langchain-aws
 rank-bm25>=0.2.2
 
 # AWS Parameter Store (optional)
-boto3
+boto3>=1.34.0
 
 # GCS Emulator (optional, for local development)
 # Install from local directory: pip install -e ./gcp-storage-emulator-main

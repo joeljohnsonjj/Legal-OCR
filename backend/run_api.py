@@ -5,10 +5,14 @@ Run this file to start the API server
 
 import uvicorn
 import os
+from pathlib import Path
 from dotenv import load_dotenv
 
-# Load environment variables
-load_dotenv()
+# Load environment variables from repo root (cwd may differ under uvicorn reload / IDEs)
+load_dotenv(Path(__file__).resolve().parent / ".env")
+
+# Unbuffered Python + prompt stream output in the server terminal (e.g. when hitting /query/stream from Postman).
+os.environ.setdefault("PYTHONUNBUFFERED", "1")
 
 # Load LLM config from AWS Parameter Store (AssumeRole flow) if LLM_PARAMETER_PATH is set
 import logging as _logging
@@ -98,13 +102,16 @@ def main():
     print("=" * 80)
     print("\nPress CTRL+C to stop the server\n")
     
-    # Start the server
+    # Start the server (exclude chroma/output writes from reload so /process does not kill in-flight /query)
     uvicorn.run(
         "query_system:app",
         host=host,
         port=port,
         reload=reload,
-        log_level="info"
+        reload_excludes=["**/chroma_db/**", "**/output/*.sqlite3"],
+        log_level="info",
+        access_log=True,
+        use_colors=True,
     )
 
 

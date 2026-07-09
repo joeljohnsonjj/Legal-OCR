@@ -1,6 +1,7 @@
 """
 Incremental JSON parser for streaming LLM responses.
-Yields complete obligation objects as they arrive in the token stream (so the client sees them over time).
+Yields each complete top-level element of the JSON array at path "results.item"
+(merge response: category groups { "category", "obligations" }) as soon as it is parsed.
 """
 import json
 import re
@@ -32,8 +33,9 @@ async def parse_obligations_stream(token_stream: AsyncIterator[str]) -> AsyncIte
     try:
         import ijson
     except ImportError:
-        # Fallback: buffer full response then parse
-        async for ob in _parse_obligations_buffered(token_stream):
+        # Fallback: stream with a heuristic parser to avoid buffering.
+        logger.warning("ijson not installed; using heuristic streaming parser")
+        async for ob in parse_obligations_stream_simple(token_stream):
             yield ob
         return
 
@@ -108,7 +110,10 @@ async def parse_obligations_stream_simple(token_stream: AsyncIterator[str]) -> A
     buffer = ""
     # Pattern to match complete obligation objects (greedy, matches { ... })
     # This is a heuristic; works when LLM outputs one obligation per line or with clear structure
-    obligation_pattern = re.compile(r'\{[^{}]*"DutyType"[^{}]*\}', re.DOTALL)
+    obligation_pattern = re.compile(
+        r'\{[^{}]*(?:"DutyType"|"Responsible Party"|"category")[^{}]*\}',
+        re.DOTALL,
+    )
     
     async for chunk in token_stream:
         buffer += chunk

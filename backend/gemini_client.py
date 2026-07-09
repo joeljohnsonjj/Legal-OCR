@@ -42,12 +42,14 @@ def generate_content(
     temperature: float = 0.1,
     response_mime_type: str = "application/json",
     max_output_tokens: Optional[int] = None,
+    require_json_object: bool = True,
 ) -> GeminiResponse:
     """
     Call Gemini generateContent via REST using API key.
     - If GOOGLE_GENAI_USE_VERTEXAI=true: uses Vertex AI (aiplatform.googleapis.com) with project/location.
     - Otherwise: uses Google AI Studio (generativelanguage.googleapis.com).
     """
+    _ = require_json_object  # API parity with Azure (Gemini does not use json_schema root-object mode here)
     key = api_key or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
     if not key:
         raise ValueError("GEMINI_API_KEY or GOOGLE_API_KEY must be set")
@@ -152,6 +154,7 @@ async def generate_content_async(
     temperature: float = 0.1,
     response_mime_type: str = "application/json",
     max_output_tokens: Optional[int] = None,
+    require_json_object: bool = True,
 ) -> GeminiResponse:
     """
     Async version of generate_content using asyncio.to_thread.
@@ -178,4 +181,5 @@ async def generate_content_async(
         temperature=temperature,
         response_mime_type=response_mime_type,
         max_output_tokens=max_output_tokens,
+        require_json_object=require_json_object,
     )

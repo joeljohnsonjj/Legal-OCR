@@ -1,0 +1,12 @@
+{
+  "venvPath": ".",
+  "venv": ".venv",
+  "pythonVersion": "3.12",
+  "typeCheckingMode": "off",
+  "executionEnvironments": [
+    {
+      "root": ".",
+      "extraPaths": [".venv/Lib/site-packages"]
+    }
+  ]
+}
