@@ -1,5 +1,6 @@
 README.md
 __init__.py
+orchestrator.py
 pyproject.toml
 test_smoke.py
 ./__init__.py
@@ -46,6 +47,7 @@ session_manager/storage/backend.py
 session_manager/storage/noop_provider.py
 session_manager/storage/postgres_provider.py
 session_manager/storage/session_services.py
+session_manager/storage/sqlite_backend.py
 session_manager/workers/__init__.py
 session_manager/workers/cleanup.py
 session_manager/workers/compaction.py

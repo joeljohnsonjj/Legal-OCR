@@ -42,7 +42,7 @@ Postgres **sessions** (context, compaction, cleanup) + **Mem0** long-term memory
 
 **→ [docs/README.md](docs/README.md)** — index of all guides.
 
-**Quick path:** [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md) (install → SQL → `.env` → LLMs → tracing). **LLM working-state patches:** [docs/WORKING_STATE_LLM_PATCH.md](docs/WORKING_STATE_LLM_PATCH.md).
+**Quick path:** [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md) (install → SQL → `.env` → LLMs → **§6b** two-string `generate_fn` + system addendum → tracing). **LLM working-state patches:** [docs/WORKING_STATE_LLM_PATCH.md](docs/WORKING_STATE_LLM_PATCH.md).
 
 ## Package root files
 
@@ -65,6 +65,7 @@ pip install -e ./memory_management
 from memory_management import initialize, process_turn
 initialize(settings, get_connection, llm_summarize=..., start_cleanup_worker=True)
 result = process_turn(question, user_id, run_id, generate_fn=..., settings=settings, llm_summarize=...)
+# generate_fn(question, session_context, user_background, **kwargs) — see docs/GETTING_STARTED.md §6b
 ```
 
 ## Cursor rules

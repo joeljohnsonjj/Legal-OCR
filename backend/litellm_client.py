@@ -111,6 +111,7 @@ def generate_content(
     temperature: float = 0.1,
     response_mime_type: str = "application/json",
     max_output_tokens: Optional[int] = None,
+    require_json_object: bool = True,
 ) -> LiteLLMResponse:
     """Sync completion via LiteLLM. Returns object with .text."""
     import litellm
@@ -130,7 +131,7 @@ def generate_content(
     if key and not (model_name or "").strip().lower().startswith("bedrock/"):
         kwargs["api_key"] = key
     # response_format=json_object is NOT supported by Bedrock Converse API; skip it for bedrock/ models
-    if response_mime_type == "application/json" and not (model_name or "").strip().lower().startswith("bedrock/"):
+    if response_mime_type == "application/json" and require_json_object and not (model_name or "").strip().lower().startswith("bedrock/"):
         kwargs["response_format"] = {"type": "json_object"}
     kwargs.update(_azure_kwargs(model_name))
     kwargs.update(_bedrock_kwargs(model_name))
@@ -153,6 +154,7 @@ async def generate_content_async(
     temperature: float = 0.1,
     response_mime_type: str = "application/json",
     max_output_tokens: Optional[int] = None,
+    require_json_object: bool = True,
 ) -> LiteLLMResponse:
     """Async completion via LiteLLM. Returns object with .text."""
     import litellm
@@ -171,7 +173,7 @@ async def generate_content_async(
     if key and not (model_name or "").strip().lower().startswith("bedrock/"):
         kwargs["api_key"] = key
     # response_format=json_object is NOT supported by Bedrock Converse API; skip it for bedrock/ models
-    if response_mime_type == "application/json" and not (model_name or "").strip().lower().startswith("bedrock/"):
+    if response_mime_type == "application/json" and require_json_object and not (model_name or "").strip().lower().startswith("bedrock/"):
         kwargs["response_format"] = {"type": "json_object"}
     kwargs.update(_azure_kwargs(model_name))
     kwargs.update(_bedrock_kwargs(model_name))
@@ -194,6 +196,7 @@ async def generate_content_stream(
     temperature: float = 0.1,
     response_mime_type: str = "application/json",
     max_output_tokens: Optional[int] = None,
+    require_json_object: bool = True,
 ) -> AsyncIterator[str]:
     """Async stream of tokens via LiteLLM. Yields text chunks."""
     import litellm
@@ -213,7 +216,7 @@ async def generate_content_stream(
     if key and not (model_name or "").strip().lower().startswith("bedrock/"):
         kwargs["api_key"] = key
     # response_format=json_object is NOT supported by Bedrock Converse API; skip it for bedrock/ models
-    if response_mime_type == "application/json" and not (model_name or "").strip().lower().startswith("bedrock/"):
+    if response_mime_type == "application/json" and require_json_object and not (model_name or "").strip().lower().startswith("bedrock/"):
         kwargs["response_format"] = {"type": "json_object"}
     kwargs.update(_azure_kwargs(model_name))
     kwargs.update(_bedrock_kwargs(model_name))

@@ -148,6 +148,7 @@ def generate_content(
     temperature: float = 0.1,
     response_mime_type: str = "application/json",
     max_output_tokens: Optional[int] = None,
+    require_json_object: bool = True,
 ):
     """
     Call the configured LLM. Returns an object with .text.
@@ -163,6 +164,7 @@ def generate_content(
             temperature=temperature,
             response_mime_type=response_mime_type,
             max_output_tokens=max_output_tokens,
+            require_json_object=require_json_object,
         )
     if _use_azure_openai():
         from azure_openai_client import generate_content as azure_generate
@@ -173,6 +175,7 @@ def generate_content(
             temperature=temperature,
             response_mime_type=response_mime_type,
             max_output_tokens=max_output_tokens,
+            require_json_object=require_json_object,
         )
     from gemini_client import generate_content as gemini_generate
     return gemini_generate(
@@ -182,6 +185,7 @@ def generate_content(
         temperature=temperature,
         response_mime_type=response_mime_type,
         max_output_tokens=max_output_tokens,
+        require_json_object=require_json_object,
     )
 
 
@@ -193,6 +197,7 @@ async def generate_content_async(
     temperature: float = 0.1,
     response_mime_type: str = "application/json",
     max_output_tokens: Optional[int] = None,
+    require_json_object: bool = True,
 ):
     """Async version: uses LiteLLM if LITELLM_MODEL set, else Azure or Gemini. Returns an object with .text."""
     if _use_litellm():
@@ -204,6 +209,7 @@ async def generate_content_async(
             temperature=temperature,
             response_mime_type=response_mime_type,
             max_output_tokens=max_output_tokens,
+            require_json_object=require_json_object,
         )
     if _use_azure_openai():
         from azure_openai_client import generate_content_async as azure_generate_async
@@ -214,6 +220,7 @@ async def generate_content_async(
             temperature=temperature,
             response_mime_type=response_mime_type,
             max_output_tokens=max_output_tokens,
+            require_json_object=require_json_object,
         )
     from gemini_client import generate_content_async as gemini_generate_async
     return await gemini_generate_async(
@@ -223,6 +230,7 @@ async def generate_content_async(
         temperature=temperature,
         response_mime_type=response_mime_type,
         max_output_tokens=max_output_tokens,
+        require_json_object=require_json_object,
     )
 
 
@@ -234,6 +242,7 @@ async def generate_content_stream(
     temperature: float = 0.1,
     response_mime_type: str = "application/json",
     max_output_tokens: Optional[int] = None,
+    require_json_object: bool = True,
 ) -> AsyncIterator[str]:
     """Stream tokens from the configured LLM. Uses LiteLLM when LITELLM_MODEL set, else Azure (Gemini-only has no stream)."""
     if _use_litellm():
@@ -245,6 +254,7 @@ async def generate_content_stream(
             temperature=temperature,
             response_mime_type=response_mime_type,
             max_output_tokens=max_output_tokens,
+            require_json_object=require_json_object,
         ):
             yield token
         return
@@ -257,6 +267,7 @@ async def generate_content_stream(
             temperature=temperature,
             response_mime_type=response_mime_type,
             max_output_tokens=max_output_tokens,
+            require_json_object=require_json_object,
         ):
             yield token
         return
