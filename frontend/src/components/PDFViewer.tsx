@@ -62,8 +62,8 @@ export function PDFViewer({
     }
     
     const fileName = `${cleanName}.pdf`;
-    // In Vite, files in public folder are served from root, so /docs/file.pdf
-    return `/docs/${encodeURIComponent(fileName)}`;
+    const base = import.meta.env.BASE_URL || '/';
+    return `${base}docs/${encodeURIComponent(fileName)}`;
   };
 
   const pdfUrl = getPdfUrl(documentName);

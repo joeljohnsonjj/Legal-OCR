@@ -4,9 +4,11 @@ import { AgreementPreview } from './components/AgreementPreview';
 import { AgreementsAppShell } from './components/AgreementsAppShell';
 import AutofillAgreementPage from './App';
 
+const routerBasename = (import.meta.env.BASE_URL || '/').replace(/\/$/, '');
+
 export default function RouterApp() {
   return (
-    <BrowserRouter>
+    <BrowserRouter basename={routerBasename || undefined}>
       <Routes>
         <Route path="/" element={<Navigate to="/agreements" replace />} />
         <Route element={<AgreementsAppShell />}>

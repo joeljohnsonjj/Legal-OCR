@@ -1,0 +1,61 @@
+services:
+  legal-ocr-qdrant:
+    image: qdrant/qdrant:latest
+    container_name: legal-ocr-qdrant
+    network_mode: host
+    volumes:
+      - legal_ocr_qdrant_data:/qdrant/storage
+    restart: unless-stopped
+
+  legal-ocr-backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: legal-ocr-backend
+    network_mode: host
+    env_file:
+      - ./backend/.env
+    environment:
+      API_HOST: 0.0.0.0
+      API_PORT: 8061
+      API_RELOAD: "false"
+      QDRANT_HOST: 127.0.0.1
+      QDRANT_PORT: 6333
+      DOCS_FOLDER: docs
+      OUTPUT_FOLDER: output
+      LOGS_FOLDER: logs
+      CACHE_FOLDER: ocr_cache
+      PROMPT_FILE: prompt.txt
+    volumes:
+      - ./backend/logs:/app/logs
+      - ./backend/ocr_cache:/app/ocr_cache
+      - ./backend/output:/app/output
+      - ./backend/query_results:/app/query_results
+      - ./backend/docs:/app/docs
+    depends_on:
+      - legal-ocr-qdrant
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8061/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 180s
+
+  legal-ocr-frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_API_BASE_URL: /legal-ocr/backend
+        VITE_BASE_PATH: /legal-ocr/
+        VITE_AI_CITATIONS: "false"
+    container_name: legal-ocr-frontend
+    network_mode: host
+    depends_on:
+      legal-ocr-backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  legal_ocr_qdrant_data:

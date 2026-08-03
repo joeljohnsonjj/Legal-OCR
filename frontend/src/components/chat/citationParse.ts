@@ -300,7 +300,8 @@ export function buildPublicDocPdfUrl(documentName: string, firstPage?: number): 
     cleanName = cleanName.slice(0, -4);
   }
   const fileName = `${cleanName}.pdf`;
-  const path = `/docs/${encodeURIComponent(fileName)}`;
+  const base = import.meta.env.BASE_URL || '/';
+  const path = `${base}docs/${encodeURIComponent(fileName)}`;
   if (firstPage !== undefined && firstPage > 0) {
     return `${path}#page=${firstPage}`;
   }

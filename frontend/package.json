@@ -2,6 +2,7 @@
       "name": "legal-ocr-frontend",
       "version": "0.1.0",
       "private": true,
+      "homepage": "/legal-ocr",
       "dependencies": {
             "@google/generative-ai": "^0.24.0",
             "@radix-ui/react-accordion": "^1.2.3",
