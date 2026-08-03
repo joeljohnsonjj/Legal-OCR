@@ -1,71 +1,17 @@
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-env/
-venv/
-ENV/
-env.bak/
-venv.bak/
-
-# Virtual environments
-env/
-venv/
-ENV/
-env.bak/
-venv.bak/
-
-# IDEs
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-
-# Environment files
-.env
-.env.local
-.env.*.local
-
-# Logs and cache
-logs/
-*.log
-ocr_cache/
-__pycache__/
-
-# Output files
-output/
-query_results/
-
-# Backup files
-bkup/
-backup/
-*.bak
-
-# OS files
-.DS_Store
-Thumbs.db
-desktop.ini
-
-# Git
-.git/
-.gitignore
-.gitattributes
-
-# Documentation
-README.md
+.venv
+venv
+__pycache__
+*.pyc
+.pytest_cache
+.mypy_cache
+output
+logs
+ocr_cache
+query_results
 docs/*.pdf
-*.md
-
-# Docker files
-Dockerfile
-.dockerignore
-docker-compose.yml
-
-# Test files
-tests/
-test_*.py
-*_test.py
-
+.env
+*.log
+.git
+.cursor
+debug-*.log
+memory_management/memory_management.egg-info

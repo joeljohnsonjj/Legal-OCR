@@ -1,8 +1,9 @@
 {
-      "name": "AI Autofill Feature Design (Copy)",
+      "name": "legal-ocr-frontend",
       "version": "0.1.0",
       "private": true,
       "dependencies": {
+            "@google/generative-ai": "^0.24.0",
             "@radix-ui/react-accordion": "^1.2.3",
             "@radix-ui/react-alert-dialog": "^1.1.6",
             "@radix-ui/react-aspect-ratio": "^1.1.2",
@@ -32,6 +33,7 @@
             "class-variance-authority": "^0.7.1",
             "clsx": "*",
             "cmdk": "^1.1.1",
+            "dotenv": "^16.4.5",
             "embla-carousel-react": "^8.6.0",
             "input-otp": "^1.4.2",
             "lucide-react": "^0.487.0",
@@ -53,7 +55,8 @@
       "devDependencies": {
             "@types/node": "^20.10.0",
             "@vitejs/plugin-react-swc": "^3.10.2",
-            "vite": "6.3.5"
+            "vite": "6.3.5",
+            "vitest": "^3.2.4"
       },
       "scripts": {
             "generate-documents": "node scripts/generate-documents.js",
@@ -61,6 +64,8 @@
             "dev": "vite",
             "prebuild": "npm run generate-documents",
             "build": "vite build",
-            "stub-server": "node server/stub-ocr-server.js"
+            "stub-server": "node server/stub-ocr-server.js",
+            "citation-normalize-server": "node server/citation-normalize-server.js",
+            "test": "vitest run"
       }
 }

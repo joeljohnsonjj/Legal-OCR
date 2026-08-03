@@ -8,12 +8,12 @@ import {
   CHAT_ASSISTANT_NAME,
   CHAT_PANEL_WIDTH,
   DEFAULT_LAND_RECORD_ID,
-  HEB_RED,
-  HEB_RED_HOVER,
+  BRAND_ORANGE,
+  BRAND_ORANGE_HOVER,
 } from '../constants/landRecord';
 
 /**
- * Land record shell: collapsible left nav, LOCATION HQ header; chat only on `/agreements`.
+ * Land record shell: collapsible left nav, top utility header; chat only on `/agreements`.
  */
 /** Chat launcher + panel only on land details agreements list (`/agreements`). */
 function isAgreementsListRoute(pathname: string): boolean {
@@ -100,7 +100,7 @@ export function AgreementsAppShell() {
               paddingLeft: 16,
               paddingRight: 12,
               borderRadius: 16,
-              backgroundColor: launcherHover ? HEB_RED_HOVER : HEB_RED,
+              backgroundColor: launcherHover ? BRAND_ORANGE_HOVER : BRAND_ORANGE,
               boxShadow: '0 4px 20px rgba(0, 0, 0, 0.08)',
               transition: 'background-color 0.2s ease',
             }}

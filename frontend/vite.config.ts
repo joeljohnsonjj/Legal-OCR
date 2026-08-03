@@ -63,5 +63,13 @@
     server: {
       port: 3000,
       open: true,
+      proxy: {
+        // Citation normalizer only (separate from VITE_API_BASE_URL / stub on 8000)
+        '/api/normalize-citations': {
+          target: 'http://localhost:8001',
+          changeOrigin: true,
+          rewrite: () => '/normalize-citations',
+        },
+      },
     },
   });

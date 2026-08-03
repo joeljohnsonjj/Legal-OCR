@@ -1,6 +1,6 @@
 import { useSearchParams } from 'react-router-dom';
 import { Info } from 'lucide-react';
-import { DEFAULT_LAND_RECORD_ID, LAND_ALIAS, LAND_PRIMARY_USE } from '../constants/landRecord';
+import { DEFAULT_LAND_RECORD_ID, LAND_ALIAS, LAND_PRIMARY_USE, BRAND_BLUE } from '../constants/landRecord';
 import { AgreementsTableSection } from './AgreementsTableSection';
 
 const TABS = [
@@ -42,7 +42,7 @@ export function LandDetailsPage() {
                 type="button"
                 className="rounded-full text-sm font-medium text-white"
                 style={{
-                  backgroundColor: '#4B5563',
+                  backgroundColor: BRAND_BLUE,
                   paddingLeft: 20,
                   paddingRight: 20,
                   height: 40,
@@ -55,7 +55,7 @@ export function LandDetailsPage() {
                 type="button"
                 className="rounded-full text-sm font-medium text-white"
                 style={{
-                  backgroundColor: '#4B5563',
+                  backgroundColor: BRAND_BLUE,
                   paddingLeft: 20,
                   paddingRight: 20,
                   height: 40,
@@ -72,12 +72,12 @@ export function LandDetailsPage() {
             style={{ lineHeight: '22px' }}
           >
             <div className="flex items-center gap-2">
-              <span className="font-semibold">Location Id:</span>
+              <span className="font-semibold">Record Id:</span>
               <span>{DEFAULT_LAND_RECORD_ID}</span>
               <button
                 type="button"
                 className="flex h-5 w-5 items-center justify-center rounded-full border border-gray-300 text-gray-500 hover:bg-gray-50"
-                aria-label="Location Id information"
+                aria-label="Record Id information"
               >
                 <Info className="h-3 w-3" strokeWidth={2} />
               </button>

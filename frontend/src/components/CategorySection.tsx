@@ -1,8 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
-import { Search, Check, X, ChevronLeft, ChevronRight } from 'lucide-react';
+import { Search, Check, X, ChevronLeft, ChevronRight, Loader2 } from 'lucide-react';
 import { FormField } from '../App';
 import { GhostFormField } from './GhostFormField';
-import { AIAnalyzingAnimation } from './AIAnalyzingAnimation';
 import { Input } from './ui/input';
 import { CitationItem } from '../services/apiService';
 import { PDFViewer } from './PDFViewer';
@@ -84,6 +83,8 @@ interface PDFReference {
 interface Snippet {
   id: string;
   title: string;
+  /** Backend obligation category (e.g. "Maintenance & Repairs"). */
+  category?: string;
   pdfReference: PDFReference;
   fieldMappings: Record<string, string>;
   matchedFields: string[];
@@ -117,6 +118,10 @@ interface CategorySectionProps {
   hasAIGeneratedFields?: Record<string, boolean>;
   globalSearchQuery?: string;
   onGlobalSearch?: (query: string) => void;
+  /** After global AI Search returned zero obligations — show empty state instead of hiding the card. */
+  aiSearchHadNoResults?: boolean;
+  /** Short tail of readable stream lines (terminal-style) while raw query bytes arrive. */
+  queryStreamProgressLog?: string;
   checkedDocuments?: string[];
   documents?: Document[];
   onDocumentCheckChange?: (documentId: string, checked: boolean) => void;
@@ -150,13 +155,15 @@ export function CategorySection({
   onFieldSearch,
   onToggleAiMode,
   isAnalyzing = false,
-  snippetsCount: _snippetsCount = 0,
+  snippetsCount = 0,
   snippets = [],
   onApplySnippet,
   isAIApproved = false,
   hasAIGeneratedFields = {},
   globalSearchQuery = '',
   onGlobalSearch,
+  aiSearchHadNoResults = false,
+  queryStreamProgressLog: _queryStreamProgressLog = '',
   checkedDocuments = [],
   documents = [],
   onDocumentCheckChange,
@@ -169,21 +176,23 @@ export function CategorySection({
   const [flippedSnippetId, setFlippedSnippetId] = useState<string | null>(null);
   const [pdfPageIndex, setPdfPageIndex] = useState(0);
 
-  // Reset snippet index when snippets change - clamp to valid bounds
+  // While the model streams, follow the newest obligation row; when idle, clamp index to bounds.
   useEffect(() => {
-    if (snippets.length > 0) {
-      // If current index is out of bounds, reset to last valid index
-      setCurrentSnippetIndex((prevIndex) => {
-        if (prevIndex >= snippets.length) {
-          return snippets.length - 1;
-        }
-        return prevIndex;
-      });
-    } else {
-      // No snippets - reset to 0
+    if (snippets.length === 0) {
       setCurrentSnippetIndex(0);
+      return;
     }
-  }, [snippets.length]);
+    if (isAnalyzing) {
+      setCurrentSnippetIndex(snippets.length - 1);
+      return;
+    }
+    setCurrentSnippetIndex((prevIndex) => {
+      if (prevIndex >= snippets.length) {
+        return snippets.length - 1;
+      }
+      return prevIndex;
+    });
+  }, [snippets.length, isAnalyzing]);
 
   // Reset PDF page index when switching snippets or flipping view
   useEffect(() => {
@@ -203,17 +212,13 @@ export function CategorySection({
 
   // Handle search execution
   const handleSearch = () => {
-    console.log('[DEBUG CategorySection] handleSearch called', { 
-      onGlobalSearch: !!onGlobalSearch, 
-      localSearchQuery,
-      checkedDocuments: checkedDocuments.length 
-    });
+    // #region UI debug logging (disabled)
+    // console.log('[DEBUG CategorySection] handleSearch called', { ... });
+    // #endregion
     if (onGlobalSearch) {
-      // Always call onGlobalSearch, even if query is empty (per requirements)
-      console.log('[DEBUG CategorySection] Calling onGlobalSearch with query:', localSearchQuery || '');
       onGlobalSearch(localSearchQuery || '');
     } else {
-      console.warn('[DEBUG CategorySection] onGlobalSearch is not defined!');
+      console.warn('[CategorySection] onGlobalSearch is not defined');
     }
   };
 
@@ -501,8 +506,11 @@ export function CategorySection({
             </div>
           )}
 
-          {/* 2. Search bar + AI Search button - Full width row, no heading */}
-          <div className="flex items-center gap-2 w-full mb-1" style={{marginTop:'20px',marginBottom:'20px'}}>
+          {/* 2. Search bar + AI Search button */}
+          <div
+            className="flex flex-wrap items-center gap-2 w-full mb-1"
+            style={{ marginTop: '20px', marginBottom: '20px' }}
+          >
             <div className="relative flex-1 min-w-0">
               <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400" />
               <Input
@@ -515,7 +523,7 @@ export function CategorySection({
                   setShowSearchRequiredWarning(false);
                 }}
                 onKeyDown={handleSearchKeyDown}
-                style={{paddingLeft:'33px'}}
+                style={{ paddingLeft: '33px' }}
               />
             </div>
             {onToggleAiMode && (
@@ -544,7 +552,7 @@ export function CategorySection({
                     : 'bg-gray-300 text-gray-700 hover:bg-gray-400'
                 }`}
                 title={checkedDocuments.length === 0 ? 'Please select at least one document' : 'Enter search text and click to search'}
-                style={{position:'relative', borderRadius:'60px'}}
+                style={{ position: 'relative', borderRadius: '60px' }}
               >
                 <Search className="w-4 h-4" />
                 AI Search
@@ -572,19 +580,41 @@ export function CategorySection({
             </div>
           )}
 
-          {/* AI Snippets Section - Show when AI mode is ON and snippets exist */}
-          {aiMode && snippets.length > 0 && (
+          {/* AI Snippets Section — show while loading, when rows exist, or when search returned no obligations */}
+          {aiMode && (snippets.length > 0 || isAnalyzing || aiSearchHadNoResults) && (
             <div className="mb-6">
-              {/* Main Card Container */}
-              <div className="bg-white border border-gray-200 rounded-lg shadow-sm overflow-hidden">
+              {/* Main Card Container — loading overlay only until first obligation streams in */}
+              <div className="relative bg-white border border-gray-200 rounded-lg shadow-sm overflow-hidden">
+                <div
+                  className={`transition-opacity duration-200 ${
+                    isAnalyzing && snippets.length === 0 ? 'opacity-50' : 'opacity-100'
+                  }`}
+                >
                 {/* Header Section */}
-                <div className="px-4 py-3 border-b border-gray-200 bg-white flex items-center justify-between">
-                  <div className="flex items-center gap-2">
+                <div className="px-4 py-3 border-b border-gray-200 bg-white flex items-center justify-between gap-3">
+                  <div className="flex flex-col gap-1 min-w-0">
                     <h3 className="text-sm font-semibold text-gray-900">AI interpretations from agreement</h3>
+                    {isAnalyzing && (
+                      <p className="text-xs text-gray-500">
+                        {snippets.length === 0
+                          ? 'Streaming merge response — obligations appear in this list as each complete obligation object arrives in the JSON (same data the backend prints line by line).'
+                          : `${snippets.length} obligation${snippets.length === 1 ? '' : 's'} received so far; the list updates as more objects finish streaming.`}
+                      </p>
+                    )}
                   </div>
                   
                   {/* Navigation Controls and View Legal Evidence - Header Right */}
                   <div className="flex items-center gap-3">
+                    {isAnalyzing && snippets.length > 0 && (
+                      <div
+                        className="flex flex-shrink-0 items-center gap-1.5 text-red-600"
+                        aria-live="polite"
+                        aria-busy="true"
+                        title="Still loading obligations"
+                      >
+                        <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
+                      </div>
+                    )}
                     {/* View Legal Evidence Button */}
                     {currentSnippet && currentSnippet.citations && currentSnippet.citations.length > 0 && (
                       <button
@@ -633,9 +663,51 @@ export function CategorySection({
                   </div>
                 </div>
 
-                {/* Content Section */}
-                {currentSnippet && (
+                {/* Stream activity log (disabled — re-enable when debugging raw stream text)
+                {queryStreamProgressLog.trim() && isAnalyzing && (
+                  <div className="border-t border-gray-100 bg-slate-50 px-4 py-2">
+                    <p className="text-[10px] font-semibold uppercase tracking-wide text-slate-500 mb-1">
+                      Stream activity
+                    </p>
+                    <pre
+                      className="text-[11px] leading-snug font-mono text-slate-700 whitespace-pre-wrap break-words max-h-28 overflow-y-auto"
+                      aria-live="polite"
+                    >
+                      {queryStreamProgressLog}
+                    </pre>
+                  </div>
+                )}
+                */}
+
+                {/* Content Section — initial fetch: overlay on card shows spinner; keep min height for layout */}
+                {snippets.length === 0 && isAnalyzing ? (
+                  <div
+                    className="min-h-[14rem] border-t border-gray-100 bg-gray-50/30"
+                    aria-hidden
+                  />
+                ) : snippets.length === 0 && !isAnalyzing && aiSearchHadNoResults ? (
+                  <div
+                    className="px-4 py-12 flex flex-col items-center justify-center gap-2 text-gray-600 border-t border-gray-100 bg-gray-50/50"
+                    role="status"
+                    aria-live="polite"
+                  >
+                    <p className="text-sm font-medium text-gray-800 text-center">No obligations found</p>
+                    <p className="text-xs text-gray-500 text-center max-w-md">
+                      The search completed successfully, but no matching obligations were returned for your query and selected documents.
+                    </p>
+                  </div>
+                ) : currentSnippet ? (
                   <div className="p-4">
+                    {currentSnippet.category ? (
+                      <div className="mb-3">
+                        <span
+                          className="inline-flex items-center rounded-full bg-indigo-50 text-indigo-900 border border-indigo-100 px-3 py-1 text-xs font-semibold tracking-tight"
+                          title="Obligation category from the agreement index"
+                        >
+                          {currentSnippet.category}
+                        </span>
+                      </div>
+                    ) : null}
                     {/* Flip Card Container */}
                     <div
                       className="relative w-full"
@@ -822,6 +894,18 @@ export function CategorySection({
                       </button>
                     </div>
                   </div>
+                ) : null}
+                </div>
+
+                {isAnalyzing && snippets.length === 0 && (
+                  <div
+                    className="absolute inset-0 z-20 flex flex-col items-center justify-center gap-3 rounded-lg bg-white/40 backdrop-blur-sm"
+                    aria-live="polite"
+                    aria-busy="true"
+                  >
+                    <Loader2 className="h-10 w-10 animate-spin text-red-600" aria-hidden />
+                    <p className="text-sm font-medium text-gray-800">Fetching obligations…</p>
+                  </div>
                 )}
               </div>
             </div>
@@ -878,17 +962,7 @@ export function CategorySection({
       <div className="px-6 py-6">
         {/* Category Header - For maintenance, only show heading (document table, search bar are in form fields below) */}
         <div className="mb-4">
-          <div className="flex items-center justify-between mb-4">
-            <h2 className="text-gray-900 font-bold text-xl">{title}</h2>
-            <div className="flex items-center gap-3">
-              {/* AI Analyzing Animation - Show in maintenance section when analyzing */}
-              {category === 'maintenance' && aiMode && isAnalyzing && (
-                <div className="animate-in fade-in slide-in-from-right duration-300">
-                  <AIAnalyzingAnimation size="sm" message="" />
-                </div>
-              )}
-            </div>
-          </div>
+          <h2 className="text-gray-900 font-bold text-xl">{title}</h2>
         </div>
 
         {/* Form Fields */}

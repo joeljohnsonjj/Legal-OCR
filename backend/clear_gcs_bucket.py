@@ -66,7 +66,7 @@ def main() -> int:
         print("Refusing to run without --yes", file=sys.stderr)
         return 2
 
-    bucket_name = os.getenv("GCS_BUCKET", "heb-legal")
+    bucket_name = os.getenv("GCS_BUCKET", "legal-ocr-documents")
 
     if args.wipe_local_disk:
         wipe_emulator_disk()

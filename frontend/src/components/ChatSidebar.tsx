@@ -4,14 +4,15 @@ import {
   useLayoutEffect,
   useRef,
   useState,
-  type ReactNode,
 } from 'react';
 import { ChevronDown, ChevronUp, RotateCcw, Send } from 'lucide-react';
 import { chatQueryStream, chatReset } from '../services/apiService';
+import { AssistantBubbleContent } from './chat/AssistantBubbleContent';
+import { formatMessageBody } from './chat/chatFormatting';
 import {
-  CHAT_ACCENT_ON_LIGHT,
-  CHAT_ACCENT_ON_RED,
-  CHAT_AREA_BG,
+  BRAND_BLUE_DEEP,
+  BRAND_ORANGE,
+  BRAND_ORANGE_HOVER,
   CHAT_ASSISTANT_NAME,
   CHAT_BORDER,
   CHAT_CARD_BG,
@@ -20,8 +21,6 @@ import {
   CHAT_TEXT_SECONDARY,
   CHAT_USER_BUBBLE_BG,
   DEFAULT_LAND_RECORD_ID,
-  HEB_RED,
-  HEB_RED_HOVER,
 } from '../constants/landRecord';
 
 const SHEET_MS = 280;
@@ -125,117 +124,6 @@ function createSessionIds(): ChatSessionIds {
     userId: `user-${stamp}-${Math.random().toString(16).slice(2)}`,
     runId: `run-${stamp}-${Math.random().toString(16).slice(2)}`,
   };
-}
-
-/** Linkify URLs and highlight “Clause … – …” spans like the reference mock. */
-function formatInlineSegment(
-  text: string,
-  keyPrefix: string,
-  accentColor: string = CHAT_ACCENT_ON_LIGHT
-): ReactNode[] {
-  const parts = text.split(/(Clause\s+\d+(?:\.\d+)*\s*[–—\-]\s*[^\n]+)/gi);
-  const out: ReactNode[] = [];
-  parts.forEach((part, i) => {
-    if (!part) return;
-    if (i % 2 === 1) {
-      out.push(
-        <span
-          key={`${keyPrefix}-cl-${i}`}
-          className="cursor-pointer underline"
-          style={{ color: accentColor }}
-        >
-          {part}
-        </span>
-      );
-    } else {
-      out.push(...linkifyUrls(part, `${keyPrefix}-u-${i}`, accentColor));
-    }
-  });
-  return out.length ? out : linkifyUrls(text, keyPrefix, accentColor);
-}
-
-function linkifyUrls(text: string, keyPrefix: string, linkColor: string = CHAT_ACCENT_ON_LIGHT): ReactNode[] {
-  const urlRe = /(https?:\/\/[^\s]+)/g;
-  const parts = text.split(urlRe);
-  return parts.map((part, i) => {
-    if (/^https?:\/\//.test(part)) {
-      return (
-        <a
-          key={`${keyPrefix}-u-${i}`}
-          href={part}
-          className="underline"
-          style={{ color: linkColor }}
-          target="_blank"
-          rel="noreferrer"
-        >
-          {part}
-        </a>
-      );
-    }
-    return <span key={`${keyPrefix}-t-${i}`}>{part}</span>;
-  });
-}
-
-function formatMessageBody(
-  content: string,
-  keyBase: string,
-  variant: 'assistant' | 'user'
-): ReactNode {
-  const lines = content.split('\n');
-  const accent = variant === 'user' ? CHAT_ACCENT_ON_RED : CHAT_ACCENT_ON_LIGHT;
-  const quoteStyle =
-    variant === 'user'
-      ? { color: 'rgba(255,255,255,0.95)' }
-      : { color: CHAT_TEXT_SECONDARY };
-
-  return lines.map((line, li) => {
-    const trimmed = line.trim();
-    const quoteChar = trimmed.length >= 2 ? trimmed[0] : '';
-    const isFullyQuoted =
-      (quoteChar === '"' || quoteChar === "'") && trimmed.endsWith(quoteChar);
-    const body = isFullyQuoted ? (
-      <em style={quoteStyle}>
-        {quoteChar}
-        {formatInlineSegment(trimmed.slice(1, -1), `${keyBase}-q-${li}`, accent)}
-        {quoteChar}
-      </em>
-    ) : (
-      <span
-        className={variant === 'user' ? 'text-white' : ''}
-        style={variant === 'assistant' ? { color: CHAT_TEXT_PRIMARY } : undefined}
-      >
-        {line
-          .split(/(".*?"|'.*?')/g)
-          .filter((segment) => segment.length > 0)
-          .map((segment, si) => {
-            const segQuote = segment.length >= 2 ? segment[0] : '';
-            const isQuotedSegment =
-              (segQuote === '"' || segQuote === "'") && segment.endsWith(segQuote);
-            if (!isQuotedSegment) {
-              return (
-                <span key={`${keyBase}-s-${li}-${si}`}>
-                  {formatInlineSegment(segment, `${keyBase}-s-${li}-${si}`, accent)}
-                </span>
-              );
-            }
-            const inner = segment.slice(1, -1);
-            return (
-              <em key={`${keyBase}-q-${li}-${si}`} style={quoteStyle}>
-                {segQuote}
-                {formatInlineSegment(inner, `${keyBase}-q-${li}-${si}`, accent)}
-                {segQuote}
-              </em>
-            );
-          })}
-      </span>
-    );
-    return (
-      <span key={`${keyBase}-ln-${li}`}>
-        {li > 0 ? <br /> : null}
-        {body}
-      </span>
-    );
-  });
 }
 
 export function ChatSidebar({
@@ -376,7 +264,8 @@ export function ChatSidebar({
   useEffect(() => {
     if (!renderOverlay) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
+      if (e.key !== 'Escape') return;
+      onClose();
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
@@ -462,10 +351,11 @@ export function ChatSidebar({
   const backdropOpacity = sheetEntered ? 0.35 : 0;
 
   return (
-    <div
-      className="pointer-events-none fixed inset-0 flex flex-col justify-end"
-      style={{ zIndex: 60 }}
-    >
+    <>
+      <div
+        className="pointer-events-none fixed inset-0 flex flex-col justify-end"
+        style={{ zIndex: 60 }}
+      >
       <button
         type="button"
         className="pointer-events-auto absolute inset-0 border-0 bg-black transition-opacity"
@@ -517,7 +407,7 @@ export function ChatSidebar({
                 height: HEADER_H,
                 minHeight: HEADER_H,
                 maxHeight: HEADER_H,
-                backgroundColor: HEB_RED,
+                backgroundColor: BRAND_ORANGE,
                 borderTopLeftRadius: PANEL_RADIUS,
                 borderTopRightRadius: PANEL_RADIUS,
                 paddingLeft: 10,
@@ -618,8 +508,12 @@ export function ChatSidebar({
                 style={{ flex: '1 1 0%', minHeight: 0 }}
               >
               <div
+                className="relative flex min-h-0 min-w-0 flex-1 flex-row"
+                style={{ flex: '1 1 0%', minHeight: 0 }}
+              >
+              <div
                 ref={listRef}
-                className="flex flex-1 flex-col overflow-y-auto overflow-x-hidden px-4 py-4"
+                className="flex min-w-0 flex-1 flex-col overflow-y-auto overflow-x-hidden px-4 py-4"
                 style={{
                   flex: '1 1 0%',
                   minHeight: 0,
@@ -657,8 +551,8 @@ export function ChatSidebar({
                                 width: 6,
                                 height: 6,
                                 borderRadius: 999,
-                                backgroundColor: HEB_RED,
-                                boxShadow: '0 0 0 2px rgba(220, 38, 38, 0.15)',
+                                backgroundColor: BRAND_ORANGE,
+                                boxShadow: '0 0 0 2px rgba(234, 88, 12, 0.2)',
                               }}
                             />
                           )}
@@ -670,7 +564,7 @@ export function ChatSidebar({
                                 height: 6,
                                 borderRadius: 999,
                                 backgroundColor: CHAT_USER_BUBBLE_BG,
-                                boxShadow: '0 0 0 2px rgba(0, 119, 204, 0.15)',
+                                boxShadow: '0 0 0 2px rgba(37, 99, 235, 0.22)',
                               }}
                             />
                           )}
@@ -690,10 +584,10 @@ export function ChatSidebar({
                               ? 'none'
                               : `1px solid ${CHAT_BORDER}`,
                             background: isUser 
-                              ? `linear-gradient(135deg, ${CHAT_USER_BUBBLE_BG} 0%, #005aa3 100%)` 
+                              ? `linear-gradient(135deg, ${CHAT_USER_BUBBLE_BG} 0%, ${BRAND_BLUE_DEEP} 100%)` 
                               : 'linear-gradient(180deg, #ffffff 0%, #f8fafc 100%)',
                             boxShadow: isUser
-                              ? '0 10px 24px rgba(0, 119, 204, 0.28), 0 4px 10px rgba(0, 119, 204, 0.16)'
+                              ? '0 10px 24px rgba(37, 99, 235, 0.28), 0 4px 10px rgba(12, 27, 58, 0.18)'
                               : '0 10px 24px rgba(15, 23, 42, 0.08), 0 4px 10px rgba(15, 23, 42, 0.05)',
                             color: isUser ? '#FFFFFF' : CHAT_TEXT_PRIMARY,
                             textAlign: 'left',
@@ -705,7 +599,7 @@ export function ChatSidebar({
                             <span className="flex items-center gap-2">
                               <svg
                                 className="h-4 w-4 animate-spin"
-                                style={{ color: HEB_RED }}
+                                style={{ color: BRAND_ORANGE }}
                                 viewBox="0 0 24 24"
                                 aria-hidden="true"
                               >
@@ -715,12 +609,18 @@ export function ChatSidebar({
                                   d="M12 2a10 10 0 0 1 10 10h-3a7 7 0 0 0-7-7V2z"
                                 />
                               </svg>
-                              <span className="text-sm font-medium" style={{ color: HEB_RED }}>
+                              <span className="text-sm font-medium" style={{ color: BRAND_ORANGE }}>
                                 Thinking…
                               </span>
                             </span>
+                          ) : isUser ? (
+                            formatMessageBody(m.content, `m-${i}`, 'user')
                           ) : (
-                            formatMessageBody(m.content, `m-${i}`, isUser ? 'user' : 'assistant')
+                            <AssistantBubbleContent
+                              content={m.content}
+                              messageKey={`m-${m.id}`}
+                              isStreaming={isStreaming}
+                            />
                           )}
                         </div>
                       </div>
@@ -745,8 +645,8 @@ export function ChatSidebar({
                             width: 6,
                             height: 6,
                             borderRadius: 999,
-                            backgroundColor: HEB_RED,
-                            boxShadow: '0 0 0 2px rgba(220, 38, 38, 0.15)',
+                            backgroundColor: BRAND_ORANGE,
+                            boxShadow: '0 0 0 2px rgba(234, 88, 12, 0.2)',
                           }}
                         />
                         <span>Assistant</span>
@@ -775,19 +675,21 @@ export function ChatSidebar({
                   <div ref={bottomRef} className="h-px w-full flex-shrink-0" aria-hidden />
                 </div>
               </div>
+              </div>
 
               {error && (
                 <div
                   className="flex-shrink-0 border-t px-4 py-3 text-xs rounded-b-lg"
                   style={{
-                    borderColor: 'rgba(238, 40, 36, 0.2)',
-                    background: 'linear-gradient(135deg, rgba(238, 40, 36, 0.06) 0%, rgba(238, 40, 36, 0.12) 100%)',
-                    color: '#7A1816',
+                    borderColor: 'rgba(234, 88, 12, 0.28)',
+                    background:
+                      'linear-gradient(135deg, rgba(234, 88, 12, 0.06) 0%, rgba(12, 27, 58, 0.06) 100%)',
+                    color: '#9A3412',
                     backdropFilter: 'blur(8px)',
                   }}
                 >
                   <div className="flex items-center gap-2">
-                    <svg className="h-3 w-3 text-red-500" viewBox="0 0 24 24" fill="currentColor">
+                    <svg className="h-3 w-3" style={{ color: BRAND_ORANGE }} viewBox="0 0 24 24" fill="currentColor">
                       <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/>
                     </svg>
                     {error}
@@ -825,8 +727,8 @@ export function ChatSidebar({
                     boxShadow: '0 1px 3px rgba(0, 0, 0, 0.05)',
                   }}
                   onFocus={(e) => {
-                    e.currentTarget.style.borderColor = HEB_RED;
-                    e.currentTarget.style.boxShadow = `0 0 0 3px rgba(220, 38, 38, 0.12), 0 2px 8px rgba(0, 0, 0, 0.1)`;
+                    e.currentTarget.style.borderColor = BRAND_ORANGE;
+                    e.currentTarget.style.boxShadow = `0 0 0 3px rgba(234, 88, 12, 0.15), 0 2px 8px rgba(0, 0, 0, 0.1)`;
                     e.currentTarget.style.transform = 'translateY(-1px)';
                   }}
                   onBlur={(e) => {
@@ -849,13 +751,13 @@ export function ChatSidebar({
                     background: loading || !input.trim()
                       ? 'linear-gradient(135deg, #9ca3af 0%, #6b7280 100%)'
                       : sendHovered
-                        ? `linear-gradient(135deg, ${HEB_RED_HOVER} 0%, #b91c1c 100%)`
-                        : `linear-gradient(135deg, ${HEB_RED} 0%, #b91c1c 100%)`,
+                        ? `linear-gradient(135deg, ${BRAND_ORANGE_HOVER} 0%, ${BRAND_BLUE_DEEP} 100%)`
+                        : `linear-gradient(135deg, ${BRAND_ORANGE} 0%, ${BRAND_BLUE_DEEP} 100%)`,
                     boxShadow: loading || !input.trim()
                       ? 'none'
                       : sendHovered
-                        ? '0 6px 20px rgba(220, 38, 38, 0.4), 0 2px 8px rgba(220, 38, 38, 0.2)'
-                        : '0 4px 16px rgba(220, 38, 38, 0.3), 0 2px 8px rgba(220, 38, 38, 0.1)',
+                        ? '0 6px 20px rgba(234, 88, 12, 0.35), 0 2px 8px rgba(12, 27, 58, 0.2)'
+                        : '0 4px 16px rgba(234, 88, 12, 0.3), 0 2px 8px rgba(12, 27, 58, 0.15)',
                     transition: 'all 0.2s ease',
                     transform: sendHovered && !loading && input.trim() ? 'translateY(-1px) scale(1.05)' : 'translateY(0) scale(1)',
                   }}
@@ -972,5 +874,6 @@ export function ChatSidebar({
         </div>
       </div>
     </div>
+    </>
   );
 }

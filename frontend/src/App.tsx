@@ -6,7 +6,15 @@ import { DOCUMENTS as GENERATED_DOCUMENTS } from './generated/documents';
 import { ArrowLeft } from 'lucide-react';
 import { saveAgreement, getAgreementById, updateAgreement } from './utils/agreementStorage';
 import type { Agreement } from './components/AgreementsLandingPage';
-import { queryObligationsStream, transformObligationToSnippet } from './services/apiService';
+import {
+  queryObligationsStreamRaw,
+  transformObligationToSnippet,
+  extractStreamingObligationsFromRawBuffer,
+} from './services/apiService';
+import {
+  DEMO_SAMPLE_LEASE_DOC_ID,
+  DEMO_SAMPLE_LEASE_FILENAME,
+} from './constants/landRecord';
 
 // Import tests for development (available in browser console)
 if (process.env.NODE_ENV === 'development') {
@@ -236,8 +244,8 @@ const SNIPPET_DATABASE = [
       // Multiple document references for this snippet
       documentReferences: [
         {
-          documentId: 'doc-mtnnn-pdf',
-          documentName: 'MTNNN.pdf',
+          documentId: DEMO_SAMPLE_LEASE_DOC_ID,
+          documentName: DEMO_SAMPLE_LEASE_FILENAME,
           pageNumber: 22,
           fullText: 'ARTICLE VI - INSURANCE PROVISIONS (CONTINUED)\n\nSection 6.3: Tenant Insurance Obligations\nAs referenced in the primary lease document Section 2.1, the Tenant shall maintain property insurance covering all tenant improvements and personal property. The Tenant must also carry business interruption insurance with a minimum 12-month coverage period.\n\nSection 6.4: Certificate Requirements\nTenant must provide certificates of insurance to the Landlord annually, naming the Landlord as additional insured on all policies.',
           highlights: [
@@ -346,7 +354,14 @@ export default function App() {
   const [snippets, setSnippets] = useState<any[]>([]);
   const [ghostValues, setGhostValues] = useState<Record<string, string>>({});
   const [isAnalyzing, setIsAnalyzing] = useState(false);
-  
+  /** True after the last global AI Search completed with zero obligations (shows empty state in UI). */
+  const [aiSearchHadNoResults, setAiSearchHadNoResults] = useState(false);
+  /**
+   * When true, field-triggered snippet fallbacks must not load mock SNIPPET_DATABASE (avoids unrelated
+   * obligations after a global search returned nothing from the backend).
+   */
+  const suppressMockSnippetFallbackAfterEmptyQueryRef = useRef(false);
+
   // AI approval workflow state
   const [isAIApproved, setIsAIApproved] = useState(false);
   const [aiApprovedFormData, setAiApprovedFormData] = useState<Record<string, string>>({});
@@ -602,13 +617,17 @@ export default function App() {
         return value && value.length >= 2;
       });
       
-      // If no fields have values, show all snippets (but don't auto-fill)
+      // If no fields have values, show mock snippets only when not suppressing after an empty global AI query
       if (!hasAnyFieldValue) {
-        const snippetsWithConfidence = SNIPPET_DATABASE.map(snippet => ({
-          ...snippet,
-          confidenceScore: 50, // Default confidence when no search criteria
-        }));
-        setSnippets(snippetsWithConfidence);
+        if (!suppressMockSnippetFallbackAfterEmptyQueryRef.current) {
+          const snippetsWithConfidence = SNIPPET_DATABASE.map(snippet => ({
+            ...snippet,
+            confidenceScore: 50, // Default confidence when no search criteria
+          }));
+          setSnippets(snippetsWithConfidence);
+        } else {
+          setSnippets([]);
+        }
         setIsAnalyzing(false);
         // DO NOT auto-populate - user should choose manually
       } else {
@@ -641,14 +660,18 @@ export default function App() {
       }
     });
 
-    // If no fields have values, show all snippets (but don't auto-fill)
+    // If no fields have values, show mock snippets only when not suppressing after an empty global AI query
     if (Object.keys(fieldValues).length === 0) {
-      const snippetsWithConfidence = SNIPPET_DATABASE.map(snippet => ({
-        ...snippet,
-        confidenceScore: 50, // Default confidence when no search criteria
-      }));
+      if (!suppressMockSnippetFallbackAfterEmptyQueryRef.current) {
+        const snippetsWithConfidence = SNIPPET_DATABASE.map(snippet => ({
+          ...snippet,
+          confidenceScore: 50, // Default confidence when no search criteria
+        }));
         setSnippets(snippetsWithConfidence);
-        setIsAnalyzing(false);
+      } else {
+        setSnippets([]);
+      }
+      setIsAnalyzing(false);
       // DO NOT auto-populate - user should choose manually
       return;
     }
@@ -797,12 +820,15 @@ export default function App() {
         setIsAnalyzing(false);
         // Auto-fill disabled - user must manually click Accept button
       } else {
-        // If no matches, show all snippets so user can still browse
-        const snippetsWithConfidence = SNIPPET_DATABASE.map(snippet => ({
-          ...snippet,
-          confidenceScore: 30, // Low confidence when no matches
-        }));
-        setSnippets(snippetsWithConfidence);
+        if (!suppressMockSnippetFallbackAfterEmptyQueryRef.current) {
+          const snippetsWithConfidence = SNIPPET_DATABASE.map(snippet => ({
+            ...snippet,
+            confidenceScore: 30, // Low confidence when no matches
+          }));
+          setSnippets(snippetsWithConfidence);
+        } else {
+          setSnippets([]);
+        }
         setIsAnalyzing(false);
       }
     }, 500); // 500ms delay to show AI animation
@@ -813,6 +839,8 @@ export default function App() {
     
     // When toggling OFF AI mode, check documents that were referenced by APPLIED snippets only
     if (!newMode && aiMode) {
+      setAiSearchHadNoResults(false);
+      suppressMockSnippetFallbackAfterEmptyQueryRef.current = false;
       // Only check documents for snippets that were actually applied (not just viewed)
       const documentsToCheck = new Set<string>();
       
@@ -886,6 +914,8 @@ export default function App() {
       // Don't set snippets from mock data here - let the API call handle it
       // The API will be called when handleSearch() is invoked from the button click
       // Clear any existing snippets to show loading state
+      setAiSearchHadNoResults(false);
+      suppressMockSnippetFallbackAfterEmptyQueryRef.current = false;
       setSnippets([]);
     }
 
@@ -959,147 +989,107 @@ export default function App() {
   };
 
   const handleGlobalSearch = async (query: string) => {
-    console.log('[DEBUG App.tsx] handleGlobalSearch called', {
-      query, 
-      queryLength: query.trim().length, 
-      checkedDocuments: Array.from(checkedDocuments),
-      checkedDocumentsCount: checkedDocuments.size
-    });
-    
-    // #region agent log
-    fetch('http://127.0.0.1:7242/ingest/c69e181c-4485-4aaa-8fb9-54a919c8d97a',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'App.tsx:1275',message:'handleGlobalSearch called',data:{query,queryLength:query.trim().length,checkedDocuments:Array.from(checkedDocuments)},timestamp:Date.now(),sessionId:'debug-session',hypothesisId:'H4'})}).catch(()=>{});
+    // #region UI debug logging (disabled)
+    // console.log('[DEBUG App.tsx] handleGlobalSearch called', { ... });
+    // fetch('http://127.0.0.1:7242/ingest/...').catch(() => {});
     // #endregion
-    
+
     setGlobalSearchQuery(query);
-    
+
     // Show AI analyzing animation
     setIsAnalyzing(true);
-    
-    console.log('[DEBUG App.tsx] setIsAnalyzing(true) called');
-    
+
     // Map checked document IDs to document names for API
     const documentNames = Array.from(checkedDocuments)
-      .map(docId => {
-        const doc = DOCUMENTS.find(d => d.id === docId);
+      .map((docId) => {
+        const doc = DOCUMENTS.find((d) => d.id === docId);
         return doc ? doc.name : null;
       })
       .filter((name): name is string => name !== null);
-    
-    // #region agent log
-    console.log('[DEBUG] Calling API with query and document names', {query, documentNames});
-    fetch('http://127.0.0.1:7242/ingest/c69e181c-4485-4aaa-8fb9-54a919c8d97a',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'App.tsx:1282',message:'Calling API with query and document names',data:{query,documentNames},timestamp:Date.now(),sessionId:'debug-session',hypothesisId:'H4'})}).catch(()=>{});
-    // #endregion
-    
+
     try {
-      // Call backend API with streaming to get obligations progressively
-      // API should be called even if query is empty (per requirements)
-      console.log('[DEBUG App.tsx] About to call queryObligationsStream', {
-        query: query || '',
-        documentNames,
-        documentNamesLength: documentNames.length
-      });
-      
-      const streamedSnippets: any[] = [];
-      let totalObligationsFound = 0;
-      let updateTimer: NodeJS.Timeout | null = null;
-      
-      await queryObligationsStream(
+      suppressMockSnippetFallbackAfterEmptyQueryRef.current = false;
+      setAiSearchHadNoResults(false);
+      setSnippets([]);
+
+      const applyStreamBufferToUi = (accumulated: string) => {
+        const obs = extractStreamingObligationsFromRawBuffer(accumulated);
+        const streamedSnippets = obs.map((obligation, index) => {
+          const snippet = transformObligationToSnippet(obligation, index);
+          const baseConfidence = 95 - index * 5;
+          const confidenceScore = Math.max(60, Math.min(100, baseConfidence));
+          return { ...snippet, confidenceScore };
+        });
+        setSnippets(streamedSnippets);
+      };
+
+      // POST /query/stream/raw-http — text/plain (progress + final merge JSON); same body as /query
+      const data = await queryObligationsStreamRaw(
         query || '',
         documentNames.length > 0 ? documentNames : undefined,
         {
-          onObligation: (obligation, index) => {
-            console.log(`[DEBUG App.tsx] Received obligation ${index + 1}:`, obligation.DutyType);
-            
-            // Transform obligation to snippet format
-            const snippet = transformObligationToSnippet(obligation, index);
-            
-            // Calculate confidence score
-            const baseConfidence = 95 - (index * 5);
-            const confidenceScore = Math.max(60, Math.min(100, baseConfidence));
-            
-            const snippetWithConfidence = {
-              ...snippet,
-              confidenceScore,
-            };
-            
-            streamedSnippets.push(snippetWithConfidence);
-            
-            // Batch updates to prevent excessive re-renders
-            // Clear any pending update
-            if (updateTimer) {
-              clearTimeout(updateTimer);
-            }
-            
-            // Schedule update after a brief delay (batching)
-            updateTimer = setTimeout(() => {
-              setSnippets([...streamedSnippets]);
-              console.log(`[DEBUG App.tsx] Batched update: ${streamedSnippets.length} snippets`);
-            }, 50); // 50ms debounce - will batch multiple rapid updates
+          save_output: false,
+          onTextChunk: (accumulated) => {
+            applyStreamBufferToUi(accumulated);
           },
-          onMetadata: (metadata) => {
-            console.log('[DEBUG App.tsx] Received metadata:', metadata);
-            totalObligationsFound = metadata.total_obligations_found;
-            
-            // #region agent log
-            console.log('[DEBUG] Backend streaming complete', {
-              resultsCount: streamedSnippets.length,
-              totalObligations: totalObligationsFound,
-              query: metadata.query
-            });
-            fetch('http://127.0.0.1:7242/ingest/c69e181c-4485-4aaa-8fb9-54a919c8d97a',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'App.tsx:1035',message:'Backend streaming complete',data:{resultsCount:streamedSnippets.length,totalObligations:totalObligationsFound,query:metadata.query},timestamp:Date.now(),sessionId:'debug-session',hypothesisId:'H2'})}).catch(()=>{});
-            // #endregion
-          },
-          onError: (errorMessage) => {
-            console.error('[DEBUG App.tsx] Stream error:', errorMessage);
-            alert('Error during streaming: ' + errorMessage);
-          },
-          onComplete: () => {
-            console.log('[DEBUG App.tsx] Streaming complete, total snippets:', streamedSnippets.length);
-            
-            // Clear any pending timer and do final update
-            if (updateTimer) {
-              clearTimeout(updateTimer);
-            }
-            
-            // Final update with all snippets
-            setSnippets([...streamedSnippets]);
-            setIsAnalyzing(false);
-            
-            // #region agent log
-            console.log('[DEBUG] Setting final snippets state', {snippetsCount: streamedSnippets.length, firstSnippetId: streamedSnippets[0]?.id});
-            fetch('http://127.0.0.1:7242/ingest/c69e181c-4485-4aaa-8fb9-54a919c8d97a',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'App.tsx:1046',message:'Setting final snippets state',data:{snippetsCount:streamedSnippets.length,firstSnippetId:streamedSnippets[0]?.id},timestamp:Date.now(),sessionId:'debug-session',hypothesisId:'H5'})}).catch(()=>{});
-            // #endregion
-          }
         }
       );
-      
-    } catch (error) {
-      // #region agent log
-      console.log('[DEBUG] API call failed, clearing snippets', {error: error instanceof Error ? error.message : String(error), errorType: error?.constructor?.name});
-      fetch('http://127.0.0.1:7242/ingest/c69e181c-4485-4aaa-8fb9-54a919c8d97a',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'App.tsx:1308',message:'API call failed, clearing snippets',data:{error:error instanceof Error?error.message:String(error),errorType:error?.constructor?.name},timestamp:Date.now(),sessionId:'debug-session',hypothesisId:'H1'})}).catch(()=>{});
+
+      if (data.error) {
+        console.error('[query/stream/raw-http UI] envelope error', data.error);
+        alert('Query failed: ' + data.error);
+        suppressMockSnippetFallbackAfterEmptyQueryRef.current = false;
+        setAiSearchHadNoResults(false);
+        setSnippets([]);
+        return;
+      }
+
+      const snippetsWithConfidence = data.results.map((obligation, index) => {
+        const snippet = transformObligationToSnippet(obligation, index);
+        const baseConfidence = 95 - index * 5;
+        const confidenceScore = Math.max(60, Math.min(100, baseConfidence));
+        return { ...snippet, confidenceScore };
+      });
+
+      // Replace incrementally streamed rows with the parser's final merge (source of truth).
+      setSnippets(snippetsWithConfidence);
+      const empty = snippetsWithConfidence.length === 0;
+      suppressMockSnippetFallbackAfterEmptyQueryRef.current = empty;
+      setAiSearchHadNoResults(empty);
+
+      // #region UI debug logging (disabled)
+      // console.log('[query/stream/raw-http UI] complete', { ... });
+      // fetch('http://127.0.0.1:7242/ingest/...').catch(() => {});
       // #endregion
-      
+    } catch (error) {
+      // #region UI debug logging (disabled)
+      // console.log('[DEBUG] API call failed, clearing snippets', { ... });
+      // fetch('http://127.0.0.1:7242/ingest/...').catch(() => {});
+      // #endregion
+
       console.error('Error fetching obligations from backend:', error);
-      
+
       // Check if it's a connection error
-      const isConnectionError = 
+      const isConnectionError =
         (error as any)?.isConnectionError ||
         (error instanceof TypeError && error.message.includes('Failed to fetch')) ||
-        (error instanceof Error && (
-          error.message.includes('NetworkError') ||
-          error.message.includes('Failed to fetch') ||
-          error.message.includes('ERR_NETWORK') ||
-          error.message.includes('ERR_INTERNET_DISCONNECTED') ||
-          error.message.includes('ERR_CONNECTION_REFUSED')
-        ));
-      
+        (error instanceof Error &&
+          (error.message.includes('NetworkError') ||
+            error.message.includes('Failed to fetch') ||
+            error.message.includes('ERR_NETWORK') ||
+            error.message.includes('ERR_INTERNET_DISCONNECTED') ||
+            error.message.includes('ERR_CONNECTION_REFUSED')));
+
       // Show alert if connection error
       if (isConnectionError) {
         alert('Legal OCR Model is not running !');
       }
-      
+
       // Clear snippets on error (no fallback to mock data)
       setSnippets([]);
+      suppressMockSnippetFallbackAfterEmptyQueryRef.current = false;
+      setAiSearchHadNoResults(false);
+    } finally {
       setIsAnalyzing(false);
     }
   };
@@ -1356,7 +1346,7 @@ export default function App() {
 
   return (
     <div className="min-h-full bg-gray-50">
-      {/* Shell already renders MainTopHeader (LOCATION HQ); back bar only */}
+      {/* Shell already renders MainTopHeader; back bar only */}
       <div className="border-b border-gray-200 bg-white px-6 py-3">
         <div className="max-w-7xl mx-auto">
           <button
@@ -1398,6 +1388,7 @@ export default function App() {
               reviewReason={reviewReason}
               globalSearchQuery={globalSearchQuery}
               onGlobalSearch={handleGlobalSearch}
+              aiSearchHadNoResults={aiSearchHadNoResults}
             />
           </main>
         </>
@@ -1422,6 +1413,7 @@ export default function App() {
             reviewReason={reviewReason}
             globalSearchQuery={globalSearchQuery}
             onGlobalSearch={handleGlobalSearch}
+            aiSearchHadNoResults={aiSearchHadNoResults}
           />
         </main>
       )}

@@ -5,6 +5,7 @@ Run this file to start the API server
 
 import uvicorn
 import os
+import sys
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -92,6 +93,15 @@ def main():
     host = os.getenv("API_HOST", "0.0.0.0")
     port = int(os.getenv("API_PORT", "8000"))
     reload = os.getenv("API_RELOAD", "true").lower() == "true"
+
+    backend_root = Path(__file__).resolve().parent
+    venv_python = backend_root / ".venv" / "Scripts" / "python.exe"
+    if venv_python.exists() and Path(sys.executable).resolve() != venv_python.resolve():
+        print(
+            "WARNING: API is not running with backend/.venv Python. "
+            "ChromaDB queries may fail (schema mismatch). Use:\n"
+            f"  {venv_python} run_api.py"
+        )
     
     print("=" * 80)
     print("Legal Obligation Query System API")

@@ -444,6 +444,20 @@ def clear_chroma_cache():
         logger.info("ChromaDB client cache cleared")
 
 
+_CHROMA_SCHEMA_MISMATCH_MSG = (
+    "ChromaDB cannot read this persistent store (metadata schema mismatch — often after upgrading "
+    "chromadb or running the API outside backend/.venv). Delete output/chroma_db and re-index "
+    "(python simple_rebuild_db.py), then start the API with .venv\\Scripts\\python.exe run_api.py."
+)
+
+
+def _log_chroma_exception(exc: BaseException) -> None:
+    if isinstance(exc, KeyError) and exc.args and exc.args[0] == "_type":
+        logger.error(_CHROMA_SCHEMA_MISMATCH_MSG)
+    else:
+        logger.error("ChromaDB error: %s", exc, exc_info=True)
+
+
 _ALLOWED_CHROMA_PERSIST_NAMES = frozenset({"chroma_db", "chroma_db_legacy"})
 
 
@@ -934,7 +948,10 @@ def query_individual_obligations(
                 )
 
         return obligations[:n_results]
-        
+
+    except KeyError as e:
+        _log_chroma_exception(e)
+        return []
     except Exception as e:
         logger.error(f"Individual obligation vector query error: {e}", exc_info=True)
         return []
@@ -996,14 +1013,7 @@ def query_obligations(
                 })
         return out
     except KeyError as e:
-        if e.args and e.args[0] == "_type":
-            logger.error(
-                "ChromaDB cannot read this persistent store (metadata schema mismatch — often after upgrading "
-                "chromadb). Delete the folder (e.g. output/chroma_db) and re-run document processing to "
-                "re-index obligations, or install a chromadb version matching the DB."
-            )
-        else:
-            logger.error(f"Vector query error: {e}", exc_info=True)
+        _log_chroma_exception(e)
         return []
     except Exception as e:
         logger.error(f"Vector query error: {e}", exc_info=True)

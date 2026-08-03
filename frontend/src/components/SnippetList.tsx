@@ -37,6 +37,7 @@ interface PDFReference {
 interface Snippet {
   id: string;
   title: string;
+  category?: string;
   pdfReference: PDFReference;
   fieldMappings: Record<string, string>;
   matchedFields: string[];
@@ -181,6 +182,11 @@ export function SnippetList({
                     <p className="text-xs text-gray-500 mb-4">
                       This snippet will fill the following fields:
                     </p>
+                    {snippet.category ? (
+                      <p className="text-xs font-semibold text-indigo-800 mb-3">
+                        Category: <span className="font-normal">{snippet.category}</span>
+                      </p>
+                    ) : null}
                   </div>
                 </div>
 

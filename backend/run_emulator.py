@@ -125,7 +125,7 @@ def main():
     except ValueError:
         logger.error("Invalid GCS_EMULATOR_PORT %r; must be an integer.", port_raw)
         sys.exit(1)
-    default_bucket = os.getenv("GCS_BUCKET", "heb-legal")
+    default_bucket = os.getenv("GCS_BUCKET", "legal-ocr-documents")
     data_dir = os.getenv("GCS_EMULATOR_DATA_DIR", "./fake-gcs-data")
     in_memory = os.getenv("GCS_EMULATOR_IN_MEMORY", "false").lower() == "true"
     

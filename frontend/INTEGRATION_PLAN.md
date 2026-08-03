@@ -1,4 +1,4 @@
-# AI Autofill Integration Plan
+# Legal OCR Integration Plan
 
 ## Complete User Flow
 

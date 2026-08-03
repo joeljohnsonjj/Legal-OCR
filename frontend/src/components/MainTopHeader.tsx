@@ -1,36 +1,35 @@
 import { Search, User } from 'lucide-react';
-import { BRAND_RED } from '../constants/landRecord';
+import { BRAND_BLACK, BRAND_HEADER_ACCENT } from '../constants/landRecord';
 
 export function MainTopHeader() {
   return (
     <header
-      className="flex flex-shrink-0 items-center justify-between bg-white"
+      className="flex flex-shrink-0 items-center justify-end bg-white"
       style={{
         minHeight: 56,
         paddingLeft: 24,
         paddingRight: 24,
-        borderBottom: `2px solid ${BRAND_RED}`,
+        borderBottom: `2px solid ${BRAND_HEADER_ACCENT}`,
       }}
     >
-      <span
-        className="font-bold uppercase tracking-wide"
-        style={{ color: BRAND_RED, fontSize: 18, letterSpacing: '0.06em' }}
-      >
-        LOCATION HQ
-      </span>
       <div className="flex items-center" style={{ gap: 16 }}>
         <button
           type="button"
-          className="flex items-center justify-center text-gray-700 hover:text-gray-900"
-          style={{ width: 40, height: 40 }}
+          className="flex items-center justify-center hover:opacity-80"
+          style={{ width: 40, height: 40, color: BRAND_BLACK }}
           aria-label="Search"
         >
           <Search className="h-5 w-5" strokeWidth={2} />
         </button>
         <button
           type="button"
-          className="flex items-center justify-center rounded-full bg-gray-300 text-gray-700 hover:bg-gray-400"
-          style={{ width: 40, height: 40 }}
+          className="flex items-center justify-center rounded-full hover:opacity-90"
+          style={{
+            width: 40,
+            height: 40,
+            backgroundColor: BRAND_BLACK,
+            color: '#FFFFFF',
+          }}
           aria-label="Profile"
         >
           <User className="h-5 w-5" strokeWidth={1.75} />

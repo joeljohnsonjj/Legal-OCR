@@ -908,6 +908,71 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // Raw text stream: /query/stream/raw-http (and legacy /query/stream/raw) — progress + final JSON
+  if (
+    req.method === 'POST' &&
+    (req.url === '/query/stream/raw-http' || req.url === '/query/stream/raw')
+  ) {
+    let body = '';
+    req.on('data', (chunk) => {
+      body += chunk;
+    });
+    req.on('end', () => {
+      try {
+        const parsed = body ? JSON.parse(body) : {};
+        const query = parsed.query || '';
+        const documentIds = parsed.document_ids || [];
+
+        const response = {
+          query,
+          total_documents_searched: documentIds.length || 1,
+          total_obligations_found: stubObligations.length,
+          results: stubObligations,
+          processed_at: new Date().toISOString(),
+        };
+
+        const sep = '='.repeat(80);
+        const prelude =
+          `[QUERY] ${query}\n` +
+          `[STEP 1] Vector search...\n` +
+          `[STEP 1] Found 0 vector results\n` +
+          `[STEP 2] No vector results; LLM filtering each document...\n` +
+          `[STEP 2] Filtering complete\n` +
+          `[STEP 3] Merging and ranking (streaming LLM tokens)...\n` +
+          `${sep}\n` +
+          `RAW LLM OUTPUT (watch it generate in real-time):\n` +
+          `${sep}\n`;
+
+        const tail = `\n\n${sep}\n[COMPLETE] Generated 1 tokens\n${sep}\n`;
+        const payload = prelude + JSON.stringify(response, null, 2) + tail;
+
+        res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+        res.writeHead(200);
+
+        // Chunk the body so the browser receives multiple read() cycles — matches real streaming
+        // and lets the UI show obligations as each complete JSON object appears in the buffer.
+        const CHUNK_SIZE = 400;
+        const CHUNK_DELAY_MS = 18;
+        let offset = 0;
+        const pump = () => {
+          if (offset >= payload.length) {
+            res.end();
+            return;
+          }
+          res.write(payload.slice(offset, offset + CHUNK_SIZE));
+          offset += CHUNK_SIZE;
+          setTimeout(pump, CHUNK_DELAY_MS);
+        };
+        pump();
+      } catch (e) {
+        res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+        res.writeHead(400);
+        res.end('[ERROR] Invalid JSON body\n');
+      }
+    });
+    return;
+  }
+
   // Non-streaming endpoint: /query (returns all at once)
   if (req.method === 'POST' && req.url === '/query') {
     let body = '';
@@ -944,5 +1009,6 @@ const server = http.createServer((req, res) => {
 server.listen(PORT, () => {
   console.log(`Stub OCR server at http://localhost:${PORT}`);
   console.log(`  - POST /query (non-streaming, returns all results at once)`);
-  console.log(`  - POST /query/stream (streaming NDJSON, progressive results)`);
+  console.log(`  - POST /query/stream/raw-http (text/plain: progress + final merge JSON; alias: /query/stream/raw)`);
+  console.log(`  - POST /query/stream (streaming NDJSON, progressive results — legacy)`);
 });

@@ -5,7 +5,7 @@ This branch combines **category/obligation extraction** (`category_obligation_ai
 ## Repository layout
 
 - **`backend/`** — API, document processing, obligation search (ChromaDB), chatbot RAG (Qdrant), memory management
-- **`frontend/`** — React UI for documents, snippet search, and chat
+- **`AIAutofillFeatureDesign/`** — React UI for documents, snippet search, and chat (deploy this frontend)
 
 ---
 
@@ -38,24 +38,36 @@ After a PDF is processed, the system stores two kinds of content in **Qdrant**:
 
 ## Quick start
 
-### Backend
+### Backend (development)
 
 ```bash
 cd backend
-pip install -r requirements.txt
-pip install -e ./memory_management
+bash scripts/install_server.sh    # Linux
+# or: .\scripts\install_server.ps1   # Windows
 ```
 
-Create `backend/.env` with LLM keys, `DOCS_FOLDER`, `OUTPUT_FOLDER`, and optional `RAG_INDEX_QDRANT=true` for chat indexing.
+Or manually:
+
+```bash
+pip install -r requirements.txt
+pip install -e ./memory_management
+python -m spacy download en_core_web_sm
+```
+
+Create `backend/.env` from `.env.example` (LLM keys, `RAG_INDEX_QDRANT=true` for chat).
 
 ```bash
 python run_api.py
 ```
 
+### Server deployment
+
+See **`backend/DEPLOYMENT.md`** for Linux systemd, Docker, system packages (Tesseract, Poppler), and production `.env` settings.
+
 ### Frontend
 
 ```bash
-cd frontend
+cd AIAutofillFeatureDesign
 npm install
 npm run dev
 ```

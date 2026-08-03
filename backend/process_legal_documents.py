@@ -969,7 +969,7 @@ Common patterns to look for:
 - "ABC Company, a Delaware corporation ('Tenant')"
 - "John Doe ('Guarantor')"
 - "LANDLORD: XYZ Properties, LLC"
-- "between H-E-B, L.P. (hereinafter 'Grantee')"
+- "between ABC Corporation, L.P. (hereinafter 'Grantee')"
 
 CRITICAL ΓÇö Field meanings (do not swap):
 - "actual_name" MUST be the full legal name of the entity **as written in the document** (e.g. "Fidelity Funding Company, a Nevada corporation" or at minimum the distinct company/person name). It must NOT be the contract-defined role word alone ("Landlord", "Tenant", "Lessee") unless the document literally names the party only that way.

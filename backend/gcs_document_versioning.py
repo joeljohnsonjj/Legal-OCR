@@ -10,7 +10,7 @@ content_key is the first 16 hex chars of SHA-256(live_object_name) so archives f
 given live path are listable without collisions between different live paths.
 
 Environment:
-  GCS_BUCKET                  — bucket name (default: heb-legal)
+  GCS_BUCKET                  — bucket name (default: legal-ocr-documents)
   GCS_DOCS_FOLDER             — used only to build default archive prefix (default: Documents)
   GCS_VERSION_ARCHIVE_PREFIX  — override archive root (default: {GCS_DOCS_FOLDER}/.versions)
   STORAGE_EMULATOR_HOST       — set by run_emulator.py / .env for fake GCS
@@ -163,7 +163,7 @@ def maybe_sync_live_from_bucket_to_docs(
 
 
 def get_bucket(client: Optional[storage.Client] = None) -> storage.Bucket:
-    bucket_name = os.getenv("GCS_BUCKET", "heb-legal")
+    bucket_name = os.getenv("GCS_BUCKET", "legal-ocr-documents")
     if client is None:
         client = storage.Client()
     return client.bucket(bucket_name)

@@ -6100,7 +6100,7 @@ async def gcs_versioned_upload(
         logging.error(f"GCS versioned upload failed: {e}", exc_info=True)
         return GcsVersionedUploadResponse(
             status="error",
-            bucket=os.getenv("GCS_BUCKET", "heb-legal"),
+            bucket=os.getenv("GCS_BUCKET", "legal-ocr-documents"),
             live_object_name=live_object_name,
             archived_previous=False,
             error=str(e),
@@ -6178,7 +6178,7 @@ async def gcs_restore_version(body: GcsRestoreVersionRequest):
         logging.error(f"GCS restore failed: {e}", exc_info=True)
         return GcsVersionedUploadResponse(
             status="error",
-            bucket=os.getenv("GCS_BUCKET", "heb-legal"),
+            bucket=os.getenv("GCS_BUCKET", "legal-ocr-documents"),
             live_object_name=body.live_object_name,
             archived_previous=False,
             error=str(e),

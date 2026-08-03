@@ -13,16 +13,16 @@ export interface GeneratedDocument {
 
 export const DOCUMENTS: GeneratedDocument[] = [
   {
-    "id": "doc-commercial-lease-agreement-buyer-triple-net-pdf",
-    "name": "Commercial Lease Agreement - Buyer Triple Net.pdf",
-    "uploadDate": "2026/07/13",
+    "id": "doc-commercial-triple-net-lease-4-pdf",
+    "name": "Commercial_Triple_Net_Lease 4.pdf",
+    "uploadDate": "2026/08/03",
     "uploadedBy": "system",
     "totalPages": 0
   },
   {
     "id": "doc-mtnnn-pdf",
     "name": "MTNNN.pdf",
-    "uploadDate": "2026/07/13",
+    "uploadDate": "2026/08/03",
     "uploadedBy": "system",
     "totalPages": 0
   }
@@ -31,8 +31,8 @@ export const DOCUMENTS: GeneratedDocument[] = [
 /** Simplified list for AgreementPreview Documents tab */
 export const ALL_DOCUMENTS: Array<{ id: string; name: string }> = [
   {
-    "id": "doc-commercial-lease-agreement-buyer-triple-net-pdf",
-    "name": "Commercial Lease Agreement - Buyer Triple Net.pdf"
+    "id": "doc-commercial-triple-net-lease-4-pdf",
+    "name": "Commercial_Triple_Net_Lease 4.pdf"
   },
   {
     "id": "doc-mtnnn-pdf",

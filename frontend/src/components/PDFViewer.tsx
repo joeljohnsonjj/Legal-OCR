@@ -26,9 +26,23 @@ interface PDFViewerProps {
   controlledPageIndex?: number;
   /** Optional fixed height for the PDF container (e.g. to match snippet size) */
   containerHeight?: string;
+  /**
+   * `embedded` — smaller scale for side panels (default).
+   * `modal` — full-width pages, no shrink transform (citation PDF popup).
+   */
+  layout?: 'embedded' | 'modal';
 }
 
-export function PDFViewer({ documentName, pageNumbers, onPageChange, className = '', hidePageNavigation = false, controlledPageIndex, containerHeight }: PDFViewerProps) {
+export function PDFViewer({
+  documentName,
+  pageNumbers,
+  onPageChange,
+  className = '',
+  hidePageNavigation = false,
+  controlledPageIndex,
+  containerHeight,
+  layout = 'embedded',
+}: PDFViewerProps) {
   const [numPages, setNumPages] = useState<number | null>(null);
   const [currentPageIndex, setCurrentPageIndex] = useState(0);
   const [loading, setLoading] = useState(true);
@@ -184,6 +198,10 @@ export function PDFViewer({ documentName, pageNumbers, onPageChange, className =
     }
   };
 
+  const isModalLayout = layout === 'modal';
+  /** Embedded panels use a slight shrink; modal uses 1:1 scale for readability. */
+  const visualScale = isModalLayout ? 1 : 0.7;
+
   if (error) {
     return (
       <div className={`flex items-center justify-center p-8 bg-gray-50 rounded-lg border border-gray-200 ${className}`}>
@@ -203,7 +221,7 @@ export function PDFViewer({ documentName, pageNumbers, onPageChange, className =
         <div className="mb-3 flex items-center justify-between bg-gray-50 px-3 py-2 rounded-lg border border-gray-200">
           <button
             onClick={handlePreviousPage}
-            disabled={currentPageIndex === 0}
+            disabled={effectivePageIndex === 0}
             className="p-1.5 text-gray-600 hover:text-gray-900 hover:bg-gray-100 rounded disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
             title="Previous page"
           >
@@ -229,7 +247,7 @@ export function PDFViewer({ documentName, pageNumbers, onPageChange, className =
           
           <button
             onClick={handleNextPage}
-            disabled={currentPageIndex === sortedPages.length - 1}
+            disabled={effectivePageIndex === sortedPages.length - 1}
             className="p-1.5 text-gray-600 hover:text-gray-900 hover:bg-gray-100 rounded disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
             title="Next page"
           >
@@ -241,7 +259,7 @@ export function PDFViewer({ documentName, pageNumbers, onPageChange, className =
       {/* PDF Document */}
       <div
         ref={containerRef}
-        className="bg-gray-100 rounded-lg border border-gray-300 overflow-y-auto"
+        className={`bg-gray-100 rounded-lg border border-gray-300 overflow-y-auto ${isModalLayout ? 'min-w-0 w-full' : ''}`}
         style={{ 
           maxHeight: containerHeight ?? '400px', 
           minHeight: containerHeight ?? '300px',
@@ -302,12 +320,18 @@ export function PDFViewer({ documentName, pageNumbers, onPageChange, className =
                     width: '100%',
                     backgroundColor: 'white',
                     position: 'relative',
-                    transform: 'scale(0.7)',
+                    transform: `scale(${visualScale})`,
                     transformOrigin: 'top center'
                   }}>
                     <Page
                       pageNumber={pageNum}
-                      width={containerRef.current?.clientWidth ? (containerRef.current.clientWidth - 50) / 0.7 : 1140}
+                      width={
+                        containerRef.current?.clientWidth
+                          ? Math.max(240, (containerRef.current.clientWidth - 24) / visualScale)
+                          : isModalLayout
+                            ? 816
+                            : 1140
+                      }
                       renderTextLayer={false}
                       renderAnnotationLayer={false}
                       className="shadow-md"

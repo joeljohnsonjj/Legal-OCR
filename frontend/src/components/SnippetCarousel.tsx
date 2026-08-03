@@ -24,6 +24,7 @@ interface PDFReference {
 interface Snippet {
   id: string;
   title: string;
+  category?: string;
   pdfReference: PDFReference;
   fieldMappings: Record<string, string>;
   matchedFields: string[];

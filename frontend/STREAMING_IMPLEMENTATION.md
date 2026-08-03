@@ -2,172 +2,74 @@
 
 ## Overview
 
-This document explains the streaming implementation for AI obligation suggestions, which mimics the backend's NDJSON streaming format. The streaming allows obligations to appear progressively in the UI as they're generated, providing better user experience with faster perceived response times.
+AI Search uses **`POST /query/stream/raw-http`**: the backend returns **`Content-Type: text/plain`** with progress lines, optional injected `[N tokens]` markers, then merge JSON (often a draft chunk followed by **`[COMPLETE]`** and a reconciled object). The client reads **`ReadableStream`** chunks, can **incrementally** scan each growing buffer for complete obligation JSON objects (`extractStreamingObligationsFromRawBuffer`) to update snippet rows before the stream ends, then runs **`parseRawQueryStreamPlainText`** on the full buffer for the **authoritative** final list. The stub serves the same **`text/plain`** response on **`/query/stream/raw-http`** and **`/query/stream/raw`**. The stub still exposes **`POST /query/stream`** (NDJSON) for manual testing only; the app does not call it.
 
 ## Architecture
 
 ### 1. Backend Stub Server (`server/stub-ocr-server.js`)
 
-The stub server now provides **two endpoints**:
+The stub server provides:
 
 #### **POST /query** (Non-Streaming)
 - Returns all results at once in a single JSON response
-- Traditional request-response pattern
-- Used for testing or when streaming is not needed
 
-#### **POST /query/stream** (Streaming - NDJSON)
-- Streams obligations one-by-one as NDJSON (Newline Delimited JSON)
-- Mimics the real backend streaming behavior
-- Each line is a complete JSON object followed by `\n`
+#### **POST /query/stream/raw-http** (used by the app)
 
-### NDJSON Stream Format
+Same **`text/plain`** contract as legacy **`POST /query/stream/raw`** when the Python app exposes both. The local stub **chunks** the response body with a short delay so the browser exercises the same incremental **`onTextChunk`** path as a real streamed HTTP body (obligations appear as each complete nested obligation object closes in the JSON).
 
-The server sends three types of events:
+- Returns **text/plain**: step lines (`[QUERY]`, `[STEP …]`), separator blocks, then **pretty-printed JSON** matching `/query`, then a `[COMPLETE]` tail.
+- Parsed by `parseRawQueryStreamPlainText` in `apiService.ts`.
 
-```typescript
-// 1. Obligation Event (sent for each obligation)
-{
-  "type": "obligation",
-  "data": {
-    "DutyType": "Base Rent Payment",
-    "Responsible Party": "Tenant",
-    "Owner Responsibility": ["Pay monthly rent..."],
-    "Reasoning": ["Obligation to pay rent..."],
-    "Citation": [{...}]
-  }
-}
+#### **POST /query/stream** (NDJSON, legacy / manual)
+- Still available on the stub for Postman or older experiments; **not** used by `App.tsx`.
 
-// 2. Metadata Event (sent at the end)
-{
-  "type": "metadata",
-  "data": {
-    "query": "rent payment",
-    "total_documents_searched": 2,
-    "total_obligations_found": 35,
-    "processed_at": "2026-02-16T12:00:00Z"
-  }
-}
+### Text/plain merge extraction
 
-// 3. Error Event (sent if an error occurs)
-{
-  "type": "error",
-  "message": "Error description"
-}
-```
+1. Remove injected lines matching `\n[123 tokens]\n` (Python stream progress).
+2. Drop everything after `\n[COMPLETE]` if present.
+3. Scan the buffer for JSON objects with brace-aware string handling; keep the **last** object that looks like a merge payload (`results` array or nested `results.results`, or `query` + `results`).
+4. **`normalizeQueryEnvelope`** → flat **`BackendObligation[]`** (same as **`queryObligations`**).
 
 ### 2. Frontend API Service (`src/services/apiService.ts`)
 
-#### **New Types**
+#### **`parseRawQueryStreamPlainText(fullText: string)`**
 
-```typescript
-export interface StreamObligationEvent {
-  type: 'obligation';
-  data: BackendObligation;
-}
+Exported for tests. Returns **`BackendQueryResponse`**.
 
-export interface StreamMetadataEvent {
-  type: 'metadata';
-  data: {
-    query: string;
-    total_documents_searched: number;
-    total_obligations_found: number;
-    processed_at: string;
-  };
-}
+#### **`queryObligationsStreamRaw(query, documentIds?, options?)`**
 
-export interface StreamErrorEvent {
-  type: 'error';
-  message: string;
-}
-
-export type StreamEvent = StreamObligationEvent | StreamMetadataEvent | StreamErrorEvent;
-```
-
-#### **New Function: `queryObligationsStream()`**
-
-```typescript
-export async function queryObligationsStream(
-  query: string,
-  documentIds?: string[],
-  callbacks?: {
-    onObligation?: (obligation: BackendObligation, index: number) => void;
-    onMetadata?: (metadata: StreamMetadataEvent['data']) => void;
-    onError?: (error: string) => void;
-    onComplete?: () => void;
-  }
-): Promise<void>
-```
-
-**How it works:**
-
-1. **Sends POST request** to `/query/stream` endpoint
-2. **Reads response body** as a stream using `ReadableStream` API
-3. **Processes NDJSON** line by line
-4. **Invokes callbacks** for each event type:
-   - `onObligation`: Called for each obligation as it arrives
-   - `onMetadata`: Called when metadata is received
-   - `onError`: Called if an error occurs
-   - `onComplete`: Called when streaming is complete
+- **`fetch`** `POST ${API_BASE_URL}/query/stream/raw-http` with the same JSON body as **`/query`** (`query`, optional **`document_ids`**, optional **`save_output`**).
+- **`Accept: text/plain, */*`** (does not assume NDJSON).
+- Reads **`response.body`** with **`getReader()`**, decodes with **`TextDecoder`**, calls **`onTextChunk(accumulated, chunk)`** on each chunk so the UI can refresh (see incremental extraction below).
+- On completion: **`parseRawQueryStreamPlainText(buffer)`** (final merge JSON wins over any draft objects in the buffer).
 
 ### 3. Frontend Integration (`src/App.tsx`)
 
-The `handleToggleAiMode` function now uses streaming:
+`handleGlobalSearch` passes **`onTextChunk`** to **`queryObligationsStreamRaw`**. Each chunk runs **`extractStreamingObligationsFromRawBuffer`** → **`setSnippets`** immediately (no deferred `requestAnimationFrame` in `App`, because cancelling that rAF after `await` had been dropping the last flush). **`queryObligationsStreamRaw`** also **`await`s one animation frame** after each chunk when `onTextChunk` is used so the browser can paint between reads. When the reader finishes, **`parseRawQueryStreamPlainText`** runs and **`setSnippets`** is applied from **`data.results`** (source of truth). **`finally`** clears **`isAnalyzing`** and the stream log.
 
 ```typescript
-const streamedSnippets: any[] = [];
-
-await queryObligationsStream(
-  query || '',
-  documentNames.length > 0 ? documentNames : undefined,
-  {
-    onObligation: (obligation, index) => {
-      // Transform to snippet format
-      const snippet = transformObligationToSnippet(obligation, index);
-      
-      // Add confidence score
-      const snippetWithConfidence = { ...snippet, confidenceScore: 95 - (index * 5) };
-      
-      // Accumulate snippets
-      streamedSnippets.push(snippetWithConfidence);
-      
-      // **Progressive UI update** - show obligations as they arrive
-      setSnippets([...streamedSnippets]);
-    },
-    onMetadata: (metadata) => {
-      console.log('Streaming complete:', metadata);
-    },
-    onError: (errorMessage) => {
-      alert('Error during streaming: ' + errorMessage);
-    },
-    onComplete: () => {
-      setIsAnalyzing(false); // Hide loading animation
-    }
-  }
-);
+const data = await queryObligationsStreamRaw(query || '', documentNames.length ? documentNames : undefined, {
+  save_output: false,
+  onTextChunk: (accumulated) => applyStreamBufferToUi(accumulated),
+});
 ```
 
 ## Key Benefits
 
-### 1. **Progressive Rendering**
-- Obligations appear in the UI as they're generated
-- Users see results immediately instead of waiting for all results
-- Better perceived performance
+### 1. **Same merge contract as `/query`**
+- Parsed with **`normalizeQueryEnvelope`** — flat obligations and nested category groups both work.
 
-### 2. **Real-time Feedback**
-- Loading animation shows until streaming completes
-- Users can see the AI "thinking" and generating results
-- Engaging user experience
+### 2. **Plain-text stream compatibility**
+- Works with **`fetch` + `ReadableStream`**; no need for Angular-style progress hacks.
+- Optional **`onTextChunk`** drives incremental snippets and the stream log.
 
-### 3. **Easy Backend Integration**
-When the real backend is ready, you only need to:
-- Change `API_BASE_URL` to point to the real server
-- No frontend code changes required
-- The streaming format is identical
+If obligations still appear **all at once**, the client may be receiving **a single large read** (common with reverse proxies or response buffering). Ensure the API flushes chunks over HTTP (e.g. disable nginx buffering with `X-Accel-Buffering: no`, or equivalent) so `reader.read()` returns multiple times while the model streams.
 
-### 4. **Error Handling**
-- Connection errors are detected and reported
-- Stream errors are handled gracefully
-- User-friendly error messages
+### 3. **Backend alignment**
+- Matches Python **`POST /query/stream/raw-http`** (same wire format as **`/query/stream/raw`** where both exist).
+
+### 4. **Error handling**
+- **`[ERROR]`** lines and **`response.ok`** checks; parse failures return **`BackendQueryResponse.error`**.
 
 ## Testing the Streaming
 
@@ -178,10 +80,12 @@ node server/stub-ocr-server.js
 ```
 
 You should see:
+
 ```
 Stub OCR server at http://localhost:8000
   - POST /query (non-streaming, returns all results at once)
-  - POST /query/stream (streaming NDJSON, progressive results)
+  - POST /query/stream/raw-http (text/plain: progress + final merge JSON; stub also accepts /query/stream/raw)
+  - POST /query/stream (streaming NDJSON, progressive results — legacy)
 ```
 
 ### 2. Start the Frontend
@@ -190,47 +94,29 @@ Stub OCR server at http://localhost:8000
 npm run dev
 ```
 
-### 3. Test Streaming in the UI
+### 3. Test in the UI
 
 1. Create a new agreement
 2. Toggle "AI Search" ON
 3. Click "AI Search" button
-4. **Watch the snippet carousel** - obligations will appear one by one
-5. Each obligation appears ~100ms apart (simulating real streaming)
+4. While the spinner runs, the client is buffering **`/query/stream/raw-http`** plain text
+5. When the merge JSON is extracted, **all** obligation snippets appear together
 
 ### 4. Test with cURL (Optional)
 
 ```bash
-# Test streaming endpoint
-curl -X POST http://localhost:8000/query/stream \
+curl -X POST http://localhost:8000/query/stream/raw-http \
   -H "Content-Type: application/json" \
   -d '{"query": "rent payment", "document_ids": ["doc1.pdf"]}' \
   --no-buffer
 ```
 
-You'll see NDJSON lines appearing progressively.
+You will see progress text followed by a JSON object (same general shape as **`POST /query`**).
 
-## Timing Configuration
+## Stub vs real timing
 
-### Stub Server Timing
-
-In `server/stub-ocr-server.js`, line 866:
-
-```javascript
-}, 100); // Send one obligation every 100ms
-```
-
-**Adjust this value to simulate different network speeds:**
-- `50` - Faster streaming (2 obligations/second)
-- `100` - Default (1 obligation/100ms)
-- `200` - Slower streaming (0.5 obligations/second)
-
-### Why 100ms?
-
-- **Fast enough** to show progressive rendering
-- **Slow enough** to see the streaming effect
-- **Realistic** for network conditions
-- The real backend will be faster or slower depending on LLM speed
+- **`/query/stream/raw-http`** (and **`/query/stream/raw`** on the stub) respond in **one write** (no artificial delay). The real Python server streams LLM tokens over a longer period while the UI shows **`isAnalyzing`** until the response completes.
+- The legacy stub **`/query/stream`** (NDJSON) still uses an interval to emit one obligation per tick if you want to demo progressive NDJSON in Postman only.
 
 ## Migration to Real Backend
 
@@ -246,10 +132,10 @@ const API_BASE_URL = 'https://your-backend-url.com'; // Change this
 
 ### Step 2: Verify Endpoint Path
 
-Make sure the real backend uses `/query/stream` or update the path in `queryObligationsStream()`:
+Make sure the real backend exposes **`POST /query/stream/raw-http`** (or change the path in **`queryObligationsStreamRaw()`** in `apiService.ts`):
 
 ```typescript
-const url = `${API_BASE_URL}/query/stream`; // Update if different
+const url = `${API_BASE_URL}/query/stream/raw-http`;
 ```
 
 ### Step 3: Test
@@ -271,26 +157,21 @@ let buffer = '';
 
 while (true) {
   const { done, value } = await reader.read();
-  if (done) break;
-  
-  buffer += decoder.decode(value, { stream: true });
-  
-  // Process complete lines
-  const lines = buffer.split('\n');
-  buffer = lines.pop() || ''; // Keep incomplete line
-  
-  for (const line of lines) {
-    const event = JSON.parse(line);
-    // Handle event...
+  if (done) {
+    buffer += decoder.decode(undefined, { stream: false });
+    break;
   }
+  buffer += decoder.decode(value, { stream: true });
+  // Optional: onTextChunk(buffer, chunk) for progress UI
 }
+const data = parseRawQueryStreamPlainText(buffer);
 ```
 
 **Why this approach?**
+
 - Native browser API (no dependencies)
-- Efficient memory usage
-- Handles partial JSON correctly
-- Compatible with NDJSON format
+- Accumulates **text/plain** until the stream ends, then **one JSON parse** of the merge payload
+- Strips Python **`[N tokens]`** injections before **`JSON.parse`**
 
 ### Error Handling
 
@@ -308,66 +189,34 @@ This allows the UI to show specific messages like "Legal OCR Model is not runnin
 
 ## Comparison: Streaming vs Non-Streaming
 
-| Feature | Non-Streaming (`/query`) | Streaming (`/query/stream`) |
-|---------|-------------------------|---------------------------|
-| **Response Time** | Wait for all obligations | First obligation appears quickly |
-| **Format** | Single JSON object | NDJSON (one JSON per line) |
-| **UI Update** | One update at end | Progressive updates |
-| **User Experience** | Loading spinner | Live results |
-| **Memory** | Buffers entire response | Streams piece by piece |
-| **Backend Load** | Same | Same (just different delivery) |
+| Feature | Non-Streaming (`/query`) | Raw text stream (`/query/stream/raw-http`) |
+|---------|-------------------------|---------------------------------------------|
+| **Response Time** | Wait for full JSON | Wait for full plain-text stream (merge JSON at end) |
+| **Format** | Single JSON object | `text/plain`: progress + one merge JSON |
+| **UI Update** | One update | One update after parse (spinner while buffering) |
+| **Envelope** | `normalizeQueryEnvelope` | Same after extraction |
 
 ## Troubleshooting
 
-### Streaming not working?
+### AI Search not working?
 
-1. **Check server logs** - Is the stub server running?
-2. **Check browser console** - Are there CORS errors?
-3. **Check network tab** - Is the response `application/x-ndjson`?
-4. **Check timing** - Try increasing delay in stub server
-
-### Obligations appear all at once?
-
-- The stub server delay might be too fast
-- Network might be too fast (local dev)
-- Increase delay in `stub-ocr-server.js`
+1. **Check server logs** — Is the backend (or stub) running on **`VITE_API_BASE_URL`**?
+2. **Check browser console** — CORS or **`Failed to fetch`**?
+3. **Check network tab** — Response should be **`text/plain`** (or compatible) for **`/query/stream/raw-http`**.
+4. **Parse errors** — If the model emits invalid JSON, **`parseRawQueryStreamPlainText`** returns **`error`**; confirm the stream includes a complete top-level **`{ ... }`** merge object.
 
 ### Error: "Response body is null"
 
-- Server might not be sending streaming response
-- Check server is using `res.write()` not `res.end()` for streaming
+- Some environments omit **`body`**; **`queryObligationsStreamRaw`** falls back to **`response.text()`**.
 
-## Future Enhancements
+## Future enhancements
 
-### 1. **Token-Level Streaming** (like backend's `/query/stream/raw`)
-- Stream the LLM's raw text output
-- Show JSON being "typed" in real-time
-- More immersive experience
-
-### 2. **Progress Indicators**
-- Show "3/35 obligations loaded"
-- Progress bar based on metadata
-- Estimated time remaining
-
-### 3. **Cancellation**
-- Add "Cancel" button during streaming
-- Use `AbortController` to stop stream
-- Clean up resources properly
-
-### 4. **Retry on Error**
-- Automatic retry for failed streams
-- Exponential backoff
-- Resume from last successful obligation
+- **`onTextChunk`** — surface `[STEP …]` lines in the UI as a live log.
+- **`AbortController`** — cancel in-flight raw streams.
+- **Incremental JSON repair** — if the server guarantees a delimiter, parse before EOF.
 
 ## Summary
 
-The streaming implementation provides:
-
-✅ **Progressive UI updates** - Obligations appear as they're generated  
-✅ **Backend compatibility** - Matches real backend's NDJSON format  
-✅ **Easy migration** - Just change API URL when ready  
-✅ **Better UX** - Faster perceived response times  
-✅ **Error handling** - Graceful failure with user-friendly messages  
-✅ **Production-ready** - Modern async patterns, efficient streaming  
-
-The stub server accurately mimics the backend's streaming behavior, allowing full frontend development and testing before the real backend integration.
+- **`queryObligationsStreamRaw`** calls **`POST /query/stream/raw-http`**, buffers **text/plain**, extracts merge JSON, and **`normalizeQueryEnvelope`** aligns results with **`POST /query`**.
+- **`App.tsx`** maps **`data.results`** to obligation snippets; incremental updates use **`onTextChunk`** during the stream.
+- The **stub** implements the same handler for **`/query/stream/raw-http`** and **`/query/stream/raw`**; legacy **`/query/stream`** NDJSON remains for manual tests only.

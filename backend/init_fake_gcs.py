@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 def init_fake_gcs_bucket():
     """
     Initialize the default bucket in fake GCS server.
-    The bucket name is read from GCS_BUCKET environment variable (default: heb-legal).
+    The bucket name is read from GCS_BUCKET environment variable (default: legal-ocr-documents).
     """
     try:
         # Check if STORAGE_EMULATOR_HOST is set (required for fake GCS)
@@ -53,7 +53,7 @@ def init_fake_gcs_bucket():
                 return False
         
         # Get bucket name from environment variable
-        bucket_name = os.getenv("GCS_BUCKET", "heb-legal")
+        bucket_name = os.getenv("GCS_BUCKET", "legal-ocr-documents")
         
         logger.info(f"Initializing fake GCS bucket: {bucket_name}")
         logger.info(f"Fake GCS endpoint: {storage_emulator_host}")
